@@ -752,5 +752,41 @@ if TELEGRAM_TOKEN:
     # Jalankan bot di background agar tidak ganggu FastAPI
     threading.Thread(target=lambda: bot.polling(non_stop=True), daemon=True).start()
     print("🤖 Telegram Bot aktif dan siap menerima pesan!")
+# Jalankan bot di background agar tidak ganggu FastAPI
+    threading.Thread(target=lambda: bot.polling(non_stop=True), daemon=True).start()
+    print("🤖 Telegram Bot aktif dan siap menerima pesan!")
 else:
     print("⚠️ TELEGRAM_TOKEN belum dikonfigurasi, bot tidak dijalankan.")
+
+
+# === AUTO REDEPLOY LOOP (PERBAIKAN FINAL) ===
+def auto_redeploy_loop():
+    """Loop auto-redeploy setiap 6 jam (jika server terdeteksi offline)"""
+    while True:
+        try:
+            if APP_URL:
+                try:
+                    r = requests.get(APP_URL, timeout=10)
+                    healthy = (r.status_code == 200)
+                except Exception:
+                    healthy = False
+
+                if not healthy:
+                    print(f"⚠️ [AUTO-REDEPLOY] Server tampak offline {datetime.utcnow().isoformat()}")
+                    # Kamu bisa tambahkan trigger redeploy otomatis di sini
+                    # misal dengan memanggil API Railway menggunakan Railway Token
+                else:
+                    print(f"✅ [AUTO-REDEPLOY] Server sehat: {datetime.utcnow().isoformat()}")
+            else:
+                print("⚠️ APP_URL tidak diset — tidak bisa cek auto-redeploy.")
+        except Exception as e:
+            print(f"❌ Error di auto_redeploy_loop: {e}")
+        time.sleep(21600)  # cek tiap 6 jam
+
+
+# Jalankan auto-redeploy loop di background
+threading.Thread(target=auto_redeploy_loop, daemon=True).start()
+print("♻️ Sistem Auto-Redeploy aktif.")
+
+# === AKHIR STARTUP ===
+print("✅ Pro Trader AI sudah aktif penuh di Railway!")

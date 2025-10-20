@@ -766,3 +766,54 @@ try:
     print("♻️ Sistem Auto-Redeploy aktif.")
 except Exception as e:
     print("❌ Gagal memulai Auto-Redeploy:", e)
+# ================= TELEGRAM COMMAND HANDLER ======================
+import telebot
+
+# Inisialisasi bot Telegram
+bot = telebot.TeleBot(os.getenv("TELEGRAM_TOKEN"))
+
+@bot.message_handler(commands=['start'])
+def send_welcome(message):
+    bot.reply_to(message, "👋 Halo! Saya Pro Trader AI — kirim saja pair + timeframe seperti:\n\nBTCUSDT 1h\nEURUSD 15m\n\nSaya akan kirim sinyal entry, TP, dan SL otomatis 💹")
+
+@bot.message_handler(func=lambda message: True)
+def handle_message(message):
+    text = message.text.strip().upper()
+
+    try:
+        # Deteksi pair & timeframe
+        parts = text.split()
+        if len(parts) != 2:
+            bot.reply_to(message, "⚠️ Format salah. Gunakan contoh: `BTCUSDT 1H` atau `EURUSD 15M`")
+            return
+
+        pair, timeframe = parts
+
+        # Kirim notifikasi sedang analisis
+        bot.send_message(message.chat.id, f"🔍 Menganalisa {pair} pada timeframe {timeframe}...")
+
+        # Panggil API analisa dari server AI kamu
+        url = f"{os.getenv('APP_URL').replace('/health', '')}/analyze_csv"
+        res = requests.post(url, data={"pair": pair, "timeframe": timeframe})
+
+        if res.status_code == 200:
+            data = res.json()
+            msg = (
+                f"📈 Pair: {pair}\n"
+                f"🕒 Timeframe: {timeframe}\n"
+                f"🎯 Entry: {data['entry']}\n"
+                f"💰 TP1: {data['tp1']} | TP2: {data['tp2']}\n"
+                f"🛑 SL: {data['sl']}\n"
+                f"📊 Confidence: {data['confidence']}%\n"
+                f"💬 Reason: {data['reason']}"
+            )
+            bot.send_message(message.chat.id, msg)
+        else:
+            bot.send_message(message.chat.id, f"❌ Gagal menganalisa: {res.text}")
+
+    except Exception as e:
+        bot.send_message(message.chat.id, f"🚫 Error: {str(e)}")
+
+# Jalankan bot Telegram di thread terpisah agar tidak mengganggu FastAPI
+threading.Thread(target=lambda: bot.polling(non_stop=True), daemon=True).start()
+print("🤖 Telegram Command Handler aktif dan siap menerima pesan!")

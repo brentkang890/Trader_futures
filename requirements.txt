@@ -38,6 +38,5 @@ rich==13.7.1
 pyTelegramBotAPI==4.16.1
 
 # === OPTIONAL: IMAGE PROCESSING (jika analisa chart via gambar) ===
-pillow==10.3.0
 opencv-python-headless==4.9.0.80
 pytesseract==0.3.10

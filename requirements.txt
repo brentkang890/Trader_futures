@@ -9,3 +9,4 @@ joblib
 pillow
 opencv-python-headless
 pytesseract
+python-multipart

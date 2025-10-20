@@ -33,9 +33,19 @@ RAILWAY_TOKEN / PROJECT_ID (optional: if you add auto-redeploy using Railway API
 
 Run with: uvicorn main_combined_learning_v3:app --host 0.0.0.0 --port $PORT """
 
-import os import io import time import threading import requests import logging from datetime import datetime from typing import Optional, Dict, Any
+import os
+import io
+import time
+import threading
+import requests
+import logging
+from datetime import datetime
+from typing import Optional, Dict, Any
 
-import numpy as np import pandas as pd from fastapi import FastAPI, Query, UploadFile, File, Form, HTTPException from fastapi.responses import JSONResponse
+import numpy as np
+import pandas as pd
+from fastapi import FastAPI, Query, UploadFile, File, Form, HTTPException
+from fastapi.responses import JSONResponse
 
 optional libs that may be heavy on some platforms
 

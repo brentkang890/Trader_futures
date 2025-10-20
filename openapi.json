@@ -1,0 +1,21 @@
+{
+  "openapi": "3.0.1",
+  "info": {
+    "title": "Pro Trader AI (ID) API",
+    "version": "1.0.0",
+    "description": "API untuk Pro Trader AI (Bahasa Indonesia)"
+  },
+  "servers": [
+    { "url": "https://<YOUR_RAILWAY_URL>" }
+  ],
+  "paths": {
+    "/health": {},
+    "/pro_signal": {},
+    "/scalp_signal": {},
+    "/analyze_chart": {},
+    "/analyze_csv": {},
+    "/learning_status": {},
+    "/retrain_learning": {},
+    "/logs": {}
+  }
+}

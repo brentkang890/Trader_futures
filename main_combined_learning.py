@@ -641,3 +641,128 @@ def get_logs(limit: int = Query(100)):
 # ---------------- STARTUP ----------------
 ensure_trade_log()
 # Jalankan server: uvicorn main_combined_learning:app --host 0.0.0.0 --port $PORT
+# ============================================================
+# ⚙️ SISTEM OTONOM PENUH - PRO TRADER AI (FINAL)
+# ============================================================
+
+import os, requests, time, threading, json
+from datetime import datetime
+
+# === Ambil dari environment Railway (AMAN) ===
+RAILWAY_TOKEN = os.getenv("8355dfa6-95b2-410e-bf0b-4a16bc42438e")
+PROJECT_ID = os.getenv("dd4df7ff-cfa4-431b-91b8-d2b03a75da3b")
+APP_URL = os.getenv("https://web-production-af34.up.railway.app/")
+TELEGRAM_TOKEN = os.getenv("8483103988:AAHeHGhuA6T0rx6nRN-w5bgGrYIfOkbmgHs")
+CHAT_ID = os.getenv("6123645566")
+
+
+# ---------------- TELEGRAM NOTIFIER ----------------
+def send_telegram_message(text: str):
+    """Kirim pesan ke Telegram saat AI aktif, restart, atau redeploy"""
+    if not TELEGRAM_TOKEN or not CHAT_ID:
+        print("⚠️ Telegram belum dikonfigurasi.")
+        return
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        data = {"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML"}
+        requests.post(url, data=data)
+        print(f"📩 [TELEGRAM] Pesan terkirim: {text}")
+    except Exception as e:
+        print(f"❌ [TELEGRAM] Gagal kirim pesan:", e)
+
+
+# ---------------- KEEP ALIVE INTERNAL ----------------
+def keep_alive_loop():
+    """Menjaga Railway tetap aktif dengan memanggil /health tiap 5 menit"""
+    while True:
+        try:
+            r = requests.get(APP_URL)
+            print(f"[KEEP-ALIVE] Ping sukses: {r.status_code} - {datetime.utcnow().isoformat()}")
+        except Exception as e:
+            print(f"[KEEP-ALIVE] Gagal ping: {e}")
+        time.sleep(300)  # tiap 5 menit
+
+try:
+    threading.Thread(target=keep_alive_loop, daemon=True).start()
+    print("✅ Sistem Keep-Alive internal aktif.")
+    send_telegram_message("🤖 <b>Pro Trader AI Aktif!</b>\n✅ Sistem KeepAlive sudah berjalan.")
+except Exception as e:
+    print("❌ Gagal memulai Keep-Alive:", e)
+
+
+# ---------------- AUTO RESTART RECOVERY ----------------
+def auto_restart_recovery():
+    """Memastikan AI hidup kembali otomatis setelah restart atau maintenance"""
+    url = APP_URL
+    while True:
+        try:
+            r = requests.get(url, timeout=10)
+            if r.status_code == 200:
+                msg = f"🧠 [RECOVERY] Server aktif kembali! ⏰ {datetime.utcnow().isoformat()} UTC"
+                print(msg)
+                send_telegram_message(msg)
+            else:
+                print(f"⚠️ [RECOVERY] Status: {r.status_code}")
+        except Exception as e:
+            print(f"❌ [RECOVERY] Error:", e)
+        time.sleep(300)
+
+try:
+    threading.Thread(target=auto_restart_recovery, daemon=True).start()
+    print("🧠 Sistem Auto-Restart Recovery aktif.")
+except Exception as e:
+    print("❌ Gagal mengaktifkan Auto-Restart Recovery:", e)
+
+
+# ---------------- AUTO REDEPLOY + SELF-MAINTENANCE ----------------
+def auto_redeploy_loop():
+    """Cek kesehatan server dan redeploy otomatis jika terhenti"""
+    def check_health():
+        try:
+            r = requests.get(APP_URL, timeout=10)
+            return r.status_code == 200
+        except Exception:
+            return False
+
+    def redeploy():
+        if not RAILWAY_TOKEN or not PROJECT_ID:
+            print("⚠️ Railway Token / Project ID belum dikonfigurasi.")
+            return
+        query = {
+            "query": """
+            mutation ($projectId: String!) {
+                projectDeploy(input: { projectId: $projectId }) {
+                    id
+                }
+            }
+            """,
+            "variables": {"projectId": PROJECT_ID}
+        }
+        headers = {
+            "Authorization": f"Bearer {RAILWAY_TOKEN}",
+            "Content-Type": "application/json"
+        }
+        try:
+            res = requests.post("https://backboard.railway.app/graphql", json=query, headers=headers)
+            if res.status_code == 200:
+                msg = f"🚀 [AUTO-REDEPLOY] Redeploy sukses! ⏰ {datetime.utcnow().isoformat()} UTC"
+                print(msg)
+                send_telegram_message(msg)
+            else:
+                print(f"❌ [AUTO-REDEPLOY] Gagal: {res.text}")
+        except Exception as e:
+            print("Error redeploy:", e)
+
+    while True:
+        if not check_health():
+            print(f"⚠️ [AUTO-REDEPLOY] Server offline, mencoba redeploy...")
+            redeploy()
+        else:
+            print(f"✅ [AUTO-REDEPLOY] Server sehat: {datetime.utcnow().isoformat()}")
+        time.sleep(21600)  # setiap 6 jam
+
+try:
+    threading.Thread(target=auto_redeploy_loop, daemon=True).start()
+    print("♻️ Sistem Auto-Redeploy aktif.")
+except Exception as e:
+    print("❌ Gagal memulai Auto-Redeploy:", e)

@@ -1,0 +1,11 @@
+fastapi
+uvicorn
+pandas
+numpy
+requests
+ta
+scikit-learn
+joblib
+pillow
+opencv-python-headless
+pytesseract

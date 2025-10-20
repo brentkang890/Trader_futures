@@ -642,8 +642,8 @@ def get_logs(limit: int = Query(100)):
 ensure_trade_log()
 # Jalankan server: uvicorn main_combined_learning:app --host 0.0.0.0 --port $PORT
 # ============================================================
-# ================== STARTUP ==================
-import os, requests, time, threading, json
+# ================== STARTUP & TELEGRAM INTEGRATION ==================
+import os, requests, time, threading
 from datetime import datetime
 import telebot
 
@@ -671,8 +671,11 @@ def send_telegram_message(text: str):
 def keep_alive_loop():
     while True:
         try:
-            r = requests.get(APP_URL)
-            print(f"[KEEP-ALIVE] ✅ Ping sukses {r.status_code} - {datetime.utcnow().isoformat()}")
+            if APP_URL:
+                r = requests.get(APP_URL)
+                print(f"[KEEP-ALIVE] ✅ Ping sukses {r.status_code} - {datetime.utcnow().isoformat()}")
+            else:
+                print("⚠️ APP_URL belum diset di Railway Variables.")
         except Exception as e:
             print(f"[KEEP-ALIVE] ❌ Gagal ping: {e}")
         time.sleep(300)
@@ -684,102 +687,70 @@ print("✅ Sistem Keep-Alive aktif.")
 def auto_restart_recovery():
     while True:
         try:
+            if not APP_URL:
+                continue
             r = requests.get(APP_URL, timeout=10)
             if r.status_code == 200:
                 print(f"🧠 [RECOVERY] Server aktif kembali {datetime.utcnow().isoformat()}")
             else:
                 print("[RECOVERY] Server offline, mencoba ulang...")
-        except:
-            print("[RECOVERY] Gagal akses server, akan coba lagi.")
+        except Exception as e:
+            print(f"[RECOVERY] Error: {e}")
         time.sleep(600)
 
 threading.Thread(target=auto_restart_recovery, daemon=True).start()
 print("♻️ Sistem Auto-Restart Recovery aktif.")
 
 # === TELEGRAM BOT ===
-bot = telebot.TeleBot(TELEGRAM_TOKEN)
+if TELEGRAM_TOKEN:
+    bot = telebot.TeleBot(TELEGRAM_TOKEN)
 
-@bot.message_handler(commands=['start'])
-def start_message(message):
-    bot.reply_to(message, "👋 Halo! Saya Pro Trader AI.\nKirim pesan seperti: BTCUSDT 1H untuk analisis chart.")
+    @bot.message_handler(commands=['start'])
+    def send_welcome(message):
+        bot.reply_to(
+            message,
+            "👋 Halo! Saya Pro Trader AI.\n"
+            "Kirim saja pair dan timeframe seperti:\n\n"
+            "<b>BTCUSDT 1h</b>\n<b>EURUSD 15m</b>\n\n"
+            "Saya akan kirim sinyal entry, TP, dan SL otomatis 💹",
+            parse_mode="HTML"
+        )
 
-@bot.message_handler(func=lambda m: True)
-def handle_message(message):
-    try:
-        parts = message.text.strip().split()
-        if len(parts) != 2:
-            bot.reply_to(message, "⚠️ Format salah. Contoh: BTCUSDT 1H")
-            return
-        pair, timeframe = parts
-        bot.send_message(message.chat.id, f"🔍 Menganalisa {pair} pada timeframe {timeframe} ...")
-        # (Di sini kamu bisa panggil fungsi analisis AI kamu)
-        bot.send_message(message.chat.id, f"✅ Analisis selesai untuk {pair} ({timeframe}).")
-    except Exception as e:
-        bot.reply_to(message, f"❌ Terjadi error: {e}")
+    @bot.message_handler(func=lambda msg: True)
+    def handle_signal_request(message):
+        try:
+            parts = message.text.strip().upper().split()
+            if len(parts) != 2:
+                bot.reply_to(message, "⚠️ Format salah. Gunakan contoh: <b>BTCUSDT 1H</b>", parse_mode="HTML")
+                return
 
-print("🤖 Telegram bot aktif.")
-bot.polling(none_stop=True)
-    while True:
-        if not check_health():
-            print(f"⚠️ [AUTO-REDEPLOY] Server offline, mencoba redeploy...")
-            redeploy()
-        else:
-            print(f"✅ [AUTO-REDEPLOY] Server sehat: {datetime.utcnow().isoformat()}")
-        time.sleep(21600)  # setiap 6 jam
+            pair, tf = parts
+            bot.send_message(message.chat.id, f"🔍 Menganalisa {pair} pada timeframe {tf} ...")
 
-try:
-    threading.Thread(target=auto_redeploy_loop, daemon=True).start()
-    print("♻️ Sistem Auto-Redeploy aktif.")
-except Exception as e:
-    print("❌ Gagal memulai Auto-Redeploy:", e)
-# ================= TELEGRAM COMMAND HANDLER ======================
-import telebot
+            # Panggil endpoint FastAPI untuk hasil analisis
+            url = f"{APP_URL}/pro_signal?pair={pair}&tf_main={tf}&tf_entry={tf}"
+            res = requests.get(url, timeout=20)
 
-# Inisialisasi bot Telegram
-bot = telebot.TeleBot(os.getenv("TELEGRAM_TOKEN"))
+            if res.status_code == 200:
+                data = res.json()
+                msg = (
+                    f"📈 <b>Pair:</b> {pair}\n"
+                    f"🕒 <b>Timeframe:</b> {tf}\n"
+                    f"🎯 <b>Entry:</b> {data['entry']}\n"
+                    f"💰 <b>TP1:</b> {data['tp1']} | <b>TP2:</b> {data['tp2']}\n"
+                    f"🛑 <b>SL:</b> {data['sl']}\n"
+                    f"📊 <b>Confidence:</b> {data['confidence']}\n"
+                    f"💬 <b>Alasan:</b> {data['reasoning']}"
+                )
+                bot.send_message(message.chat.id, msg, parse_mode="HTML")
+            else:
+                bot.send_message(message.chat.id, f"❌ Gagal menganalisa: {res.text}")
 
-@bot.message_handler(commands=['start'])
-def send_welcome(message):
-    bot.reply_to(message, "👋 Halo! Saya Pro Trader AI — kirim saja pair + timeframe seperti:\n\nBTCUSDT 1h\nEURUSD 15m\n\nSaya akan kirim sinyal entry, TP, dan SL otomatis 💹")
+        except Exception as e:
+            bot.send_message(message.chat.id, f"🚫 Error: {str(e)}")
 
-@bot.message_handler(func=lambda message: True)
-def handle_message(message):
-    text = message.text.strip().upper()
-
-    try:
-        # Deteksi pair & timeframe
-        parts = text.split()
-        if len(parts) != 2:
-            bot.reply_to(message, "⚠️ Format salah. Gunakan contoh: `BTCUSDT 1H` atau `EURUSD 15M`")
-            return
-
-        pair, timeframe = parts
-
-        # Kirim notifikasi sedang analisis
-        bot.send_message(message.chat.id, f"🔍 Menganalisa {pair} pada timeframe {timeframe}...")
-
-        # Panggil API analisa dari server AI kamu
-        url = f"{os.getenv('APP_URL').replace('/health', '')}/analyze_csv"
-        res = requests.post(url, data={"pair": pair, "timeframe": timeframe})
-
-        if res.status_code == 200:
-            data = res.json()
-            msg = (
-                f"📈 Pair: {pair}\n"
-                f"🕒 Timeframe: {timeframe}\n"
-                f"🎯 Entry: {data['entry']}\n"
-                f"💰 TP1: {data['tp1']} | TP2: {data['tp2']}\n"
-                f"🛑 SL: {data['sl']}\n"
-                f"📊 Confidence: {data['confidence']}%\n"
-                f"💬 Reason: {data['reason']}"
-            )
-            bot.send_message(message.chat.id, msg)
-        else:
-            bot.send_message(message.chat.id, f"❌ Gagal menganalisa: {res.text}")
-
-    except Exception as e:
-        bot.send_message(message.chat.id, f"🚫 Error: {str(e)}")
-
-# Jalankan bot Telegram di thread terpisah agar tidak mengganggu FastAPI
-threading.Thread(target=lambda: bot.polling(non_stop=True), daemon=True).start()
-print("🤖 Telegram Command Handler aktif dan siap menerima pesan!")
+    # Jalankan bot di background agar tidak ganggu FastAPI
+    threading.Thread(target=lambda: bot.polling(non_stop=True), daemon=True).start()
+    print("🤖 Telegram Bot aktif dan siap menerima pesan!")
+else:
+    print("⚠️ TELEGRAM_TOKEN belum dikonfigurasi, bot tidak dijalankan.")

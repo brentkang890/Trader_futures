@@ -25,6 +25,14 @@ except:
 
 app = FastAPI(title="Pro Trader AI v2", version="2.0")
 
+@app.get("/")
+def root():
+    return {
+        "status": "ok",
+        "service": "Pro Trader AI v2",
+        "message": "✅ Server aktif penuh dan siap menganalisis market!"
+    }
+
 TRADE_LOG_FILE = "trade_log.csv"
 MODEL_FILE = "rf_model.pkl"
 

@@ -1,42 +1,12 @@
-# === CORE SERVER ===
-fastapi==0.111.0
-uvicorn==0.30.1
-python-multipart==0.0.9
-
-# === DATA & ANALYTICS ===
-pandas==1.5.3
-numpy==1.23.5
-scikit-learn==1.5.0
-ta==0.11.0
-joblib==1.4.2
-
-# === MACHINE LEARNING ===
-tensorflow==2.16.1
-keras==3.3.3
-
-# === TRADING TOOLS ===
-ccxt==4.3.59
-python-binance==1.0.19
-yfinance==0.2.38
-
-# === CHART & BACKTEST SUPPORT ===
-matplotlib==3.9.0
-mplfinance==0.12.10b0
-
-# === NETWORKING & API ===
-requests==2.32.3
-aiohttp==3.9.5
-
-# === SYSTEM MANAGEMENT ===
-python-dotenv==1.0.1
-schedule==1.2.1
-
-# === LOGGING & STABILITY ===
-rich==13.7.1
-
-# === TELEGRAM BOT SUPPORT ===
-pyTelegramBotAPI==4.16.1
-
-# === OPTIONAL: IMAGE PROCESSING (jika analisa chart via gambar) ===
-opencv-python-headless==4.9.0.80
-pytesseract==0.3.10
+fastapi
+uvicorn
+pandas
+numpy
+scikit-learn
+joblib
+ta
+opencv-python-headless
+pillow
+pytesseract
+requests
+pyTelegramBotAPI

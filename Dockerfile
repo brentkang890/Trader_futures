@@ -17,10 +17,9 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /app
 
 # ================================
-# 📦 Copy project files
+# 📦 Copy all project files
 # ================================
-COPY requirements.txt requirements.txt
-COPY main_combined_learning.py .
+COPY . .
 
 # ================================
 # 📦 Install Python dependencies
@@ -34,6 +33,6 @@ ENV PORT=8000
 ENV PYTHONUNBUFFERED=1
 
 # ================================
-# 🚀 Run the FastAPI app using uvicorn
+# 🚀 Run both FastAPI (AI) + Telegram Bot together
 # ================================
-CMD ["uvicorn", "main_combined_learning:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD sh -c "uvicorn main_combined_learning:app --host 0.0.0.0 --port ${PORT:-8000} & python telegram_bot.py"

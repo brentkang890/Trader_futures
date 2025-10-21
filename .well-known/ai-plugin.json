@@ -2,12 +2,12 @@
   "schema_version": "v1",
   "name_for_human": "Pro Trader AI (ID)",
   "name_for_model": "pro_trader_ai",
-  "description_for_human": "AI trading berbahasa Indonesia untuk Crypto & Forex. Analisis teknikal, sinyal entry/TP/SL, dan pembelajaran otomatis.",
-  "description_for_model": "AI agent trading berbahasa Indonesia yang mampu membaca chart crypto dan forex serta menghasilkan sinyal dengan confidence dan alasan yang jelas.",
+  "description_for_human": "AI trading profesional berbahasa Indonesia untuk analisis Crypto & Forex. Menentukan entry, TP, dan SL dengan sistem pembelajaran otomatis.",
+  "description_for_model": "AI trading berpengalaman 10 tahun yang menggunakan analisis teknikal canggih dan pembelajaran mesin untuk membuat sinyal entry, take profit, dan stop loss.",
   "auth": { "type": "none" },
   "api": {
     "type": "openapi",
-    "url": "https://https://web-production-af34.up.railway.app/openapi.json"
+    "url": "https://web-production-af34.up.railway.app/openapi.json"
   },
   "logo_url": "https://i.imgur.com/7IdrG4T.png",
   "contact_email": "support@protrader.ai",

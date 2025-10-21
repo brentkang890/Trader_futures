@@ -7,7 +7,7 @@
   "auth": { "type": "none" },
   "api": {
     "type": "openapi",
-    "url": "https://<YOUR_RAILWAY_URL>/openapi.json"
+    "url": "https://https://web-production-af34.up.railway.app/openapi.json"
   },
   "logo_url": "https://i.imgur.com/7IdrG4T.png",
   "contact_email": "support@protrader.ai",

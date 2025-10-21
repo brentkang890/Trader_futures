@@ -1,14 +1,11 @@
 import requests
 import time
-import json
 import os
 
-# === KONFIGURASI ENV (Railway Variables) ===
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-CHAT_ID = os.environ.get("CHAT_ID")
-APP_URL = os.environ.get("APP_URL")  # URL dari app AI kamu, misal: https://web-production-af34.up.railway.app
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+CHAT_ID = os.environ.get("CHAT_ID", "")
+APP_URL = os.environ.get("APP_URL", "")
 
-# === Fungsi kirim pesan ke Telegram ===
 def send_message(text):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML"}
@@ -17,7 +14,6 @@ def send_message(text):
     except Exception as e:
         print(f"[ERROR] Gagal kirim pesan Telegram: {e}")
 
-# === Fungsi ambil pesan baru dari Telegram ===
 def get_updates(offset=None):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
     params = {"timeout": 100, "offset": offset}
@@ -27,152 +23,97 @@ def get_updates(offset=None):
         print(f"[ERROR] Gagal ambil update: {e}")
         return {}
 
-# === Fungsi utama untuk handle command ===
-def handle_command(command):
-    cmd = command.strip().lower()
+def handle_text_command(command):
     try:
-        # === STATUS MODEL ===
-        if cmd == "status":
-            r = requests.get(f"{APP_URL}/learning_status_summary", timeout=15)
-            if r.status_code != 200:
-                return f"⚠️ Gagal ambil status: {r.text}"
-            d = r.json()
-            return (
-                f"🤖 <b>Status Model AI</b>\n"
-                f"📦 Model: {d.get('model_status','❌')}\n"
-                f"📊 Log Data: {d.get('log_count',0)} sinyal\n"
-                f"🧠 Kesiapan Retrain: {'✅ Siap' if d.get('learning_ready') else '❌ Belum cukup data'}\n"
-                f"📋 {d.get('description','')}"
-            )
+        cmd = command.lower().strip()
 
-        # === LIHAT LOG TERBARU ===
-        elif cmd == "log":
-            r = requests.get(f"{APP_URL}/logs_summary", timeout=15)
-            if r.status_code != 200:
-                return f"⚠️ Gagal ambil log: {r.text}"
-            d = r.json()
-            if "detail" in d:
-                return f"ℹ️ {d['detail']}"
-            return (
-                f"📊 <b>{d.get('pair','?')} ({d.get('timeframe','?')})</b>\n"
-                f"💡 Signal: <b>{d.get('signal_type','?')}</b>\n"
-                f"🎯 Entry: {d.get('entry','?')}\n"
-                f"🎯 TP1: {d.get('tp1','?')}\n"
-                f"🎯 TP2: {d.get('tp2','?')}\n"
-                f"🛡 SL: {d.get('sl','?')}\n"
-                f"📈 Confidence: {d.get('confidence','?')}\n"
-                f"🧠 Reasoning: {d.get('reasoning','')}"
-            )
-
-        # === STATISTIK PERFORMA AI ===
-        elif cmd == "stats":
-            r = requests.get(f"{APP_URL}/ai_performance", timeout=20)
-            if r.status_code != 200:
-                return f"⚠️ Gagal ambil statistik: {r.text}"
-            d = r.json()
-            if "error" in d:
-                return f"ℹ️ {d['error']}"
-            return (
-                f"📈 <b>Statistik Performa AI</b>\n"
-                f"============================\n"
-                f"💹 Total Sinyal: {d.get('total_signals',0)}\n"
-                f"✅ Winrate: {d.get('winrate',0)}%\n"
-                f"💰 Profit Factor: {d.get('profit_factor','N/A')}\n"
-                f"⚙️ Model: {d.get('model_status','❌')}"
-            )
-
-        # === SCALPING MODE (contoh: scalp btcusdt) ===
-        elif cmd.startswith("scalp "):
+        if cmd.startswith("scalp "):
             pair = cmd.split()[1].upper()
-            r = requests.get(f"{APP_URL}/scalp_signal?pair={pair}&tf=3m&auto_log=true", timeout=25)
-            if r.status_code != 200:
-                return f"⚠️ Gagal ambil scalp signal: {r.text}"
-            d = r.json()
-            return (
-                f"⚡ <b>Scalp Signal {d.get('pair','')}</b> ({d.get('timeframe','')})\n"
-                f"💡 <b>{d.get('signal_type','')}</b>\n"
-                f"🎯 Entry: {d.get('entry','')}\n"
-                f"🎯 TP1: {d.get('tp1','')}\n"
-                f"🎯 TP2: {d.get('tp2','')}\n"
-                f"🛡 SL: {d.get('sl','')}\n"
-                f"📈 Confidence: {d.get('confidence','')}\n"
-                f"🧠 Reasoning: {d.get('reasoning','')}"
-            )
-
-        # === SIGNAL BIASA (contoh: BTCUSDT 15m) ===
+            url = f"{APP_URL}/scalp_signal?pair={pair}&tf=3m"
+        elif cmd.startswith("log"):
+            url = f"{APP_URL}/logs"
+        elif cmd.startswith("status"):
+            url = f"{APP_URL}/learning_status"
+        elif len(cmd.split()) == 2:
+            pair, tf = cmd.split()
+            url = f"{APP_URL}/pro_signal?pair={pair.upper()}&tf_entry={tf}"
+        elif len(cmd.split()) == 1:
+            pair = cmd.split()[0]
+            url = f"{APP_URL}/pro_signal?pair={pair.upper()}&tf_entry=15m"
         else:
-            parts = cmd.split()
-            if len(parts) == 2:
-                pair, tf = parts
-            elif len(parts) == 1:
-                pair, tf = parts[0], "15m"
-            else:
-                return "⚠️ Format salah!\nGunakan: <b>BTCUSDT 15m</b> atau <b>ETHUSDT</b>"
+            return "⚠️ Format salah!\nGunakan: <b>BTCUSDT 15m</b> atau <b>scalp BTCUSDT</b>"
 
-            url = f"{APP_URL}/pro_signal?pair={pair.upper()}&tf_main=1h&tf_entry={tf}&auto_log=true"
-            print(f"[INFO] Fetching: {url}")
-            r = requests.get(url, timeout=25)
+        print(f"[INFO] Fetching {url}")
+        r = requests.get(url, timeout=25)
+        if r.status_code != 200:
+            return f"⚠️ Gagal ambil sinyal: {r.text}"
 
-            if r.status_code != 200:
-                return f"⚠️ Gagal ambil sinyal: {r.text}"
-
-            try:
-                d = r.json()
-            except Exception:
-                return f"⚠️ Gagal parsing respon dari AI: {r.text[:150]}"
-
-            if "error" in d:
-                return f"⚠️ {d['error']}"
-
-            return (
-                f"📊 <b>{d.get('pair','?')} ({d.get('timeframe','?')})</b>\n"
-                f"💡 Signal: <b>{d.get('signal_type','?')}</b>\n"
-                f"🎯 Entry: {d.get('entry','?')}\n"
-                f"🎯 TP1: {d.get('tp1','?')}\n"
-                f"🎯 TP2: {d.get('tp2','?')}\n"
-                f"🛡 SL: {d.get('sl','?')}\n"
-                f"📈 Confidence: {d.get('confidence','?')}\n"
-                f"🧠 Reasoning: {d.get('reasoning','')}"
-            )
+        d = r.json()
+        msg = (
+            f"📊 <b>{d.get('pair', '')} ({d.get('timeframe', '')})</b>\n"
+            f"💡 Signal: <b>{d.get('signal_type', '')}</b>\n"
+            f"🎯 Entry: {d.get('entry', '')}\n"
+            f"🎯 TP1: {d.get('tp1', '')}\n"
+            f"🎯 TP2: {d.get('tp2', '')}\n"
+            f"🛡 SL: {d.get('sl', '')}\n"
+            f"📈 Confidence: {d.get('confidence', '')}\n\n"
+            f"🧠 Reasoning: {d.get('reasoning', '')}"
+        )
+        return msg
 
     except Exception as e:
-        import traceback
-        print("[ERROR CMD]", traceback.format_exc())
-        return f"❌ Terjadi error internal: {e}"
+        print(f"[ERROR] {e}")
+        return f"❌ Error: {e}"
 
-# === MAIN LOOP ===
+def handle_photo(photo_id):
+    """Analisis gambar chart"""
+    try:
+        info = requests.get(f"https://api.telegram.org/bot{BOT_TOKEN}/getFile?file_id={photo_id}").json()
+        file_path = info["result"]["file_path"]
+        file_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
+        img = requests.get(file_url).content
+
+        files = {"file": ("chart.png", img, "image/png")}
+        r = requests.post(f"{APP_URL}/analyze_chart", files=files, timeout=60)
+        if r.status_code != 200:
+            send_message(f"⚠️ Gagal analisis chart: {r.text}")
+            return
+        d = r.json()
+        msg = (
+            f"📉 <b>Analisis Gambar Chart</b>\n"
+            f"💡 Signal: <b>{d['signal_type']}</b>\n"
+            f"🎯 Entry: {d['entry']}\n"
+            f"🎯 TP1: {d['tp1']}\n"
+            f"🎯 TP2: {d['tp2']}\n"
+            f"🛡 SL: {d['sl']}\n"
+            f"📈 Confidence: {d['confidence']}\n\n"
+            f"🧠 Reasoning: {d['reasoning']}"
+        )
+        send_message(msg)
+    except Exception as e:
+        send_message(f"❌ Error analisis gambar: {e}")
+
 def main():
     offset = None
-    print("🤖 Bot aktif dan tersambung ke:", APP_URL)
-    send_message("🤖 <b>Pro Trader AI Bot siap digunakan!</b>\nKirim <b>BTCUSDT 15m</b> untuk sinyal cepat.\nAtau kirim <b>status</b> untuk lihat kondisi model.")
+    send_message("🤖 <b>Pro Trader AI Bot aktif & terhubung ke AI Agent!</b>\nKirim: <b>BTCUSDT 15m</b> atau gambar chart.")
 
     while True:
-        try:
-            updates = get_updates(offset)
-            if "result" in updates:
-                for update in updates["result"]:
-                    offset = update["update_id"] + 1
-                    msg = update.get("message", {})
-                    if not msg: continue
+        updates = get_updates(offset)
+        if "result" in updates:
+            for upd in updates["result"]:
+                offset = upd["update_id"] + 1
+                msg = upd.get("message", {})
 
-                    text = msg.get("text", "").strip()
-                    if not text: continue
-
-                    print(f"[MSG] {text}")
+                if "text" in msg:
+                    text = msg["text"].strip()
                     if text.startswith("/start"):
-                        send_message(
-                            "👋 Halo! Kirim pair dan timeframe (contoh: <b>BTCUSDT 15m</b>).\n"
-                            "Ketik <b>status</b> untuk cek kondisi model.\n"
-                            "Ketik <b>stats</b> untuk performa AI."
-                        )
+                        send_message("👋 Kirim pair + timeframe (contoh: <b>BTCUSDT 15m</b>)\nAtau kirim gambar chart.")
                     else:
-                        response = handle_command(text)
-                        send_message(response)
-
-            time.sleep(2)
-        except Exception as e:
-            print(f"[ERROR LOOP] {e}")
-            time.sleep(5)
+                        send_message(handle_text_command(text))
+                elif "photo" in msg:
+                    photo_id = msg["photo"][-1]["file_id"]
+                    handle_photo(photo_id)
+        time.sleep(2)
 
 if __name__ == "__main__":
     main()

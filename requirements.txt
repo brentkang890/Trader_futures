@@ -9,4 +9,3 @@ joblib
 pillow
 opencv-python-headless
 pytesseract
-python-telegram-bot

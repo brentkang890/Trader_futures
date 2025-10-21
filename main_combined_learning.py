@@ -642,6 +642,53 @@ def get_logs(limit: int = Query(100)):
     return JSONResponse({"logs": df})
 
 
+@app.get("/logs_summary")
+def logs_summary():
+    """Kembalikan 1 sinyal terakhir untuk ditampilkan di Telegram"""
+    try:
+        if not os.path.exists(TRADE_LOG_FILE):
+            return JSONResponse({"detail": "Belum ada log sinyal tersimpan."})
+        df = pd.read_csv(TRADE_LOG_FILE)
+        if df.empty:
+            return JSONResponse({"detail": "Belum ada data sinyal terbaru."})
+        last = df.iloc[-1]
+        data = {
+            "pair": last.get("pair", ""),
+            "timeframe": last.get("timeframe", ""),
+            "signal_type": last.get("signal_type", ""),
+            "entry": last.get("entry", ""),
+            "tp1": last.get("tp1", ""),
+            "tp2": last.get("tp2", ""),
+            "sl": last.get("sl", ""),
+            "confidence": last.get("confidence", ""),
+            "reasoning": last.get("reasoning", "")
+        }
+        return JSONResponse(data)
+    except Exception as e:
+        return JSONResponse({"error": str(e)})
+
+
+@app.get("/learning_status_summary")
+def learning_status_summary():
+    """Kembalikan status model AI untuk ditampilkan di Telegram"""
+    try:
+        model_exists = os.path.exists(MODEL_FILE)
+        logs_exist = os.path.exists(TRADE_LOG_FILE)
+        logs_count = 0
+        if logs_exist:
+            df = pd.read_csv(TRADE_LOG_FILE)
+            logs_count = len(df)
+
+        data = {
+            "model_status": "✅ Sudah Dilatih" if model_exists else "❌ Belum Ada Model",
+            "log_count": logs_count,
+            "learning_ready": logs_count >= MIN_SAMPLES_TO_TRAIN,
+            "description": "AI siap retrain otomatis saat data cukup."
+        }
+        return JSONResponse(data)
+    except Exception as e:
+        return JSONResponse({"error": str(e)})
+
 # ---------------- STARTUP ----------------
 ensure_trade_log()
 # Jalankan server: uvicorn main_combined_learning:app --host 0.0.0.0 --port $PORT

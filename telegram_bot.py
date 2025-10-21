@@ -3,20 +3,31 @@ import time
 import json
 import os
 
+# === KONFIGURASI DARI RAILWAY VARIABLE ===
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "8483103988:AAHeHGuHA6T0rx6nRN-w5bgGrYlf0kbmgHs")
 CHAT_ID = os.environ.get("CHAT_ID", "6123645566")
-APP_URL = os.environ.get("APP_URL", "https://web-production-af34.up.railway.app")
+APP_URL = os.environ.get("APP_URL", "https://web-production-0e51b.up.railway.app")  # ganti ke URL aktif AI-mu
 
+# === FUNGSI KIRIM PESAN TELEGRAM ===
 def send_message(text):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML"}
-    requests.post(url, json=payload)
+    try:
+        requests.post(url, json=payload, timeout=10)
+    except Exception as e:
+        print(f"[ERROR] Gagal kirim pesan Telegram: {e}")
 
+# === FUNGSI MENGAMBIL PESAN BARU ===
 def get_updates(offset=None):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
     params = {"timeout": 100, "offset": offset}
-    return requests.get(url, params=params).json()
+    try:
+        return requests.get(url, params=params, timeout=120).json()
+    except Exception as e:
+        print(f"[ERROR] Gagal ambil update: {e}")
+        return {}
 
+# === FUNGSI HANDLE COMMAND USER ===
 def handle_command(command):
     try:
         parts = command.strip().split()
@@ -27,41 +38,57 @@ def handle_command(command):
             pair = parts[0]
             url = f"{APP_URL}/pro_signal?pair={pair.upper()}&tf_entry=15m&auto_log=true"
         else:
-            return "Format: <b>BTCUSDT 15m</b> atau <b>ETHUSDT</b>"
-        
-        r = requests.get(url, timeout=20)
+            return "⚠️ Format salah!\n\nGunakan format:\n<b>BTCUSDT 15m</b> atau <b>ETHUSDT</b>"
+
+        print(f"[INFO] Fetching signal dari: {url}")
+        r = requests.get(url, timeout=25)
         if r.status_code == 200:
             data = r.json()
-            msg = f"📊 <b>{data['pair']} ({data['timeframe']})</b>\n"
-            msg += f"💡 Signal: <b>{data['signal_type']}</b>\n"
-            msg += f"🎯 Entry: {data['entry']}\n"
-            msg += f"🎯 TP1: {data['tp1']}\n"
-            msg += f"🎯 TP2: {data['tp2']}\n"
-            msg += f"🛡 SL: {data['sl']}\n"
-            msg += f"📈 Confidence: {data['confidence']}\n\n"
-            msg += f"🧠 Reasoning: {data['reasoning']}"
+            msg = (
+                f"📊 <b>{data['pair']} ({data['timeframe']})</b>\n"
+                f"💡 Signal: <b>{data['signal_type']}</b>\n"
+                f"🎯 Entry: {data['entry']}\n"
+                f"🎯 TP1: {data['tp1']}\n"
+                f"🎯 TP2: {data['tp2']}\n"
+                f"🛡 SL: {data['sl']}\n"
+                f"📈 Confidence: {data['confidence']}\n\n"
+                f"🧠 Reasoning: {data['reasoning']}"
+            )
             return msg
         else:
-            return f"⚠️ Gagal fetch data: {r.text}"
-    except Exception as e:
-        return f"❌ Error: {e}"
+            return f"⚠️ Gagal ambil sinyal: {r.text}"
 
+    except Exception as e:
+        print(f"[ERROR] Saat handle command: {e}")
+        return f"❌ Terjadi error: {e}"
+
+# === PROGRAM UTAMA ===
 def main():
     offset = None
-    send_message("🤖 Pro Trader AI Bot Aktif dan Siap Membantu!")
+    print(f"🤖 BOT AKTIF | Terhubung ke: {APP_URL}")
+    send_message("🤖 <b>Pro Trader AI Bot Aktif dan Siap Membantu!</b>")
+
     while True:
-        updates = get_updates(offset)
-        if "result" in updates:
-            for update in updates["result"]:
-                offset = update["update_id"] + 1
-                if "message" in update and "text" in update["message"]:
-                    text = update["message"]["text"]
-                    if text.startswith("/start"):
-                        send_message("Selamat datang! Kirim perintah seperti:\n\n<b>BTCUSDT 15m</b> atau <b>ETHUSDT</b>")
-                    else:
-                        response = handle_command(text)
-                        send_message(response)
-        time.sleep(2)
+        try:
+            updates = get_updates(offset)
+            if "result" in updates:
+                for update in updates["result"]:
+                    offset = update["update_id"] + 1
+                    if "message" in update and "text" in update["message"]:
+                        text = update["message"]["text"].strip()
+                        if text.startswith("/start"):
+                            send_message(
+                                "👋 Halo! Kirim pair + timeframe (contoh: <b>BTCUSDT 15m</b>)\n"
+                                "Atau kirim <b>BTCUSDT</b> untuk default timeframe 15m."
+                            )
+                        else:
+                            response = handle_command(text)
+                            send_message(response)
+            time.sleep(3)  # biar ringan di Railway Free Tier
+
+        except Exception as e:
+            print(f"[ERROR LOOP] {e}")
+            time.sleep(5)
 
 if __name__ == "__main__":
     main()

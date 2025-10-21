@@ -8,5 +8,4 @@ scikit-learn
 joblib
 pillow
 opencv-python-headless
-pyTelegramBotAPI
 pytesseract

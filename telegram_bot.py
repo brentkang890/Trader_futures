@@ -6,7 +6,7 @@ import os
 # === KONFIGURASI DARI RAILWAY VARIABLE ===
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "8483103988:AAHeHGuHA6T0rx6nRN-w5bgGrYlf0kbmgHs")
 CHAT_ID = os.environ.get("CHAT_ID", "6123645566")
-APP_URL = os.environ.get("APP_URL", "https://web-production-0e51b.up.railway.app")  # ganti ke URL aktif AI-mu
+APP_URL = os.environ.get("APP_URL", "https://web-production-af34.up.railway.app")  # ganti ke URL aktif AI-mu
 
 # === FUNGSI KIRIM PESAN TELEGRAM ===
 def send_message(text):

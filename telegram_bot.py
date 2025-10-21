@@ -82,6 +82,38 @@ def handle_command(command):
                 f"🧠 Reasoning: {d['reasoning']}"
             )
 
+        elif cmd == "stats":
+            r = requests.get(f"{APP_URL}/ai_performance", timeout=25)
+            d = r.json()
+            if "error" in d:
+                return f"⚠️ {d['error']}"
+
+            msg = (
+                f"📈 <b>Statistik Performa AI</b>\n"
+                f"========================\n"
+                f"💹 Total Sinyal: {d['total_signals']}\n"
+                f"✅ Winrate Keseluruhan: {d['winrate']}%\n"
+                f"💰 Profit Factor: {d['profit_factor']}\n"
+                f"📉 Max Drawdown: {d['max_drawdown']}\n"
+                f"📊 Avg Confidence: {d['avg_confidence']}\n"
+                f"⚙️ Model: {d['model_status']}\n\n"
+            )
+
+            # Per Pair
+            if d.get("pair_stats"):
+                msg += "📊 <b>Berdasarkan Pair:</b>\n"
+                for p in d["pair_stats"][:5]:
+                    msg += f"- {p['pair']} → {p['winrate']}% winrate ({p['signals']} sinyal)\n"
+                msg += "\n"
+
+            # Per Timeframe
+            if d.get("tf_stats"):
+                msg += "🕒 <b>Berdasarkan Timeframe:</b>\n"
+                for t in d["tf_stats"]:
+                    msg += f"- {t['timeframe']} → {t['winrate']}% winrate ({t['signals']} sinyal)\n"
+
+            return msg
+
         else:
             parts = cmd.split()
             if len(parts) == 2:

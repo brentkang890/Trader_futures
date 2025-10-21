@@ -6,7 +6,7 @@ import os
 # === KONFIGURASI DARI RAILWAY VARIABLE ===
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "8483103988:AAHeHGuHA6T0rx6nRN-w5bgGrYlf0kbmgHs")
 CHAT_ID = os.environ.get("CHAT_ID", "6123645566")
-APP_URL = os.environ.get("APP_URL", "https://web-production-af34.up.railway.app")  # URL aktif AI
+APP_URL = os.environ.get("APP_URL", "https://web-production-af34.up.railway.app")  # URL AI server kamu
 
 # === FUNGSI KIRIM PESAN TELEGRAM ===
 def send_message(text):
@@ -33,15 +33,17 @@ def handle_command(command):
         parts = command.strip().split()
         if len(parts) == 2:
             pair, tf = parts
-            url = f"{APP_URL}/pro_signal?pair={pair.upper()}&tf_entry={tf}"
+            url = f"{APP_URL}/pro_signal?pair={pair.upper()}&tf_main=tf_{tf}"
         elif len(parts) == 1:
             pair = parts[0]
-            url = f"{APP_URL}/pro_signal?pair={pair.upper()}&tf_entry=15m"
+            url = f"{APP_URL}/pro_signal?pair={pair.upper()}&tf_main=tf_15m"
         else:
             return "⚠️ Format salah!\n\nGunakan format:\n<b>BTCUSDT 15m</b> atau <b>ETHUSDT</b>"
 
         print(f"[INFO] Fetching signal dari: {url}")
         r = requests.get(url, timeout=25)
+
+        # === Jika respons berhasil ===
         if r.status_code == 200:
             data = r.json()
             msg = (
@@ -55,6 +57,8 @@ def handle_command(command):
                 f"🧠 Reasoning: {data['reasoning']}"
             )
             return msg
+
+        # === Jika API gagal balas ===
         else:
             return f"⚠️ Gagal ambil sinyal: {r.text}"
 

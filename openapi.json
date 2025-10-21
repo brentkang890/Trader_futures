@@ -3,10 +3,12 @@
   "info": {
     "title": "Pro Trader AI (ID) API",
     "version": "1.0.0",
-    "description": "API untuk Pro Trader AI (Bahasa Indonesia)"
+    "description": "API untuk Pro Trader AI - versi Bahasa Indonesia dengan analisis teknikal dan sistem pembelajaran otomatis."
   },
   "servers": [
-    { "url": "https:/https://web-production-af34.up.railway.app" }
+    {
+      "url": "https://web-production-af34.up.railway.app"
+    }
   ],
   "paths": {
     "/health": {},

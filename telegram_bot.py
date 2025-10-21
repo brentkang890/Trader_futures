@@ -6,23 +6,25 @@ import os
 # === KONFIGURASI DARI RAILWAY VARIABLE ===
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "8483103988:AAHeHGuHA6T0rx6nRN-w5bgGrYlf0kbmgHs")
 CHAT_ID = os.environ.get("CHAT_ID", "6123645566")
-APP_URL = os.environ.get("APP_URL", "https://web-production-af34.up.railway.app")  # URL AI server kamu
+APP_URL = os.environ.get("APP_URL", "https://web-production-af34.up.railway.app")
 
 # === FUNGSI KIRIM PESAN TELEGRAM ===
 def send_message(text):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML"}
     try:
-        requests.post(url, json=payload, timeout=10)
+        response = requests.post(url, json=payload, timeout=10)
+        if response.status_code != 200:
+            print(f"[WARN] Gagal kirim pesan: {response.text}")
     except Exception as e:
         print(f"[ERROR] Gagal kirim pesan Telegram: {e}")
 
 # === FUNGSI MENGAMBIL PESAN BARU ===
 def get_updates(offset=None):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
-    params = {"timeout": 100, "offset": offset}
+    params = {"timeout": 60, "offset": offset}
     try:
-        return requests.get(url, params=params, timeout=120).json()
+        return requests.get(url, params=params, timeout=65).json()
     except Exception as e:
         print(f"[ERROR] Gagal ambil update: {e}")
         return {}
@@ -43,7 +45,6 @@ def handle_command(command):
         print(f"[INFO] Fetching signal dari: {url}")
         r = requests.get(url, timeout=25)
 
-        # === Jika respons berhasil ===
         if r.status_code == 200:
             data = r.json()
             msg = (
@@ -57,8 +58,6 @@ def handle_command(command):
                 f"🧠 Reasoning: {data['reasoning']}"
             )
             return msg
-
-        # === Jika API gagal balas ===
         else:
             return f"⚠️ Gagal ambil sinyal: {r.text}"
 
@@ -88,7 +87,7 @@ def main():
                         else:
                             response = handle_command(text)
                             send_message(response)
-            time.sleep(3)
+            time.sleep(2)  # Lebih responsif
 
         except Exception as e:
             print(f"[ERROR LOOP] {e}")

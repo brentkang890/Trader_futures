@@ -1,22 +1,30 @@
 # main_combined_learning.py
 """
 Pro Trader AI - Combined + Learning (Bahasa Indonesia)
-- Analisis Crypto (Binance) & Forex (CSV)
+- Analisis Crypto (Binance) & Forex (AlphaVantage)
 - Auto-logging sinyal ke trade_log.csv
 - Integrated Learning (RandomForest) yang otomatis retrain setiap N sinyal
+- Model caching & auto-refresh setelah retrain
+- Endpoint debugging /model_debug
 - Output reasoning dan pesan difokuskan ke Bahasa Indonesia
 """
 
-import os, io, math, json, threading, time
+import os
+import io
+import math
+import json
+import threading
+import time
+import re
 from datetime import datetime
-from typing import Optional, List, Dict, Any
+from typing import Optional, Dict, Any
 
 import requests
 import pandas as pd
 import numpy as np
 
 from fastapi import FastAPI, Query, UploadFile, File, Form, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, FileResponse
 
 # technical libs
 import ta
@@ -37,36 +45,83 @@ except Exception:
     pytesseract = None
     _HAS_TESSERACT = False
 
-app = FastAPI(title="Pro Trader AI - Combined + Learning (ID)",
-              description="Analisis Crypto (Binance) & Forex (CSV) + Pembelajaran Terintegrasi",
-              version="1.0")
+app = FastAPI(
+    title="Pro Trader AI - Combined + Learning (ID)",
+    description="Analisis Crypto (Binance) & Forex (AlphaVantage) + Pembelajaran Terintegrasi",
+    version="1.0"
+)
 
 # ---------------- KONFIG ----------------
 BACKTEST_URL = os.environ.get("BACKTEST_URL")  # optional evaluator endpoint
 TRADE_LOG_FILE = "trade_log.csv"
 MODEL_FILE = "rf_model.pkl"
-MIN_SAMPLES_TO_TRAIN = 50
-N_SIGNALS_TO_RETRAIN = 50   # retrain setelah 50 sinyal baru
+MIN_SAMPLES_TO_TRAIN = int(os.environ.get("MIN_SAMPLES_TO_TRAIN", 50))
+N_SIGNALS_TO_RETRAIN = int(os.environ.get("N_SIGNALS_TO_RETRAIN", 50))
 BINANCE_KLINES = "https://api.binance.com/api/v3/klines"
 
-# thread-safety
-import threading
+ALPHA_API_KEY = os.environ.get("ALPHA_API_KEY", "")
+ALPHA_URL = "https://www.alphavantage.co/query"
+
+# thread-safety + caching
 _lock = threading.Lock()
 _last_retrain_count = 0
+_cached_model = None  # cache untuk model yang dimuat dari disk
 
 # ---------------- UTILITAS & INDIKATOR ----------------
-def fetch_ohlc_binance(symbol: str, interval: str, limit: int = 500) -> pd.DataFrame:
-    params = {"symbol": symbol.upper(), "interval": interval, "limit": limit}
-    r = requests.get("https://api.binance.com/api/v3/klines", params=params, timeout=10)
+def fetch_ohlc_alpha_forex(symbol: str, interval: str="15m", limit: int=500) -> pd.DataFrame:
+    """Fallback untuk pair Forex (contoh XAUUSD, EURUSD) via AlphaVantage FX_INTRADAY atau daily."""
+    if not ALPHA_API_KEY:
+        raise RuntimeError("ALPHA_API_KEY_not_set")
+    symbol = symbol.upper()
+    from_sym = symbol[:3]
+    to_sym = symbol[3:]
+    mapping = {"1m":"1min","3m":"5min","5m":"5min","15m":"15min","30m":"30min","1h":"60min","4h":"60min","1d":"daily"}
+    iv = mapping.get(interval, "15min")
+    params = {"function": "FX_INTRADAY", "from_symbol": from_sym, "to_symbol": to_sym,
+              "interval": iv, "apikey": ALPHA_API_KEY, "outputsize":"compact"}
+    r = requests.get(ALPHA_URL, params=params, timeout=15)
     r.raise_for_status()
     data = r.json()
-    df = pd.DataFrame(data, columns=[
-        "open_time","open","high","low","close","volume","close_time",
-        "qav","num_trades","tb_base","tb_quote","ignore"
-    ])
-    for c in ["open","high","low","close","volume"]:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
+    possible_keys = [k for k in data.keys() if "Time Series" in k]
+    if not possible_keys:
+        raise ValueError(f"AlphaVantage no data: {data}")
+    key = possible_keys[0]
+    ts = data[key]
+    df = pd.DataFrame(ts).T
+    df.columns = [c.split('. ')[-1] for c in df.columns]
+    df = df.rename(columns=lambda c: c.strip())
+    cols_need = [c for c in ["open","high","low","close"] if c in df.columns]
+    df = df[cols_need].astype(float)
+    df = df.sort_index().tail(limit).reset_index(drop=True)
+    df["volume"] = 0.0
+    df.insert(0, "open_time", pd.RangeIndex(start=0, stop=len(df)))
     return df[["open_time","open","high","low","close","volume"]]
+
+def fetch_ohlc_binance(symbol: str, interval: str, limit: int = 500) -> pd.DataFrame:
+    """Try Binance (crypto). If fail, fallback to AlphaVantage (forex)."""
+    symbol = symbol.upper()
+    # Try Binance first
+    try:
+        params = {"symbol": symbol, "interval": interval, "limit": limit}
+        r = requests.get(BINANCE_KLINES, params=params, timeout=10)
+        if r.status_code == 200:
+            data = r.json()
+            df = pd.DataFrame(data, columns=[
+                "open_time","open","high","low","close","volume","close_time",
+                "qav","num_trades","tb_base","tb_quote","ignore"
+            ])
+            for c in ["open","high","low","close","volume"]:
+                df[c] = pd.to_numeric(df[c], errors="coerce")
+            df = df[["open_time","open","high","low","close","volume"]].reset_index(drop=True)
+            return df
+    except Exception:
+        pass
+
+    # Fallback to AlphaVantage for forex
+    try:
+        return fetch_ohlc_alpha_forex(symbol, interval, limit)
+    except Exception as e:
+        raise RuntimeError(f"fetch_ohlc_failed_for_{symbol}: {e}")
 
 def ema(series: pd.Series, n: int):
     return ta.trend.EMAIndicator(series, window=n).ema_indicator()
@@ -164,8 +219,8 @@ def hybrid_analyze(df: pd.DataFrame, pair:Optional[str]=None, timeframe:Optional
         "confidence": round(confidence,3),
         "reasoning": reasoning
     }
-    
-    # ---------------- SCALPING ENGINE ----------------
+
+# ---------------- SCALPING ENGINE ----------------
 def scalp_engine(df: pd.DataFrame, pair:Optional[str]=None, tf:Optional[str]=None) -> dict:
     if df.shape[0] < 30:
         return {"error": "data_tidak_cukup"}
@@ -218,9 +273,9 @@ def scalp_engine(df: pd.DataFrame, pair:Optional[str]=None, tf:Optional[str]=Non
         "reasoning": reason
     }
 
-# ---------------- LOGGING & BACKTEST (PONDASI) ----------------
+# ---------------- LOGGING & BACKTEST ----------------
 def ensure_trade_log():
-    """Pastikan file trade_log.csv ada untuk mencatat semua sinyal AI"""
+    """Pastikan file trade_log.csv ada"""
     if not os.path.exists(TRADE_LOG_FILE):
         df = pd.DataFrame(columns=[
             "id", "timestamp", "pair", "timeframe", "signal_type",
@@ -230,11 +285,9 @@ def ensure_trade_log():
         df.to_csv(TRADE_LOG_FILE, index=False)
 
 def append_trade_log(record: Dict[str, Any]) -> int:
-    """Tambahkan sinyal baru ke file trade_log.csv"""
     ensure_trade_log()
     df = pd.read_csv(TRADE_LOG_FILE)
     next_id = int(df['id'].max()) + 1 if not df.empty else 1
-
     record_row = {
         "id": next_id,
         "timestamp": datetime.utcnow().isoformat(),
@@ -250,14 +303,11 @@ def append_trade_log(record: Dict[str, Any]) -> int:
         "backtest_hit": record.get("backtest_hit"),
         "backtest_pnl": record.get("backtest_pnl")
     }
-
-    df = df.append(record_row, ignore_index=True)
+    df = pd.concat([df, pd.DataFrame([record_row])], ignore_index=True)
     df.to_csv(TRADE_LOG_FILE, index=False)
     return next_id
-    
-    # ---------------- BACKTEST KOMUNIKASI ----------------
+
 def post_to_backtester(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """Mengirim hasil sinyal ke sistem backtester (jika ada)"""
     if not BACKTEST_URL:
         return {"error": "BACKTEST_URL_not_configured"}
     try:
@@ -269,15 +319,93 @@ def post_to_backtester(payload: Dict[str, Any]) -> Dict[str, Any]:
     except Exception as e:
         return {"error": "backtester_unreachable", "detail": str(e)}
 
+# ---------------- IMAGE OCR HELPERS ----------------
+def ocr_y_axis_prices(img_cv):
+    """Extract numeric labels from right-side y-axis using tesseract (best-effort)."""
+    if not _HAS_TESSERACT:
+        return {}
+    h, w = img_cv.shape[:2]
+    crop = img_cv[int(h*0.02):int(h*0.98), int(w*0.76):w].copy()
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    gray = cv2.resize(gray, None, fx=1.4, fy=1.4, interpolation=cv2.INTER_CUBIC)
+    _, th = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    th = cv2.medianBlur(th, 3)
+    config = "--psm 6 --oem 3 -c tessedit_char_whitelist=0123456789.,"
+    txt = pytesseract.image_to_string(th, config=config)
+    lines = [l.strip() for l in txt.splitlines() if l.strip()]
+    vals = []
+    for ln in lines:
+        s = ln.replace(",", ".").replace(" ", "")
+        m = re.findall(r"[\d\.]+", s)
+        if m:
+            try:
+                vals.append(float(m[0]))
+            except:
+                pass
+    if not vals:
+        return {}
+    ys = np.linspace(int(h*0.02), int(h*0.98), num=len(vals)).astype(int).tolist()
+    prices = vals
+    return {int(y): float(p) for y,p in zip(ys, prices)}
+
+def detect_candles_from_plot(img_cv, y_map, max_bars=200):
+    """Heuristic detection: HSV detection for red/green candles. Returns DF open/high/low/close."""
+    h,w,_ = img_cv.shape
+    plot = img_cv[int(h*0.06):int(h*0.94), int(w*0.06):int(w*0.94)].copy()
+    hsv = cv2.cvtColor(plot, cv2.COLOR_BGR2HSV)
+    lower_red1 = np.array([0, 40, 40]); upper_red1 = np.array([12,255,255])
+    lower_red2 = np.array([160,40,40]); upper_red2 = np.array([180,255,255])
+    lower_green = np.array([35,40,40]); upper_green = np.array([95,255,255])
+
+    mask_r = cv2.bitwise_or(cv2.inRange(hsv, lower_red1, upper_red1),
+                            cv2.inRange(hsv, lower_red2, upper_red2))
+    mask_g = cv2.inRange(hsv, lower_green, upper_green)
+    mask = cv2.bitwise_or(mask_r, mask_g)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((3,3),np.uint8), iterations=1)
+
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    candles = []
+    ys = sorted(y_map.keys()) if y_map else None
+    ps = [y_map[y] for y in ys] if ys else None
+    for c in contours:
+        x,y,cw,ch = cv2.boundingRect(c)
+        if cw < 4 or ch < 6:
+            continue
+        global_y_top = y + int(h*0.06)
+        global_y_bot = y+ch + int(h*0.06)
+        if ys and len(ys)>1:
+            high = float(np.interp(global_y_top, ys, ps))
+            low = float(np.interp(global_y_bot, ys, ps))
+        else:
+            rel_top = (y) / plot.shape[0]
+            rel_bottom = (y+ch) / plot.shape[0]
+            high = 100*(1-rel_top)
+            low = 100*(1-rel_bottom)
+        roi_g = mask_g[y:y+ch, x:x+cw]
+        roi_r = mask_r[y:y+ch, x:x+cw]
+        bullish = int(np.mean(roi_g) > np.mean(roi_r))
+        if bullish:
+            open_p = low + (high-low)*0.25
+            close_p = high - (high-low)*0.12
+        else:
+            open_p = high - (high-low)*0.25
+            close_p = low + (high-low)*0.12
+        candles.append({"x": x, "open": open_p, "high": high, "low": low, "close": close_p})
+
+    if not candles:
+        return pd.DataFrame(columns=["open","high","low","close"])
+    df = pd.DataFrame(sorted(candles, key=lambda r: r["x"]))[["open","high","low","close"]]
+    if not ys or len(ys)<=1:
+        lastc = df["close"].iloc[-1] if not df["close"].isna().all() else 1.0
+        df = df / lastc
+    return df.tail(max_bars).reset_index(drop=True)
 
 # ---------------- FEATURE ENGINEERING ----------------
 def compute_features_for_row(pair: str, timeframe: str, entry: float, tp: Optional[float], sl: float) -> Optional[Dict[str, float]]:
-    """Membuat fitur teknikal yang digunakan untuk pelatihan model"""
     try:
         kdf = fetch_ohlc_binance(pair, timeframe, limit=200)
     except Exception:
         return None
-
     kdf = kdf.tail(60).reset_index(drop=True)
     close = kdf['close'].astype(float)
     high = kdf['high'].astype(float)
@@ -289,7 +417,7 @@ def compute_features_for_row(pair: str, timeframe: str, entry: float, tp: Option
     rsi14 = ta.momentum.RSIIndicator(close, window=14).rsi().iloc[-1]
     atr14 = ta.volatility.AverageTrueRange(high, low, close, window=14).average_true_range().iloc[-1]
     vol_mean = vol.tail(40).mean() if len(vol) >= 40 else vol.mean()
-    vol_now = vol.iloc[-1]
+    vol_now = vol.iloc[-1] if len(vol)>0 else 0.0
     vol_spike = 1.0 if vol_now > vol_mean * 1.8 else 0.0
 
     recent_high = high.tail(80).max()
@@ -299,25 +427,21 @@ def compute_features_for_row(pair: str, timeframe: str, entry: float, tp: Option
     rr = abs((tp - entry) / (entry - sl)) if (tp is not None and (entry - sl) != 0) else 0.0
 
     return {
-        "ema8_21_diff": (ema8 - ema21) / entry,
+        "ema8_21_diff": (ema8 - ema21) / (entry if entry!=0 else 1),
         "rsi14": float(rsi14),
-        "atr_rel": float(atr14) / entry,
+        "atr_rel": float(atr14) / (entry if entry!=0 else 1),
         "vol_spike": float(vol_spike),
         "dist_to_high": float(dist_to_high),
         "dist_to_low": float(dist_to_low),
         "rr": float(rr)
     }
 
-
 # ---------------- LEARNING SYSTEM ----------------
 def build_dataset_from_trade_log():
-    """Bangun dataset dari trade_log.csv untuk training model pembelajaran"""
     if not os.path.exists(TRADE_LOG_FILE):
         return None, None
-
     df = pd.read_csv(TRADE_LOG_FILE)
     rows, labels = [], []
-
     for _, r in df.iterrows():
         hit = str(r.get("backtest_hit", "")).upper()
         if hit == "" or hit == "NO_HIT":
@@ -328,35 +452,32 @@ def build_dataset_from_trade_log():
             label = 0
         else:
             label = 0
-
-        feats = compute_features_for_row(
-            str(r['pair']),
-            str(r['timeframe'] or "15m"),
-            float(r['entry']),
-            r.get('tp1', None),
-            float(r['sl'])
-        )
+        try:
+            feats = compute_features_for_row(
+                str(r['pair']),
+                str(r['timeframe'] or "15m"),
+                float(r['entry']),
+                r.get('tp1', None),
+                float(r['sl'])
+            )
+        except Exception:
+            feats = None
         if feats is None:
             continue
-
         rows.append(feats)
         labels.append(label)
-
     if not rows:
         return None, None
-
     X = pd.DataFrame(rows)
     y = pd.Series(labels)
     return X, y
 
-
 def train_and_save_model():
-    """Melatih model RandomForest baru dari trade_log.csv"""
-    global _last_retrain_count
+    """Melatih model RandomForest baru dan update cache model."""
+    global _last_retrain_count, _cached_model
     X, y = build_dataset_from_trade_log()
     if X is None or len(y) < MIN_SAMPLES_TO_TRAIN:
         return {"status": "data_tidak_cukup", "samples": 0 if y is None else len(y)}
-
     X_train, X_test, y_train, y_test = train_test_split(
         X, y, test_size=0.2, random_state=42, stratify=y
     )
@@ -364,11 +485,13 @@ def train_and_save_model():
     clf.fit(X_train, y_train)
     y_pred = clf.predict(X_test)
     yprob = clf.predict_proba(X_test)[:, 1] if hasattr(clf, "predict_proba") else None
-
     report = classification_report(y_test, y_pred, output_dict=True)
     auc = roc_auc_score(y_test, yprob) if yprob is not None else None
 
     joblib.dump({"clf": clf, "features": list(X.columns)}, MODEL_FILE)
+
+    # update cache supaya tidak perlu load dari disk tiap prediksi
+    _cached_model = {"clf": clf, "features": list(X.columns)}
 
     try:
         df = pd.read_csv(TRADE_LOG_FILE)
@@ -378,14 +501,17 @@ def train_and_save_model():
 
     return {"status": "trained", "samples": len(y), "auc": auc, "report": report}
 
-
 def predict_with_model(payload: Dict[str, Any]):
-    """Prediksi probabilitas sukses sinyal menggunakan model pembelajaran"""
-    if not os.path.exists(MODEL_FILE):
-        raise RuntimeError("model_belum_dilatih")
+    """Prediksi probabilitas sukses sinyal menggunakan model pembelajaran (pakai cache jika ada)."""
+    global _cached_model
+    if _cached_model is None:
+        if not os.path.exists(MODEL_FILE):
+            raise RuntimeError("model_belum_dilatih")
+        _cached_model = joblib.load(MODEL_FILE)
 
-    mod = joblib.load(MODEL_FILE)
+    mod = _cached_model
     clf = mod["clf"]
+
     pair = payload.get("pair")
     timeframe = payload.get("timeframe") or "15m"
     entry = float(payload.get("entry"))
@@ -399,10 +525,9 @@ def predict_with_model(payload: Dict[str, Any]):
     X = pd.DataFrame([feats])
     prob = float(clf.predict_proba(X)[:, 1][0]) if hasattr(clf, "predict_proba") else float(clf.predict(X)[0])
     return {"prob": prob, "features": feats}
-    
-    # ---------------- BACKGROUND RETRAIN ----------------
+
 def maybe_trigger_retrain_background():
-    """Jalankan retrain model di background"""
+    """Jalankan retrain model di background (daemon thread)."""
     def worker():
         try:
             res = train_and_save_model()
@@ -413,7 +538,7 @@ def maybe_trigger_retrain_background():
     t.start()
 
 def check_and_trigger_retrain_if_needed():
-    """Cek apakah sudah waktunya retrain model"""
+    """Cek apakah sudah waktunya retrain model berdasarkan jumlah sinyal baru."""
     global _last_retrain_count
     with _lock:
         try:
@@ -427,15 +552,13 @@ def check_and_trigger_retrain_if_needed():
         except Exception as e:
             print("check_retrain error", e)
 
-
 # ---------------- ENDPOINT FASTAPI ----------------
 @app.get("/health")
 def health():
     return {"status": "ok", "service": "Pro Trader AI - Learning (ID)"}
 
-
 def _postprocess_with_learning(signal: Dict[str, Any]) -> Dict[str, Any]:
-    """Gabungkan hasil analisis teknikal + model AI pembelajaran"""
+    """Gabungkan hasil analisis teknikal + model AI pembelajaran (jika ada)."""
     try:
         if os.path.exists(MODEL_FILE):
             pred = predict_with_model({
@@ -462,10 +585,9 @@ def _postprocess_with_learning(signal: Dict[str, Any]) -> Dict[str, Any]:
         signal["model_error"] = str(e)
     return signal
 
-
 @app.get("/pro_signal")
 def pro_signal(pair: str = Query(...), tf_main: str = Query("1h"), tf_entry: str = Query("15m"), limit: int = Query(300), auto_log: bool = Query(False)):
-    """Analisis sinyal jangka menengah (multi-timeframe)"""
+    """Analisis sinyal jangka menengah (multi-timeframe)."""
     try:
         df_entry = fetch_ohlc_binance(pair, tf_entry, limit=limit)
     except Exception as e:
@@ -503,10 +625,9 @@ def pro_signal(pair: str = Query(...), tf_main: str = Query("1h"), tf_entry: str
 
     return JSONResponse(res)
 
-
 @app.get("/scalp_signal")
 def scalp_signal(pair: str = Query(...), tf: str = Query("3m"), limit: int = Query(300), auto_log: bool = Query(False)):
-    """Analisis sinyal scalping cepat"""
+    """Analisis sinyal scalping cepat."""
     try:
         df = fetch_ohlc_binance(pair, tf, limit=limit)
     except Exception as e:
@@ -536,10 +657,9 @@ def scalp_signal(pair: str = Query(...), tf: str = Query("3m"), limit: int = Que
 
     return JSONResponse(res)
 
-
 @app.post("/analyze_chart")
 def analyze_chart(file: UploadFile = File(...), pair: Optional[str] = Form(None), timeframe: Optional[str] = Form(None), auto_backtest: Optional[str] = Form("true")):
-    """Analisis chart dari gambar (screenshot TradingView dsb)"""
+    """Analisis chart dari gambar (screenshot TradingView dsb)."""
     auto_flag = auto_backtest.lower() != "false"
     try:
         contents = file.file.read()
@@ -577,13 +697,14 @@ def analyze_chart(file: UploadFile = File(...), pair: Optional[str] = Form(None)
         append_trade_log({
             "pair": res["pair"], "timeframe": res["timeframe"], "signal_type": res["signal_type"],
             "entry": res["entry"], "tp1": res["tp1"], "tp2": res["tp2"], "sl": res["sl"],
-            "confidence": res["confidence"], "reasoning": res["reasoning"]
+            "confidence": res["confidence"], "reasoning": res["reasoning"],
+            "backtest_hit": bt_res.get("hit") if isinstance(bt_res, dict) else None,
+            "backtest_pnl": bt_res.get("pnl_total") if isinstance(bt_res, dict) else None
         })
         check_and_trigger_retrain_if_needed()
 
     res['bars_used'] = int(df_ohlc.shape[0])
     return JSONResponse(res)
-
 
 @app.post("/analyze_csv")
 def analyze_csv(file: UploadFile = File(...), pair: Optional[str] = Form(None), timeframe: Optional[str] = Form(None)):
@@ -610,14 +731,15 @@ def analyze_csv(file: UploadFile = File(...), pair: Optional[str] = Form(None), 
     res = _postprocess_with_learning(res)
     return JSONResponse(res)
 
-
 @app.get("/learning_status")
 def learning_status():
-    """Lihat status model pembelajaran"""
     info = {"model_exists": os.path.exists(MODEL_FILE)}
     if info["model_exists"]:
-        mod = joblib.load(MODEL_FILE)
-        info["features"] = mod.get("features")
+        try:
+            mod = joblib.load(MODEL_FILE)
+            info["features"] = mod.get("features")
+        except:
+            info["features"] = None
     try:
         df = pd.read_csv(TRADE_LOG_FILE) if os.path.exists(TRADE_LOG_FILE) else pd.DataFrame()
         info["trade_log_count"] = len(df)
@@ -625,23 +747,126 @@ def learning_status():
         info["trade_log_count"] = 0
     return JSONResponse(info)
 
+@app.get("/model_debug")
+def model_debug():
+    """Endpoint debug model: fitur, last trained timestamp, importance (jika ada)."""
+    info = {"model_exists": os.path.exists(MODEL_FILE), "last_trained": None, "features": None, "feature_importance": None}
+    if os.path.exists(MODEL_FILE):
+        try:
+            mod = joblib.load(MODEL_FILE)
+            clf = mod.get("clf")
+            features = mod.get("features")
+            info["features"] = features
+            info["last_trained"] = datetime.fromtimestamp(os.path.getmtime(MODEL_FILE)).isoformat()
+            if hasattr(clf, "feature_importances_"):
+                imps = clf.feature_importances_.tolist()
+                info["feature_importance"] = dict(zip(features, [round(float(x),6) for x in imps]))
+        except Exception as e:
+            info["error_loading_model"] = str(e)
+    return JSONResponse(info)
 
 @app.get("/retrain_learning")
 def retrain_learning():
-    """Paksa retrain model AI"""
+    """Paksa retrain model AI (synchronous request)."""
     res = train_and_save_model()
     return JSONResponse(res)
 
-
 @app.get("/logs")
 def get_logs(limit: int = Query(100)):
-    """Lihat sinyal yang sudah tersimpan di log"""
     ensure_trade_log()
     df = pd.read_csv(TRADE_LOG_FILE)
     df = df.tail(limit).to_dict(orient="records")
     return JSONResponse({"logs": df})
 
+@app.get("/logs_summary")
+def logs_summary():
+    try:
+        if not os.path.exists(TRADE_LOG_FILE):
+            return JSONResponse({"detail": "Belum ada log sinyal tersimpan."})
+        df = pd.read_csv(TRADE_LOG_FILE)
+        if df.empty:
+            return JSONResponse({"detail": "Belum ada data sinyal terbaru."})
+        last = df.iloc[-1]
+        data = {
+            "pair": last.get("pair", ""),
+            "timeframe": last.get("timeframe", ""),
+            "signal_type": last.get("signal_type", ""),
+            "entry": last.get("entry", ""),
+            "tp1": last.get("tp1", ""),
+            "tp2": last.get("tp2", ""),
+            "sl": last.get("sl", ""),
+            "confidence": last.get("confidence", ""),
+            "reasoning": last.get("reasoning", "")
+        }
+        return JSONResponse(data)
+    except Exception as e:
+        return JSONResponse({"error": str(e)})
+
+@app.get("/download_logs")
+def download_logs():
+    ensure_trade_log()
+    return FileResponse(TRADE_LOG_FILE, media_type="text/csv", filename="trade_log.csv")
+
+@app.get("/ai_performance")
+def ai_performance():
+    try:
+        ensure_trade_log()
+        df = pd.read_csv(TRADE_LOG_FILE)
+        if df.empty:
+            return JSONResponse({"error": "Belum ada data sinyal untuk dianalisis."})
+        total = len(df)
+        tp_hits = df["backtest_hit"].astype(str).str.upper().str.startswith("TP").sum()
+        sl_hits = df["backtest_hit"].astype(str).str.upper().str.startswith("SL").sum()
+        winrate = round((tp_hits / total) * 100, 2) if total > 0 else 0
+        avg_conf = round(pd.to_numeric(df.get("confidence", pd.Series([])), errors="coerce").mean(), 3)
+        pnl_values = pd.to_numeric(df.get("backtest_pnl", pd.Series([])), errors="coerce").dropna()
+        total_pnl = float(pnl_values.sum()) if not pnl_values.empty else 0.0
+        profit_factor = None
+        if not pnl_values.empty and (pnl_values < 0).any():
+            prof = pnl_values[pnl_values > 0].sum()
+            loss = abs(pnl_values[pnl_values < 0].sum())
+            profit_factor = round(prof / loss, 2) if loss != 0 else None
+        max_drawdown = float(pnl_values.min()) if not pnl_values.empty else 0.0
+        pair_stats = []
+        for pair, group in df.groupby("pair"):
+            tp_pair = group["backtest_hit"].astype(str).str.upper().str.startswith("TP").sum()
+            wr_pair = round((tp_pair / len(group)) * 100, 2)
+            pair_stats.append({"pair": pair, "signals": len(group), "winrate": wr_pair})
+        pair_stats = sorted(pair_stats, key=lambda x: x["signals"], reverse=True)
+        tf_stats = []
+        for tf, group in df.groupby("timeframe"):
+            tp_tf = group["backtest_hit"].astype(str).str.upper().str.startswith("TP").sum()
+            wr_tf = round((tp_tf / len(group)) * 100, 2)
+            tf_stats.append({"timeframe": tf, "signals": len(group), "winrate": wr_tf})
+        tf_stats = sorted(tf_stats, key=lambda x: x["signals"], reverse=True)
+        model_exists = os.path.exists(MODEL_FILE)
+        data = {
+            "total_signals": total,
+            "tp_hits": int(tp_hits),
+            "sl_hits": int(sl_hits),
+            "winrate": winrate,
+            "avg_confidence": avg_conf,
+            "total_pnl": total_pnl,
+            "profit_factor": profit_factor,
+            "max_drawdown": max_drawdown,
+            "pair_stats": pair_stats,
+            "tf_stats": tf_stats,
+            "model_status": "✅ Sudah Dilatih" if model_exists else "❌ Belum Ada Model"
+        }
+        return JSONResponse(data)
+    except Exception as e:
+        return JSONResponse({"error": str(e)})
 
 # ---------------- STARTUP ----------------
-ensure_trade_log()
-# Jalankan server: uvicorn main_combined_learning:app --host 0.0.0.0 --port $PORT
+@app.on_event("startup")
+def startup_event():
+    ensure_trade_log()
+    global _cached_model
+    if os.path.exists(MODEL_FILE):
+        try:
+            _cached_model = joblib.load(MODEL_FILE)
+            print("Loaded cached model on startup.")
+        except Exception as e:
+            print("Failed load cached model on startup:", e)
+
+# Run server: uvicorn main_combined_learning:app --host 0.0.0.0 --port $PORT

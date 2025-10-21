@@ -291,4 +291,73 @@ def keep_alive_loop():
 
 threading.Thread(target=keep_alive_loop, daemon=True).start()
 
+
+# ---------------- TELEGRAM BOT ----------------
+if telebot and TELEGRAM_TOKEN:
+    try:
+        bot = telebot.TeleBot(TELEGRAM_TOKEN)
+
+        @bot.message_handler(commands=['start'])
+        def _welcome(msg):
+            bot.reply_to(msg, "👋 Halo! Kirim pair + timeframe (contoh: BTCUSDT 1h) atau kirim gambar chart untuk dianalisis.")
+
+        @bot.message_handler(func=lambda m: True, content_types=['text'])
+        def _handle_text(msg):
+            try:
+                parts = msg.text.strip().upper().split()
+                if len(parts) < 1:
+                    bot.reply_to(msg, "⚠️ Format salah. Contoh: BTCUSDT 15m")
+                    return
+                pair = parts[0]
+                tf = parts[1] if len(parts) > 1 else '15m'
+                url = f"{APP_URL}/pro_signal?pair={pair}&tf_main={tf}&tf_entry={tf}"
+                r = requests.get(url, timeout=25)
+                if r.status_code == 200:
+                    d = r.json()
+                    bot.send_message(msg.chat.id, f"📈 {pair} ({tf})\n🎯 Entry: {d.get('entry')}\n💰 TP1: {d.get('tp1')} | TP2: {d.get('tp2')}\n🛑 SL: {d.get('sl')}\n📊 Conf: {d.get('confidence')}\n💬 {d.get('reasoning')}", parse_mode='HTML')
+                else:
+                    bot.send_message(msg.chat.id, f"❌ Gagal ambil sinyal: {r.text}")
+            except Exception as e:
+                bot.send_message(msg.chat.id, f"🚫 Error: {e}")
+
+        @bot.message_handler(content_types=['photo'])
+        def _handle_photo(msg):
+            try:
+                file_id = msg.photo[-1].file_id
+                file_info = bot.get_file(file_id)
+                file_url = f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{file_info.file_path}"
+                img_data = requests.get(file_url).content
+                files = {'file': ('chart.png', img_data, 'image/png')}
+                data = {'pair': 'IMG', 'timeframe': 'chart'}
+                r = requests.post(f"{APP_URL}/analyze_chart", files=files, data=data, timeout=40)
+                if r.status_code == 200:
+                    d = r.json()
+                    bot.send_message(msg.chat.id, f"📊 Analisis Chart\n🎯 Entry: {d.get('entry')}\n💰 TP1: {d.get('tp1')} | TP2: {d.get('tp2')}\n🛑 SL: {d.get('sl')}\n📈 Sinyal: {d.get('signal_type')}\n📊 Conf: {d.get('confidence')}\n💬 {d.get('reasoning')}", parse_mode='HTML')
+                else:
+                    bot.send_message(msg.chat.id, f"❌ Gagal analisa gambar: {r.text}")
+            except Exception as e:
+                bot.send_message(msg.chat.id, f"🚫 Error: {e}")
+
+        threading.Thread(target=lambda: bot.polling(non_stop=True), daemon=True).start()
+        logger.info("🤖 Telegram Bot aktif (menerima teks & gambar)")
+    except Exception as e:
+        logger.exception("Gagal menjalankan bot Telegram")
+else:
+    logger.warning("⚠️ TELEGRAM_TOKEN belum diset atau library telebot tidak tersedia.")
 logger.info("✅ Pro Trader AI v3 siap & aktif penuh!")
+
+from fastapi.responses import HTMLResponse
+
+@app.get("/", response_class=HTMLResponse)
+def home():
+    return """
+    <html>
+    <head><title>Pro Trader AI v3</title></head>
+    <body style="background-color:#0b0b0b;color:#00ff99;font-family:sans-serif;text-align:center;padding:40px;">
+        <h2>🚀 Pro Trader AI v3 Aktif</h2>
+        <p>Server berjalan dengan stabil di Railway.</p>
+        <p>🤖 Telegram Bot status: {status}</p>
+        <p>Gunakan perintah <b>/start</b> di Telegram untuk memulai.</p>
+    </body>
+    </html>
+    """.format(status="✅ Aktif" if TELEGRAM_TOKEN else "❌ Tidak Aktif")

@@ -689,6 +689,74 @@ def learning_status_summary():
     except Exception as e:
         return JSONResponse({"error": str(e)})
 
+
+@app.get("/ai_performance")
+def ai_performance():
+    """Menghitung statistik performa AI global + per pair dan timeframe"""
+    try:
+        ensure_trade_log()
+        df = pd.read_csv(TRADE_LOG_FILE)
+        if df.empty:
+            return JSONResponse({"error": "Belum ada data sinyal untuk dianalisis."})
+
+        total = len(df)
+        tp_hits = df["backtest_hit"].astype(str).str.upper().str.startswith("TP").sum()
+        sl_hits = df["backtest_hit"].astype(str).str.upper().str.startswith("SL").sum()
+        winrate = round((tp_hits / total) * 100, 2) if total > 0 else 0
+        avg_conf = round(df["confidence"].mean(), 3) if "confidence" in df.columns else 0
+
+        pnl_values = pd.to_numeric(df.get("backtest_pnl", []), errors="coerce").dropna()
+        total_pnl = pnl_values.sum() if not pnl_values.empty else 0
+        profit_factor = round(abs(pnl_values[pnl_values > 0].sum() / abs(pnl_values[pnl_values < 0].sum())), 2) if (pnl_values < 0).any() else None
+        max_drawdown = round(pnl_values.min(), 3) if not pnl_values.empty else 0
+
+        # === Statistik Per Pair ===
+        pair_stats = []
+        for pair, group in df.groupby("pair"):
+            if group.empty:
+                continue
+            tp_pair = group["backtest_hit"].astype(str).str.upper().str.startswith("TP").sum()
+            wr_pair = round((tp_pair / len(group)) * 100, 2)
+            pair_stats.append({
+                "pair": pair,
+                "signals": len(group),
+                "winrate": wr_pair
+            })
+        pair_stats = sorted(pair_stats, key=lambda x: x["signals"], reverse=True)
+
+        # === Statistik Per Timeframe ===
+        tf_stats = []
+        for tf, group in df.groupby("timeframe"):
+            if group.empty:
+                continue
+            tp_tf = group["backtest_hit"].astype(str).str.upper().str.startswith("TP").sum()
+            wr_tf = round((tp_tf / len(group)) * 100, 2)
+            tf_stats.append({
+                "timeframe": tf,
+                "signals": len(group),
+                "winrate": wr_tf
+            })
+        tf_stats = sorted(tf_stats, key=lambda x: x["signals"], reverse=True)
+
+        model_exists = os.path.exists(MODEL_FILE)
+        data = {
+            "total_signals": total,
+            "tp_hits": int(tp_hits),
+            "sl_hits": int(sl_hits),
+            "winrate": winrate,
+            "avg_confidence": avg_conf,
+            "total_pnl": total_pnl,
+            "profit_factor": profit_factor,
+            "max_drawdown": max_drawdown,
+            "pair_stats": pair_stats,
+            "tf_stats": tf_stats,
+            "model_status": "✅ Sudah Dilatih" if model_exists else "❌ Belum Ada Model"
+        }
+
+        return JSONResponse(data)
+    except Exception as e:
+        return JSONResponse({"error": str(e)})
+
 # ---------------- STARTUP ----------------
 ensure_trade_log()
 # Jalankan server: uvicorn main_combined_learning:app --host 0.0.0.0 --port $PORT

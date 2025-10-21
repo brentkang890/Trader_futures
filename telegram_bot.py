@@ -6,7 +6,7 @@ import os
 # === KONFIGURASI DARI RAILWAY VARIABLE ===
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "8483103988:AAHeHGuHA6T0rx6nRN-w5bgGrYlf0kbmgHs")
 CHAT_ID = os.environ.get("CHAT_ID", "6123645566")
-APP_URL = os.environ.get("APP_URL", "https://web-production-af34.up.railway.app")  # ganti ke URL aktif AI-mu
+APP_URL = os.environ.get("APP_URL", "https://web-production-af34.up.railway.app")  # URL aktif AI
 
 # === FUNGSI KIRIM PESAN TELEGRAM ===
 def send_message(text):
@@ -33,10 +33,10 @@ def handle_command(command):
         parts = command.strip().split()
         if len(parts) == 2:
             pair, tf = parts
-            url = f"{APP_URL}/pro_signal?pair={pair.upper()}&tf_entry={tf}&auto_log=true"
+            url = f"{APP_URL}/pro_signal?pair={pair.upper()}&tf_entry={tf}"
         elif len(parts) == 1:
             pair = parts[0]
-            url = f"{APP_URL}/pro_signal?pair={pair.upper()}&tf_entry=15m&auto_log=true"
+            url = f"{APP_URL}/pro_signal?pair={pair.upper()}&tf_entry=15m"
         else:
             return "⚠️ Format salah!\n\nGunakan format:\n<b>BTCUSDT 15m</b> atau <b>ETHUSDT</b>"
 
@@ -84,7 +84,7 @@ def main():
                         else:
                             response = handle_command(text)
                             send_message(response)
-            time.sleep(3)  # biar ringan di Railway Free Tier
+            time.sleep(3)
 
         except Exception as e:
             print(f"[ERROR LOOP] {e}")

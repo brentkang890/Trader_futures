@@ -9,6 +9,7 @@ RUN apt-get update && apt-get install -y \
     tesseract-ocr \
     libgl1 \
     libglib2.0-0 \
+    supervisor \
     && rm -rf /var/lib/apt/lists/*
 
 # ================================
@@ -17,7 +18,7 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /app
 
 # ================================
-# 📦 Copy all project files
+# 📦 Copy project files
 # ================================
 COPY . .
 
@@ -33,6 +34,13 @@ ENV PORT=8000
 ENV PYTHONUNBUFFERED=1
 
 # ================================
-# 🚀 Run both FastAPI (AI) + Telegram Bot together
+# 🧠 Supervisor configuration
 # ================================
-CMD sh -c "uvicorn main_combined_learning:app --host 0.0.0.0 --port ${PORT:-8000} & python telegram_bot.py"
+RUN echo "[supervisord]\nnodaemon=true\n\
+[program:fastapi]\ncommand=uvicorn main_combined_learning:app --host 0.0.0.0 --port ${PORT:-8000}\nautorestart=true\n\
+[program:telegrambot]\ncommand=python telegram_bot.py\nautorestart=true" > /etc/supervisor/conf.d/supervisord.conf
+
+# ================================
+# 🚀 Run both services
+# ================================
+CMD ["supervisord", "-c", "/etc/supervisor/conf.d/supervisord.conf"]

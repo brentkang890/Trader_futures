@@ -6,7 +6,7 @@
     "description": "API untuk Pro Trader AI (Bahasa Indonesia)"
   },
   "servers": [
-    { "url": "https://<YOUR_RAILWAY_URL>" }
+    { "url": "https:/https://web-production-af34.up.railway.app" }
   ],
   "paths": {
     "/health": {},

@@ -1,97 +1,119 @@
 import requests
 import time
-import json
 import os
 
-# === KONFIGURASI DARI RAILWAY VARIABLE ===
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "8483103988:AAHeHGuHA6T0rx6nRN-w5bgGrYlf0kbmgHs")
-CHAT_ID = os.environ.get("CHAT_ID", "6123645566")
-APP_URL = os.environ.get("APP_URL", "https://web-production-af34.up.railway.app")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+CHAT_ID = os.environ.get("CHAT_ID", "")
+APP_URL = os.environ.get("APP_URL", "")
 
-# === FUNGSI KIRIM PESAN TELEGRAM ===
 def send_message(text):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML"}
     try:
-        response = requests.post(url, json=payload, timeout=10)
-        if response.status_code != 200:
-            print(f"[WARN] Gagal kirim pesan: {response.text}")
+        requests.post(url, json=payload, timeout=10)
     except Exception as e:
         print(f"[ERROR] Gagal kirim pesan Telegram: {e}")
 
-# === FUNGSI MENGAMBIL PESAN BARU ===
 def get_updates(offset=None):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
-    params = {"timeout": 60, "offset": offset}
+    params = {"timeout": 100, "offset": offset}
     try:
-        return requests.get(url, params=params, timeout=65).json()
+        return requests.get(url, params=params, timeout=120).json()
     except Exception as e:
         print(f"[ERROR] Gagal ambil update: {e}")
         return {}
 
-# === FUNGSI HANDLE COMMAND USER ===
-def handle_command(command):
+def handle_text_command(command):
     try:
-        parts = command.strip().split()
-        if len(parts) == 2:
-            pair, tf = parts
-            url = f"{APP_URL}/pro_signal?pair={pair.upper()}&tf_main=tf_{tf}"
-        elif len(parts) == 1:
-            pair = parts[0]
-            url = f"{APP_URL}/pro_signal?pair={pair.upper()}&tf_main=tf_15m"
-        else:
-            return "⚠️ Format salah!\n\nGunakan format:\n<b>BTCUSDT 15m</b> atau <b>ETHUSDT</b>"
+        cmd = command.lower().strip()
 
-        print(f"[INFO] Fetching signal dari: {url}")
+        if cmd.startswith("scalp "):
+            pair = cmd.split()[1].upper()
+            url = f"{APP_URL}/scalp_signal?pair={pair}&tf=3m"
+        elif cmd.startswith("log"):
+            url = f"{APP_URL}/logs"
+        elif cmd.startswith("status"):
+            url = f"{APP_URL}/learning_status"
+        elif len(cmd.split()) == 2:
+            pair, tf = cmd.split()
+            url = f"{APP_URL}/pro_signal?pair={pair.upper()}&tf_entry={tf}"
+        elif len(cmd.split()) == 1:
+            pair = cmd.split()[0]
+            url = f"{APP_URL}/pro_signal?pair={pair.upper()}&tf_entry=15m"
+        else:
+            return "⚠️ Format salah!\nGunakan: <b>BTCUSDT 15m</b> atau <b>scalp BTCUSDT</b>"
+
+        print(f"[INFO] Fetching {url}")
         r = requests.get(url, timeout=25)
-
-        if r.status_code == 200:
-            data = r.json()
-            msg = (
-                f"📊 <b>{data['pair']} ({data['timeframe']})</b>\n"
-                f"💡 Signal: <b>{data['signal_type']}</b>\n"
-                f"🎯 Entry: {data['entry']}\n"
-                f"🎯 TP1: {data['tp1']}\n"
-                f"🎯 TP2: {data['tp2']}\n"
-                f"🛡 SL: {data['sl']}\n"
-                f"📈 Confidence: {data['confidence']}\n\n"
-                f"🧠 Reasoning: {data['reasoning']}"
-            )
-            return msg
-        else:
+        if r.status_code != 200:
             return f"⚠️ Gagal ambil sinyal: {r.text}"
 
-    except Exception as e:
-        print(f"[ERROR] Saat handle command: {e}")
-        return f"❌ Terjadi error: {e}"
+        d = r.json()
+        msg = (
+            f"📊 <b>{d.get('pair', '')} ({d.get('timeframe', '')})</b>\n"
+            f"💡 Signal: <b>{d.get('signal_type', '')}</b>\n"
+            f"🎯 Entry: {d.get('entry', '')}\n"
+            f"🎯 TP1: {d.get('tp1', '')}\n"
+            f"🎯 TP2: {d.get('tp2', '')}\n"
+            f"🛡 SL: {d.get('sl', '')}\n"
+            f"📈 Confidence: {d.get('confidence', '')}\n\n"
+            f"🧠 Reasoning: {d.get('reasoning', '')}"
+        )
+        return msg
 
-# === PROGRAM UTAMA ===
+    except Exception as e:
+        print(f"[ERROR] {e}")
+        return f"❌ Error: {e}"
+
+def handle_photo(photo_id):
+    """Analisis gambar chart"""
+    try:
+        info = requests.get(f"https://api.telegram.org/bot{BOT_TOKEN}/getFile?file_id={photo_id}").json()
+        file_path = info["result"]["file_path"]
+        file_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
+        img = requests.get(file_url).content
+
+        files = {"file": ("chart.png", img, "image/png")}
+        r = requests.post(f"{APP_URL}/analyze_chart", files=files, timeout=60)
+        if r.status_code != 200:
+            send_message(f"⚠️ Gagal analisis chart: {r.text}")
+            return
+        d = r.json()
+        msg = (
+            f"📉 <b>Analisis Gambar Chart</b>\n"
+            f"💡 Signal: <b>{d['signal_type']}</b>\n"
+            f"🎯 Entry: {d['entry']}\n"
+            f"🎯 TP1: {d['tp1']}\n"
+            f"🎯 TP2: {d['tp2']}\n"
+            f"🛡 SL: {d['sl']}\n"
+            f"📈 Confidence: {d['confidence']}\n\n"
+            f"🧠 Reasoning: {d['reasoning']}"
+        )
+        send_message(msg)
+    except Exception as e:
+        send_message(f"❌ Error analisis gambar: {e}")
+
 def main():
     offset = None
-    print(f"🤖 BOT AKTIF | Terhubung ke: {APP_URL}")
-    send_message("🤖 <b>Pro Trader AI Bot Aktif dan Siap Membantu!</b>")
+    send_message("🤖 <b>Pro Trader AI Bot aktif & terhubung ke AI Agent!</b>\nKirim: <b>BTCUSDT 15m</b> atau gambar chart.")
 
     while True:
-        try:
-            updates = get_updates(offset)
-            if "result" in updates:
-                for update in updates["result"]:
-                    offset = update["update_id"] + 1
-                    if "message" in update and "text" in update["message"]:
-                        text = update["message"]["text"].strip()
-                        if text.startswith("/start"):
-                            send_message(
-                                "👋 Halo! Kirim pair + timeframe (contoh: <b>BTCUSDT 15m</b>)\n"
-                                "Atau kirim <b>BTCUSDT</b> untuk default timeframe 15m."
-                            )
-                        else:
-                            response = handle_command(text)
-                            send_message(response)
-            time.sleep(2)  # Lebih responsif
+        updates = get_updates(offset)
+        if "result" in updates:
+            for upd in updates["result"]:
+                offset = upd["update_id"] + 1
+                msg = upd.get("message", {})
 
-        except Exception as e:
-            print(f"[ERROR LOOP] {e}")
-            time.sleep(5)
+                if "text" in msg:
+                    text = msg["text"].strip()
+                    if text.startswith("/start"):
+                        send_message("👋 Kirim pair + timeframe (contoh: <b>BTCUSDT 15m</b>)\nAtau kirim gambar chart.")
+                    else:
+                        send_message(handle_text_command(text))
+                elif "photo" in msg:
+                    photo_id = msg["photo"][-1]["file_id"]
+                    handle_photo(photo_id)
+        time.sleep(2)
 
 if __name__ == "__main__":
     main()

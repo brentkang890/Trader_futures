@@ -918,6 +918,40 @@ def ai_performance():
         return JSONResponse(data)
     except Exception as e:
         return JSONResponse({"error": str(e)})
+# ---------------- LOGGING ----------------
+def ensure_trade_log():
+    """Pastikan file trade_log.csv ada"""
+    if not os.path.exists(TRADE_LOG_FILE):
+        df = pd.DataFrame(columns=[
+            "id", "timestamp", "pair", "timeframe", "signal_type",
+            "entry", "tp1", "tp2", "sl", "confidence", "reasoning",
+            "backtest_hit", "backtest_pnl"
+        ])
+        df.to_csv(TRADE_LOG_FILE, index=False)
+
+
+def append_trade_log(record: Dict[str, Any]):
+    """Tambahkan satu record sinyal ke file trade_log.csv"""
+    ensure_trade_log()
+    df = pd.read_csv(TRADE_LOG_FILE)
+    next_id = int(df['id'].max()) + 1 if not df.empty else 1
+    record_row = {
+        "id": next_id,
+        "timestamp": datetime.utcnow().isoformat(),
+        "pair": record.get("pair"),
+        "timeframe": record.get("timeframe"),
+        "signal_type": record.get("signal_type"),
+        "entry": record.get("entry"),
+        "tp1": record.get("tp1"),
+        "tp2": record.get("tp2"),
+        "sl": record.get("sl"),
+        "confidence": record.get("confidence"),
+        "reasoning": record.get("reasoning"),
+        "backtest_hit": record.get("backtest_hit"),
+        "backtest_pnl": record.get("backtest_pnl")
+    }
+    df = pd.concat([df, pd.DataFrame([record_row])], ignore_index=True)
+    df.to_csv(TRADE_LOG_FILE, index=False)
 
 # ---------------- STARTUP ----------------
 @app.on_event("startup")

@@ -11,6 +11,7 @@ Pro Trader AI - Combined + Learning (Bahasa Indonesia)
 import os
 import io
 import re
+import csv
 import threading
 import time
 from datetime import datetime

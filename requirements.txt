@@ -1,5 +1,5 @@
 fastapi
-uvicorn
+uvicorn[standard]
 pandas
 numpy
 requests
@@ -10,4 +10,3 @@ pillow
 opencv-python-headless
 pytesseract
 python-multipart
-yfinance

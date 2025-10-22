@@ -70,14 +70,27 @@ _cached_model = None  # cache untuk model yang dimuat dari disk
 
 # ---------------- UTILITAS ----------------
 def ensure_trade_log():
-    """Pastikan file trade_log.csv ada"""
-    if not os.path.exists(TRADE_LOG_FILE):
-        df = pd.DataFrame(columns=[
-            "id", "timestamp", "pair", "timeframe", "signal_type",
-            "entry", "tp1", "tp2", "sl", "confidence", "reasoning",
-            "backtest_hit", "backtest_pnl"
+    """Pastikan file trade_log.csv ada."""
+    if not os.path.exists(TRADE_LOG):
+        with open(TRADE_LOG, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["timestamp", "pair", "signal_type", "entry", "tp1", "tp2", "sl", "confidence"])
+
+def append_trade_log(logrec):
+    """Tambahkan 1 baris log hasil sinyal ke trade_log.csv"""
+    ensure_trade_log()
+    with open(TRADE_LOG, "a", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            datetime.utcnow().isoformat(),
+            logrec.get("pair"),
+            logrec.get("signal_type"),
+            logrec.get("entry"),
+            logrec.get("tp1"),
+            logrec.get("tp2"),
+            logrec.get("sl"),
+            logrec.get("confidence")
         ])
-        df.to_csv(TRADE_LOG_FILE, index=False)
 
 def detect_market(pair: str) -> str:
     """Tentukan apakah pair crypto atau forex (best-effort)."""

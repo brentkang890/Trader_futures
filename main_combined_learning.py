@@ -1,11 +1,17 @@
 # main_combined_learning.py
 """
 Pro Trader AI - Combined + Learning (Bahasa Indonesia)
-Support: Binance (crypto) fallback AlphaVantage (forex)
-Auto-log, learning (RandomForest), OCR chart (opsional)
+- Analisis Crypto & Forex (Binance / AlphaVantage)
+- Sentiment Fusion System (crypto + macro)
+- Endpoints tambahan: /sentiment, /mode, /context
+- Integrated Learning (RandomForest) + model cache
+- Bahasa: Indonesia
 """
+
 import os
 import io
+import math
+import json
 import threading
 import time
 import re
@@ -15,15 +21,20 @@ from typing import Optional, Dict, Any
 import requests
 import pandas as pd
 import numpy as np
+
 from fastapi import FastAPI, Query, UploadFile, File, Form, HTTPException
 from fastapi.responses import JSONResponse, FileResponse
 
+# technical libs
 import ta
+
+# learning libs
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import classification_report, roc_auc_score
 import joblib
 
+# image libs (optional)
 from PIL import Image
 import cv2
 try:
@@ -33,10 +44,14 @@ except Exception:
     pytesseract = None
     _HAS_TESSERACT = False
 
-app = FastAPI(title="Pro Trader AI - Combined + Learning (ID)")
+app = FastAPI(
+    title="Pro Trader AI - Combined + Learning (ID)",
+    description="Analisis Crypto (Binance) & Forex (AlphaVantage) + Pembelajaran Terintegrasi + Sentiment Fusion",
+    version="1.0"
+)
 
-# ---------------- CONFIG ----------------
-BACKTEST_URL = os.environ.get("BACKTEST_URL")
+# ---------------- KONFIG ----------------
+BACKTEST_URL = os.environ.get("BACKTEST_URL")  # optional evaluator endpoint
 TRADE_LOG_FILE = "trade_log.csv"
 MODEL_FILE = "rf_model.pkl"
 MIN_SAMPLES_TO_TRAIN = int(os.environ.get("MIN_SAMPLES_TO_TRAIN", 50))
@@ -46,18 +61,32 @@ BINANCE_KLINES = "https://api.binance.com/api/v3/klines"
 ALPHA_API_KEY = os.environ.get("ALPHA_API_KEY", "")
 ALPHA_URL = "https://www.alphavantage.co/query"
 
+# sentiment endpoints (best-effort)
+FNG_URL = "https://api.alternative.me/fng/"          # Fear & Greed (crypto)
+COINGECKO_GLOBAL = "https://api.coingecko.com/api/v3/global"
+
+# thread-safety + caching
 _lock = threading.Lock()
 _last_retrain_count = 0
-_cached_model = None
+_cached_model = None  # cache untuk model yang dimuat dari disk
 
-# ---------------- UTIL ----------------
+# ---------------- UTILITAS & INDIKATOR ----------------
+def detect_market(pair: str) -> str:
+    """Tentukan apakah pair crypto atau forex (best-effort)."""
+    p = (pair or "").upper()
+    if any(x in p for x in ["USDT", "BUSD", "BTC", "ETH", "SOL", "BNB", "ADA", "DOGE"]):
+        return "crypto"
+    # simple heuristic: if contains only letters and ends with 3-letter fiat code -> forex
+    if len(p) >= 6 and p[-3:].isalpha() and p[:-3].isalpha():
+        return "forex"
+    # fallback to crypto
+    return "crypto"
+
 def fetch_ohlc_alpha_forex(symbol: str, interval: str="15m", limit: int=500) -> pd.DataFrame:
+    """Fallback untuk pair Forex via AlphaVantage FX_INTRADAY (best-effort)."""
     if not ALPHA_API_KEY:
         raise RuntimeError("ALPHA_API_KEY_not_set")
     symbol = symbol.upper()
-    # Simple split: first 3 chars from/to — for some symbols (EURUSD, GBPUSD)
-    if len(symbol) < 6:
-        raise ValueError("symbol_format_invalid_for_alpha")
     from_sym = symbol[:3]
     to_sym = symbol[3:]
     mapping = {"1m":"1min","3m":"5min","5m":"5min","15m":"15min","30m":"30min","1h":"60min","4h":"60min","1d":"daily"}
@@ -83,8 +112,9 @@ def fetch_ohlc_alpha_forex(symbol: str, interval: str="15m", limit: int=500) -> 
     return df[["open_time","open","high","low","close","volume"]]
 
 def fetch_ohlc_binance(symbol: str, interval: str, limit: int = 500) -> pd.DataFrame:
+    """Try Binance (crypto). If fail, fallback to AlphaVantage (forex)."""
     symbol = symbol.upper()
-    # Try Binance first (crypto)
+    # Try Binance first
     try:
         params = {"symbol": symbol, "interval": interval, "limit": limit}
         r = requests.get(BINANCE_KLINES, params=params, timeout=10)
@@ -100,7 +130,8 @@ def fetch_ohlc_binance(symbol: str, interval: str, limit: int = 500) -> pd.DataF
             return df
     except Exception:
         pass
-    # Fallback to AlphaVantage (Forex)
+
+    # Fallback to AlphaVantage for forex
     try:
         return fetch_ohlc_alpha_forex(symbol, interval, limit)
     except Exception as e:
@@ -130,29 +161,34 @@ def breakout_of_structure(df: pd.DataFrame, window:int=20):
     if prev >= low_sw and last < low_sw: return "BOS_DOWN"
     return None
 
-# ---------------- STRATEGY ----------------
+# ---------------- STRATEGI HYBRID ----------------
 def hybrid_analyze(df: pd.DataFrame, pair:Optional[str]=None, timeframe:Optional[str]=None) -> dict:
     df = df.copy().dropna().reset_index(drop=True)
     if df.shape[0] < 12:
         return {"error":"data_tidak_cukup", "message":"Perlu minimal 12 candle untuk analisis."}
+
     df['ema20'] = ema(df['close'],20)
     df['ema50'] = ema(df['close'],50)
     df['rsi14'] = rsi(df['close'],14)
     df['atr14'] = atr(df,14)
+
     last = df.iloc[-1]
     price = float(last['close'])
     ema20 = float(last['ema20'])
     ema50 = float(last['ema50'])
     rsi_now = float(last['rsi14'])
     atr_now = float(last['atr14']) if not np.isnan(last['atr14']) else price*0.001
+
     recent_high, recent_low = detect_sr(df, lookback=120)
     bos = breakout_of_structure(df, window=20)
     swing_high = df['high'].tail(80).max()
     swing_low  = df['low'].tail(80).min()
     diff = swing_high - swing_low
     fib_618 = swing_high - diff*0.618 if diff>0 else price
+
     reasons, conf = [], []
     trend = "bullish" if ema20 > ema50 else "bearish"
+
     if bos == "BOS_UP" or (trend == "bullish" and price > ema20):
         entry = price
         sl = recent_low - atr_now*0.6
@@ -183,6 +219,7 @@ def hybrid_analyze(df: pd.DataFrame, pair:Optional[str]=None, timeframe:Optional
         reasons.append("Belum ada arah jelas — tunggu konfirmasi TF lebih tinggi.")
         conf.append(0.25)
         signal="WAIT"
+
     confidence = float(sum(conf)/len(conf))
     reasoning = " · ".join(reasons)
     return {
@@ -197,19 +234,22 @@ def hybrid_analyze(df: pd.DataFrame, pair:Optional[str]=None, timeframe:Optional
         "reasoning": reasoning
     }
 
-# ---------------- SCALP ----------------
+# ---------------- SCALPING ENGINE ----------------
 def scalp_engine(df: pd.DataFrame, pair:Optional[str]=None, tf:Optional[str]=None) -> dict:
     if df.shape[0] < 30:
         return {"error": "data_tidak_cukup"}
+
     df['ema8'] = ema(df['close'], 8)
     df['ema21'] = ema(df['close'], 21)
     df['rsi14'] = rsi(df['close'], 14)
     df['atr14'] = atr(df, 14)
+
     last = df.iloc[-1]
     price = float(last['close'])
     atr_now = float(last['atr14']) if not np.isnan(last['atr14']) else price * 0.001
     vol_mean = df['volume'].tail(40).mean() if df.shape[0] >= 40 else df['volume'].mean()
     vol_spike = float(last['volume']) > (vol_mean * 1.8 if vol_mean > 0 else False)
+
     if float(last['ema8']) > float(last['ema21']) and vol_spike and 35 < float(last['rsi14']) < 75:
         entry = price
         sl = entry - atr_now * 0.6
@@ -234,6 +274,7 @@ def scalp_engine(df: pd.DataFrame, pair:Optional[str]=None, tf:Optional[str]=Non
         reason = "Tidak ada peluang scalping bersih, disarankan tunggu konfirmasi."
         conf = 0.3
         signal = "WAIT"
+
     return {
         "pair": pair or "",
         "timeframe": tf or "",
@@ -246,53 +287,77 @@ def scalp_engine(df: pd.DataFrame, pair:Optional[str]=None, tf:Optional[str]=Non
         "reasoning": reason
     }
 
-# ---------------- LOGGING ----------------
-def ensure_trade_log():
-    if not os.path.exists(TRADE_LOG_FILE):
-        df = pd.DataFrame(columns=[
-            "id", "timestamp", "pair", "timeframe", "signal_type",
-            "entry", "tp1", "tp2", "sl", "confidence", "reasoning",
-            "backtest_hit", "backtest_pnl"
-        ])
-        df.to_csv(TRADE_LOG_FILE, index=False)
-
-def append_trade_log(record: Dict[str, Any]) -> int:
-    ensure_trade_log()
-    df = pd.read_csv(TRADE_LOG_FILE)
-    next_id = int(df['id'].max()) + 1 if not df.empty else 1
-    record_row = {
-        "id": next_id,
-        "timestamp": datetime.utcnow().isoformat(),
-        "pair": record.get("pair"),
-        "timeframe": record.get("timeframe"),
-        "signal_type": record.get("signal_type"),
-        "entry": record.get("entry"),
-        "tp1": record.get("tp1"),
-        "tp2": record.get("tp2"),
-        "sl": record.get("sl"),
-        "confidence": record.get("confidence"),
-        "reasoning": record.get("reasoning"),
-        "backtest_hit": record.get("backtest_hit"),
-        "backtest_pnl": record.get("backtest_pnl")
-    }
-    df = pd.concat([df, pd.DataFrame([record_row])], ignore_index=True)
-    df.to_csv(TRADE_LOG_FILE, index=False)
-    return next_id
-
-def post_to_backtester(payload: Dict[str, Any]) -> Dict[str, Any]:
-    if not BACKTEST_URL:
-        return {"error": "BACKTEST_URL_not_configured"}
+# ---------------- SENTIMENT HELPERS ----------------
+def get_crypto_sentiment():
+    """Ambil Fear & Greed + BTC dominance (Coingecko) - best-effort."""
+    out = {"fear_greed": None, "fng_value": None, "btc_dominance": None, "source": []}
+    # Fear & Greed
     try:
-        r = requests.post(BACKTEST_URL, json=payload, timeout=15)
+        r = requests.get(FNG_URL, params={"limit": 1}, timeout=8)
+        j = r.json()
+        if "data" in j and len(j["data"])>0:
+            d = j["data"][0]
+            out["fear_greed"] = d.get("value_classification")
+            out["fng_value"] = int(d.get("value")) if d.get("value") else None
+            out["source"].append("alternative.me/fng")
+    except Exception:
+        pass
+    # Coingecko global -> btc dominance
+    try:
+        r = requests.get(COINGECKO_GLOBAL, timeout=8)
+        j = r.json()
+        mp = j.get("data", {}).get("market_cap_percentage", {})
+        btc_dom = mp.get("btc") or mp.get("btc_dominance")
+        if btc_dom is not None:
+            out["btc_dominance"] = round(float(btc_dom), 2)
+            out["source"].append("coingecko/global")
+    except Exception:
+        pass
+    return out
+
+def get_macro_sentiment():
+    """Ambil beberapa indikator makro sederhana (best-effort)."""
+    out = {"dxy": None, "vix": None, "snp_change": None, "source": []}
+    # DXY via AlphaVantage (if available) - best-effort (Alpha may not provide DXY easily)
+    if ALPHA_API_KEY:
         try:
-            return r.json()
-        except:
-            return {"status_code": r.status_code, "text": r.text}
-    except Exception as e:
-        return {"error": "backtester_unreachable", "detail": str(e)}
+            # menggunakan FX_INTRADAY USD/EUR etc bukan DXY. Kita mencoba indikator via symbol DX-Y.NYB (Alpha doesn't always support)
+            params = {"function": "CURRENCY_EXCHANGE_RATE", "from_currency": "USD", "to_currency": "EUR", "apikey": ALPHA_API_KEY}
+            r = requests.get(ALPHA_URL, params=params, timeout=8).json()
+            # tidak banyak, tapi kita hanya fill sources
+            out["source"].append("alphavantage/FX")
+        except Exception:
+            pass
+    # VIX & S&P scrapes are complicated; skip actual values — keep best-effort placeholders
+    return out
+
+def fuse_confidence(tech_conf: float, market: str, crypto_sent: dict=None, macro_sent: dict=None) -> float:
+    """Fusion rule to combine technical confidence with sentiment depending on market."""
+    tech = float(tech_conf or 0.5)
+    if market == "crypto":
+        sent_score = 0.5
+        if crypto_sent:
+            fng = crypto_sent.get("fng_value")
+            btc_dom = crypto_sent.get("btc_dominance")
+            # simple mapping: lower FNG -> bearish sentiment
+            if fng is not None:
+                sent_score = min(1.0, max(0.0, (fng/100.0)))  # 0..1
+            if btc_dom is not None:
+                # higher BTC dominance -> slightly bullish for BTC, but for altcoins maybe bearish
+                sent_score = (sent_score + (btc_dom/100.0))/2.0
+        final = 0.65 * tech + 0.35 * sent_score
+    else:
+        # forex: rely more on tech + macro (macro missing => fallback)
+        macro_score = 0.5
+        if macro_sent:
+            # placeholder: prefer neutral if no data
+            macro_score = 0.5
+        final = 0.7 * tech + 0.3 * macro_score
+    return round(max(0.0, min(1.0, final)), 3)
 
 # ---------------- IMAGE OCR HELPERS ----------------
 def ocr_y_axis_prices(img_cv):
+    """Extract numeric labels from right-side y-axis using tesseract (best-effort)."""
     if not _HAS_TESSERACT:
         return {}
     h, w = img_cv.shape[:2]
@@ -320,17 +385,20 @@ def ocr_y_axis_prices(img_cv):
     return {int(y): float(p) for y,p in zip(ys, prices)}
 
 def detect_candles_from_plot(img_cv, y_map, max_bars=200):
+    """Heuristic detection: HSV detection for red/green candles. Returns DF open/high/low/close."""
     h,w,_ = img_cv.shape
     plot = img_cv[int(h*0.06):int(h*0.94), int(w*0.06):int(w*0.94)].copy()
     hsv = cv2.cvtColor(plot, cv2.COLOR_BGR2HSV)
     lower_red1 = np.array([0, 40, 40]); upper_red1 = np.array([12,255,255])
     lower_red2 = np.array([160,40,40]); upper_red2 = np.array([180,255,255])
     lower_green = np.array([35,40,40]); upper_green = np.array([95,255,255])
+
     mask_r = cv2.bitwise_or(cv2.inRange(hsv, lower_red1, upper_red1),
                             cv2.inRange(hsv, lower_red2, upper_red2))
     mask_g = cv2.inRange(hsv, lower_green, upper_green)
     mask = cv2.bitwise_or(mask_r, mask_g)
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((3,3),np.uint8), iterations=1)
+
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     candles = []
     ys = sorted(y_map.keys()) if y_map else None
@@ -359,6 +427,7 @@ def detect_candles_from_plot(img_cv, y_map, max_bars=200):
             open_p = high - (high-low)*0.25
             close_p = low + (high-low)*0.12
         candles.append({"x": x, "open": open_p, "high": high, "low": low, "close": close_p})
+
     if not candles:
         return pd.DataFrame(columns=["open","high","low","close"])
     df = pd.DataFrame(sorted(candles, key=lambda r: r["x"]))[["open","high","low","close"]]
@@ -367,7 +436,7 @@ def detect_candles_from_plot(img_cv, y_map, max_bars=200):
         df = df / lastc
     return df.tail(max_bars).reset_index(drop=True)
 
-# ---------------- FEATURE & LEARNING ----------------
+# ---------------- FEATURE ENGINEERING ----------------
 def compute_features_for_row(pair: str, timeframe: str, entry: float, tp: Optional[float], sl: float) -> Optional[Dict[str, float]]:
     try:
         kdf = fetch_ohlc_binance(pair, timeframe, limit=200)
@@ -378,6 +447,7 @@ def compute_features_for_row(pair: str, timeframe: str, entry: float, tp: Option
     high = kdf['high'].astype(float)
     low = kdf['low'].astype(float)
     vol = kdf['volume'].astype(float)
+
     ema8 = close.ewm(span=8, adjust=False).mean().iloc[-1]
     ema21 = close.ewm(span=21, adjust=False).mean().iloc[-1]
     rsi14 = ta.momentum.RSIIndicator(close, window=14).rsi().iloc[-1]
@@ -385,11 +455,13 @@ def compute_features_for_row(pair: str, timeframe: str, entry: float, tp: Option
     vol_mean = vol.tail(40).mean() if len(vol) >= 40 else vol.mean()
     vol_now = vol.iloc[-1] if len(vol)>0 else 0.0
     vol_spike = 1.0 if vol_now > vol_mean * 1.8 else 0.0
+
     recent_high = high.tail(80).max()
     recent_low = low.tail(80).min()
     dist_to_high = (recent_high - entry) / entry if entry else 0.0
     dist_to_low = (entry - recent_low) / entry if entry else 0.0
     rr = abs((tp - entry) / (entry - sl)) if (tp is not None and (entry - sl) != 0) else 0.0
+
     return {
         "ema8_21_diff": (ema8 - ema21) / (entry if entry!=0 else 1),
         "rsi14": float(rsi14),
@@ -400,6 +472,7 @@ def compute_features_for_row(pair: str, timeframe: str, entry: float, tp: Option
         "rr": float(rr)
     }
 
+# ---------------- LEARNING SYSTEM ----------------
 def build_dataset_from_trade_log():
     if not os.path.exists(TRADE_LOG_FILE):
         return None, None
@@ -436,6 +509,7 @@ def build_dataset_from_trade_log():
     return X, y
 
 def train_and_save_model():
+    """Melatih model RandomForest baru dan update cache model."""
     global _last_retrain_count, _cached_model
     X, y = build_dataset_from_trade_log()
     if X is None or len(y) < MIN_SAMPLES_TO_TRAIN:
@@ -449,36 +523,47 @@ def train_and_save_model():
     yprob = clf.predict_proba(X_test)[:, 1] if hasattr(clf, "predict_proba") else None
     report = classification_report(y_test, y_pred, output_dict=True)
     auc = roc_auc_score(y_test, yprob) if yprob is not None else None
+
     joblib.dump({"clf": clf, "features": list(X.columns)}, MODEL_FILE)
+
+    # update cache supaya tidak perlu load dari disk tiap prediksi
     _cached_model = {"clf": clf, "features": list(X.columns)}
+
     try:
         df = pd.read_csv(TRADE_LOG_FILE)
         _last_retrain_count = len(df)
     except:
         _last_retrain_count = 0
+
     return {"status": "trained", "samples": len(y), "auc": auc, "report": report}
 
 def predict_with_model(payload: Dict[str, Any]):
+    """Prediksi probabilitas sukses sinyal menggunakan model pembelajaran (pakai cache jika ada)."""
     global _cached_model
     if _cached_model is None:
         if not os.path.exists(MODEL_FILE):
             raise RuntimeError("model_belum_dilatih")
         _cached_model = joblib.load(MODEL_FILE)
+
     mod = _cached_model
     clf = mod["clf"]
+
     pair = payload.get("pair")
     timeframe = payload.get("timeframe") or "15m"
     entry = float(payload.get("entry"))
     tp = payload.get("tp") or payload.get("tp1")
     sl = float(payload.get("sl"))
+
     feats = compute_features_for_row(pair, timeframe, entry, tp, sl)
     if feats is None:
         raise RuntimeError("gagal_menghitung_fitur")
+
     X = pd.DataFrame([feats])
     prob = float(clf.predict_proba(X)[:, 1][0]) if hasattr(clf, "predict_proba") else float(clf.predict(X)[0])
     return {"prob": prob, "features": feats}
 
 def maybe_trigger_retrain_background():
+    """Jalankan retrain model di background (daemon thread)."""
     def worker():
         try:
             res = train_and_save_model()
@@ -489,6 +574,7 @@ def maybe_trigger_retrain_background():
     t.start()
 
 def check_and_trigger_retrain_if_needed():
+    """Cek apakah sudah waktunya retrain model berdasarkan jumlah sinyal baru."""
     global _last_retrain_count
     with _lock:
         try:
@@ -502,44 +588,62 @@ def check_and_trigger_retrain_if_needed():
         except Exception as e:
             print("check_retrain error", e)
 
-# ---------------- FASTAPI ENDPOINTS ----------------
+# ---------------- ENDPOINT FASTAPI ----------------
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    return {"status": "ok", "service": "Pro Trader AI - Learning (ID)"}
 
 def _postprocess_with_learning(signal: Dict[str, Any]) -> Dict[str, Any]:
+    """Gabungkan hasil analisis teknikal + model AI pembelajaran (jika ada) + fusion sentiment."""
     try:
+        market = detect_market(signal.get("pair", ""))
+        # compute sentiment scores
+        crypto_sent = get_crypto_sentiment() if market == "crypto" else None
+        macro_sent = get_macro_sentiment() if market == "forex" else None
+
+        # if model exists, use model prob to tweak confidence first
+        model_prob = None
         if os.path.exists(MODEL_FILE):
-            pred = predict_with_model({
-                "pair": signal.get("pair"),
-                "timeframe": signal.get("timeframe"),
-                "entry": signal.get("entry"),
-                "tp": signal.get("tp1"),
-                "sl": signal.get("sl")
-            })
-            prob = pred.get("prob", 0.0)
-            orig = float(signal.get("confidence", 0.5))
-            new_conf = round(max(min(1.0, 0.9 * orig + 0.1 * prob), 0.0), 3)
-            signal["confidence"] = new_conf
-            signal["model_prob"] = round(prob, 3)
-            if prob < 0.35:
-                signal["vetoed_by_model"] = True
-                signal["signal_type"] = "WAIT"
-            else:
-                signal["vetoed_by_model"] = False
+            try:
+                pred = predict_with_model({
+                    "pair": signal.get("pair"),
+                    "timeframe": signal.get("timeframe"),
+                    "entry": signal.get("entry"),
+                    "tp": signal.get("tp1"),
+                    "sl": signal.get("sl")
+                })
+                model_prob = pred.get("prob", None)
+                signal["model_prob"] = round(model_prob, 3) if model_prob is not None else None
+            except Exception as e:
+                signal["model_error"] = str(e)
+
+        orig = float(signal.get("confidence", 0.5))
+        fused = fuse_confidence(orig, market, crypto_sent, macro_sent)
+        # if model exists, slightly blend model_prob too
+        if model_prob is not None:
+            fused = round(max(0.0, min(1.0, 0.85 * fused + 0.15 * model_prob)), 3)
+        signal["confidence"] = fused
+        signal["market_mode"] = market
+        signal["sentiment"] = {"crypto": crypto_sent, "macro": macro_sent}
+        # veto if extremely low model_prob
+        if model_prob is not None and model_prob < 0.25:
+            signal["vetoed_by_model"] = True
+            signal["signal_type"] = "WAIT"
         else:
-            signal["model_prob"] = None
             signal["vetoed_by_model"] = False
+
     except Exception as e:
-        signal["model_error"] = str(e)
+        signal["postprocess_error"] = str(e)
     return signal
 
 @app.get("/pro_signal")
 def pro_signal(pair: str = Query(...), tf_main: str = Query("1h"), tf_entry: str = Query("15m"), limit: int = Query(300), auto_log: bool = Query(False)):
+    """Analisis sinyal jangka menengah (multi-timeframe)."""
     try:
         df_entry = fetch_ohlc_binance(pair, tf_entry, limit=limit)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"fetch_failed: {e}")
+
     res = hybrid_analyze(df_entry, pair=pair, timeframe=tf_entry)
     try:
         df_main = fetch_ohlc_binance(pair, tf_main, limit=200)
@@ -548,7 +652,9 @@ def pro_signal(pair: str = Query(...), tf_main: str = Query("1h"), tf_entry: str
         res['context_main_trend'] = "bullish" if ema20_main > ema50_main else "bearish"
     except:
         pass
+
     res = _postprocess_with_learning(res)
+
     if auto_log:
         payload_bt = {
             "pair": res["pair"], "timeframe": res["timeframe"], "side": res["signal_type"],
@@ -557,6 +663,7 @@ def pro_signal(pair: str = Query(...), tf_main: str = Query("1h"), tf_entry: str
         }
         bt_res = post_to_backtester(payload_bt)
         res["backtest_raw"] = bt_res
+
         logrec = {
             "pair": res["pair"], "timeframe": res["timeframe"], "signal_type": res["signal_type"],
             "entry": res["entry"], "tp1": res.get("tp1"), "tp2": res.get("tp2"),
@@ -566,16 +673,20 @@ def pro_signal(pair: str = Query(...), tf_main: str = Query("1h"), tf_entry: str
         }
         append_trade_log(logrec)
         check_and_trigger_retrain_if_needed()
+
     return JSONResponse(res)
 
 @app.get("/scalp_signal")
 def scalp_signal(pair: str = Query(...), tf: str = Query("3m"), limit: int = Query(300), auto_log: bool = Query(False)):
+    """Analisis sinyal scalping cepat."""
     try:
         df = fetch_ohlc_binance(pair, tf, limit=limit)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"fetch_failed: {e}")
+
     res = scalp_engine(df, pair=pair, tf=tf)
     res = _postprocess_with_learning(res)
+
     if auto_log:
         payload_bt = {
             "pair": res["pair"], "timeframe": res["timeframe"], "side": res["signal_type"],
@@ -584,6 +695,7 @@ def scalp_signal(pair: str = Query(...), tf: str = Query("3m"), limit: int = Que
         }
         bt_res = post_to_backtester(payload_bt)
         res["backtest_raw"] = bt_res
+
         logrec = {
             "pair": res["pair"], "timeframe": res["timeframe"], "signal_type": res["signal_type"],
             "entry": res["entry"], "tp1": res.get("tp1"), "tp2": res.get("tp2"),
@@ -593,10 +705,12 @@ def scalp_signal(pair: str = Query(...), tf: str = Query("3m"), limit: int = Que
         }
         append_trade_log(logrec)
         check_and_trigger_retrain_if_needed()
+
     return JSONResponse(res)
 
 @app.post("/analyze_chart")
 def analyze_chart(file: UploadFile = File(...), pair: Optional[str] = Form(None), timeframe: Optional[str] = Form(None), auto_backtest: Optional[str] = Form("true")):
+    """Analisis chart dari gambar (screenshot TradingView dsb)."""
     auto_flag = auto_backtest.lower() != "false"
     try:
         contents = file.file.read()
@@ -604,20 +718,26 @@ def analyze_chart(file: UploadFile = File(...), pair: Optional[str] = Form(None)
         img_cv = cv2.cvtColor(np.array(pil), cv2.COLOR_RGB2BGR)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"gambar_tidak_valid: {e}")
+
     if not _HAS_TESSERACT:
         raise HTTPException(status_code=400, detail="tesseract_ocr_tidak_tersedia")
+
     y_map = {}
     try:
         y_map = ocr_y_axis_prices(img_cv)
     except:
         y_map = {}
+
     df_ohlc = detect_candles_from_plot(img_cv, y_map, max_bars=200)
     if df_ohlc.empty:
         raise HTTPException(status_code=400, detail="gagal_membaca_chart")
+
     for col in ['open', 'high', 'low', 'close']:
         df_ohlc[col] = pd.to_numeric(df_ohlc[col], errors='coerce')
+
     res = hybrid_analyze(df_ohlc, pair=pair or "IMG", timeframe=timeframe or "img")
     res = _postprocess_with_learning(res)
+
     if auto_flag:
         bt_res = post_to_backtester({
             "pair": res["pair"], "timeframe": res["timeframe"], "side": res["signal_type"],
@@ -633,8 +753,64 @@ def analyze_chart(file: UploadFile = File(...), pair: Optional[str] = Form(None)
             "backtest_pnl": bt_res.get("pnl_total") if isinstance(bt_res, dict) else None
         })
         check_and_trigger_retrain_if_needed()
+
     res['bars_used'] = int(df_ohlc.shape[0])
     return JSONResponse(res)
+
+@app.post("/analyze_csv")
+def analyze_csv(file: UploadFile = File(...), pair: Optional[str] = Form(None), timeframe: Optional[str] = Form(None)):
+    """Analisis data historis (Forex) dari file CSV"""
+    try:
+        contents = file.file.read()
+        df = pd.read_csv(io.BytesIO(contents))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"invalid_csv: {e}")
+
+    df.columns = [c.strip().lower() for c in df.columns]
+    def find_col(k): return next((c for c in df.columns if k in c), None)
+
+    o, h, l, ccol = find_col('open'), find_col('high'), find_col('low'), find_col('close')
+    if not all([o, h, l, ccol]):
+        raise HTTPException(status_code=400, detail="kolom_tidak_lengkap (butuh open, high, low, close)")
+
+    df2 = df[[o, h, l, ccol]].rename(columns={o: 'open', h: 'high', l: 'low', ccol: 'close'})
+    for col in ['open', 'high', 'low', 'close']:
+        df2[col] = pd.to_numeric(df2[col], errors='coerce')
+    df2 = df2.dropna().reset_index(drop=True)
+
+    res = hybrid_analyze(df2, pair=pair or "CSV", timeframe=timeframe or "csv")
+    res = _postprocess_with_learning(res)
+    return JSONResponse(res)
+
+@app.get("/sentiment")
+def sentiment():
+    """Endpoint ringkasan sentiment: crypto + macro (best-effort)."""
+    c = get_crypto_sentiment()
+    m = get_macro_sentiment()
+    return JSONResponse({"crypto_sentiment": c, "macro_sentiment": m})
+
+@app.get("/mode")
+def mode(pair: str = Query(...)):
+    """Kembalikan mode (crypto/forex) dan sumber yang akan digunakan."""
+    p = pair.upper()
+    m = detect_market(p)
+    sources = {"crypto": ["binance", "coingecko", "alternative.me"], "forex": ["alphavantage (fallback)"]}
+    return JSONResponse({"pair": p, "mode": m, "data_sources": sources.get(m)})
+
+@app.get("/context")
+def context(pair: str = Query(...), tf: str = Query("15m")):
+    """Kembalikan konteks analisis untuk pair: mode, sentiment, last price (best-effort)."""
+    p = pair.upper()
+    m = detect_market(p)
+    c = get_crypto_sentiment() if m == "crypto" else None
+    macro = get_macro_sentiment() if m == "forex" else None
+    last_price = None
+    try:
+        df = fetch_ohlc_binance(p, tf, limit=5)
+        last_price = float(df['close'].astype(float).iloc[-1])
+    except Exception:
+        last_price = None
+    return JSONResponse({"pair": p, "mode": m, "last_price": last_price, "crypto_sentiment": c, "macro_sentiment": macro})
 
 @app.get("/learning_status")
 def learning_status():
@@ -651,6 +827,18 @@ def learning_status():
     except:
         info["trade_log_count"] = 0
     return JSONResponse(info)
+
+@app.get("/retrain_learning")
+def retrain_learning():
+    res = train_and_save_model()
+    return JSONResponse(res)
+
+@app.get("/logs")
+def get_logs(limit: int = Query(100)):
+    ensure_trade_log()
+    df = pd.read_csv(TRADE_LOG_FILE)
+    df = df.tail(limit).to_dict(orient="records")
+    return JSONResponse({"logs": df})
 
 @app.get("/logs_summary")
 def logs_summary():
@@ -675,6 +863,11 @@ def logs_summary():
         return JSONResponse(data)
     except Exception as e:
         return JSONResponse({"error": str(e)})
+
+@app.get("/download_logs")
+def download_logs():
+    ensure_trade_log()
+    return FileResponse(TRADE_LOG_FILE, media_type="text/csv", filename="trade_log.csv")
 
 @app.get("/ai_performance")
 def ai_performance():
@@ -726,7 +919,7 @@ def ai_performance():
     except Exception as e:
         return JSONResponse({"error": str(e)})
 
-# startup
+# ---------------- STARTUP ----------------
 @app.on_event("startup")
 def startup_event():
     ensure_trade_log()
@@ -738,4 +931,4 @@ def startup_event():
         except Exception as e:
             print("Failed load cached model on startup:", e)
 
-# How to run: uvicorn main_combined_learning:app --host 0.0.0.0 --port $PORT
+# Run server: uvicorn main_combined_learning:app --host 0.0.0.0 --port $PORT

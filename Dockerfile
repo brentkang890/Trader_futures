@@ -1,13 +1,15 @@
 # ================================================================
-# 🤖 PRO TRADER AI - UNIVERSAL DOCKERFILE (AI + Backtester + Telegram Bot)
+# 🚀 PRO TRADER AI - UNIVERSAL DOCKERFILE
+# Support: AI Agent + Backtester + Telegram Bot
 # ================================================================
 
-# -------------------------------
-# 🐍 Base image Python + system libs
-# -------------------------------
+# Gunakan Python slim agar ringan & cepat
 FROM python:3.10-slim
 
-# Install dependencies for OCR (Tesseract) & OpenCV
+# ================================================================
+# ⚙️ Install System Dependencies
+# (dibutuhkan untuk OpenCV, OCR, dan FastAPI)
+# ================================================================
 RUN apt-get update && apt-get install -y \
     build-essential \
     tesseract-ocr \
@@ -15,32 +17,35 @@ RUN apt-get update && apt-get install -y \
     libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
-# -------------------------------
-# 📂 Set working directory
-# -------------------------------
+# ================================================================
+# 📂 Set Working Directory
+# ================================================================
 WORKDIR /app
 
-# -------------------------------
-# 📦 Copy dependency list
-# -------------------------------
+# ================================================================
+# 📦 Copy dan Install Dependencies
+# ================================================================
 COPY requirements.txt .
-
-# Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
-# -------------------------------
-# 📦 Copy all source code
-# -------------------------------
+# ================================================================
+# 📂 Copy Semua File Project
+# ================================================================
 COPY . .
 
-# -------------------------------
-# ⚙️ Default Environment Variables
-# -------------------------------
-ENV PYTHONUNBUFFERED=1
+# ================================================================
+# ⚙️ Environment Default (Railway override ini otomatis)
+# ================================================================
 ENV PORT=8000
+ENV PYTHONUNBUFFERED=1
 
-# -------------------------------
-# 🚀 Default command
-# (Railway akan override sesuai “Start Command”)
-# -------------------------------
-CMD ["uvicorn", "main_combined_learning:app", "--host", "0.0.0.0", "--port", "8000"]
+# ================================================================
+# 🧠 Default Command
+# (Railway akan override sesuai project-nya)
+# ================================================================
+# Contoh command di Railway:
+# - AI Agent     → uvicorn main_combined_learning:app --host 0.0.0.0 --port $PORT
+# - Backtester   → uvicorn backtester:app --host 0.0.0.0 --port $PORT
+# - Telegram Bot → python telegram_bot.py
+# ================================================================
+CMD ["python", "main_combined_learning.py"]

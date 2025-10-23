@@ -1,25 +1,24 @@
 # ======================================================
-# 🤖 PRO TRADER AI - TELEGRAM BOT (Final Version)
-# Analisis Otomatis Crypto & Forex + Chart Reader
+# 🤖 PRO TRADER AI - FINAL TELEGRAM BOT
+# Analisis Otomatis Crypto & Forex + Chart Reader + Backtest
 # ======================================================
 
 import os
 import time
 import requests
 
-# ---------------- KONFIGURASI ----------------
+# ---------------- KONFIG ----------------
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
-APP_URL = os.environ.get("APP_URL")
+APP_URL = os.environ.get("APP_URL")  # URL AI Agent
+BACKTEST_URL = os.environ.get("BACKTEST_URL")  # URL Backtester (Railway)
 
 if not BOT_TOKEN or not CHAT_ID or not APP_URL:
-    raise ValueError("❌ Environment variable BOT_TOKEN, CHAT_ID, atau APP_URL belum diatur di Railway.")
+    raise ValueError("❌ Variabel BOT_TOKEN, CHAT_ID, atau APP_URL belum diatur di Railway!")
 
 # ---------------- UTILITAS ----------------
 def send_message(text, parse_mode="HTML"):
-    """Kirim pesan teks ke Telegram."""
-    if not text:
-        return
+    """Kirim pesan ke Telegram"""
     try:
         url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
         payload = {"chat_id": CHAT_ID, "text": text[:4096], "parse_mode": parse_mode}
@@ -27,8 +26,9 @@ def send_message(text, parse_mode="HTML"):
     except Exception as e:
         print("[ERROR] Kirim pesan gagal:", e)
 
+
 def get_updates(offset=None):
-    """Ambil pesan terbaru dari Telegram."""
+    """Ambil pesan terbaru dari Telegram"""
     try:
         url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
         params = {"timeout": 100, "offset": offset}
@@ -37,110 +37,112 @@ def get_updates(offset=None):
         print("[ERROR] Gagal ambil update:", e)
         return {}
 
-def send_photo(image_bytes, caption="📈 Hasil Analisis Chart", parse_mode="HTML"):
-    """Kirim gambar hasil analisis ke Telegram."""
-    try:
-        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
-        files = {"photo": ("chart.jpg", image_bytes)}
-        data = {"chat_id": CHAT_ID, "caption": caption, "parse_mode": parse_mode}
-        requests.post(url, files=files, data=data, timeout=20)
-    except Exception as e:
-        print("[ERROR] Kirim foto gagal:", e)
 
-# ---------------- HANDLER PERINTAH ----------------
+# ---------------- COMMAND HANDLER ----------------
 def handle_command(text):
-    """Proses perintah dari pengguna Telegram."""
     if not text:
         return "⚠️ Pesan kosong."
     text = text.strip().lower()
 
+    # ============================
+    # 🔹 BACKTEST COMMAND
+    # ============================
+    if text.startswith("backtest"):
+        try:
+            parts = text.split()
+            if len(parts) < 2:
+                return "⚙️ Format: <code>backtest BTCUSDT</code> atau <code>backtest XAUUSD</code>"
+
+            pair = parts[1].upper()
+
+            payload = {
+                "pair": pair,
+                "side": "LONG",      # bisa diubah jadi SHORT
+                "entry": 30000,
+                "tp1": 31000,
+                "sl": 29500,
+                "timeframe": "15m"
+            }
+
+            target_url = BACKTEST_URL or f"{APP_URL.replace('production','faithful-truth')}/backtest"
+            r = requests.post(target_url, json=payload, timeout=30)
+            d = r.json()
+
+            if "error" in d:
+                return f"⚠️ Backtest gagal: {d['error']}"
+
+            msg = (
+                f"🧮 <b>Backtest Result</b>\n"
+                f"📊 Pair: {d.get('pair')}\n"
+                f"💡 Side: {d.get('side')}\n"
+                f"🎯 Hit: {d.get('hit')}\n"
+                f"💰 PnL: {d.get('pnl_total')}%\n"
+                f"📈 Market: {d.get('market')}"
+            )
+            return msg
+        except Exception as e:
+            return f"⚠️ Gagal jalankan backtest: {e}"
+
+    # ============================
     # 🔹 STATUS MODEL
+    # ============================
     if text == "status":
         try:
             r = requests.get(f"{APP_URL}/learning_status", timeout=20)
             d = r.json()
+            msg = (
+                "🤖 <b>Status AI Agent</b>\n"
+                f"📦 Model: {'✅ Ada' if d.get('model_exists') else '❌ Tidak ada'}\n"
+                f"📊 Log Data: {d.get('trade_log_count', 0)} sinyal"
+            )
+            return msg
         except Exception as e:
             return f"⚠️ Gagal ambil status: {e}"
-        return (
-            "🤖 <b>Status AI Agent</b>\n"
-            f"📦 Model: {'✅ Ada' if d.get('model_exists') else '❌ Tidak ada'}\n"
-            f"📊 Data Log: {d.get('trade_log_count', 0)} sinyal\n"
-            f"🧩 Fitur: {', '.join(d.get('features', [])) if d.get('features') else '-'}"
-        )
 
+    # ============================
     # 🔹 STATISTIK
+    # ============================
     if text == "stats":
         try:
             r = requests.get(f"{APP_URL}/ai_performance", timeout=25)
             d = r.json()
-        except Exception as e:
-            return f"⚠️ Tidak bisa ambil statistik: {e}"
-        if "error" in d:
-            return f"⚠️ {d['error']}"
-        return (
-            "📈 <b>Statistik Performa AI</b>\n"
-            f"📊 Total sinyal: {d['total_signals']}\n"
-            f"✅ Winrate: {d['winrate']}%\n"
-            f"💰 Profit Factor: {d.get('profit_factor', 'N/A')}\n"
-            f"📉 Max Drawdown: {d.get('max_drawdown', 'N/A')}\n"
-            f"⚙️ Model: {d['model_status']}"
-        )
-
-    # 🔹 LOG TERAKHIR
-    if text == "log":
-        try:
-            r = requests.get(f"{APP_URL}/logs_summary", timeout=15)
-            d = r.json()
-        except Exception as e:
-            return f"⚠️ Tidak bisa ambil log: {e}"
-        if "detail" in d:
-            return d["detail"]
-        return (
-            f"📊 <b>{d.get('pair')}</b> ({d.get('timeframe')})\n"
-            f"💡 Signal: <b>{d.get('signal_type')}</b>\n"
-            f"🎯 Entry: {d.get('entry')}\n"
-            f"TP1: {d.get('tp1')} | TP2: {d.get('tp2')}\n"
-            f"🛡 SL: {d.get('sl')}\n"
-            f"📈 Confidence: {d.get('confidence')}\n"
-            f"🧠 {d.get('reasoning')}"
-        )
-      
-    # 🔹 BACKTEST MANUAL
-    if text.startswith("backtest "):
-        parts = text.split()
-        if len(parts) < 2:
-            return "⚠️ Format salah. Contoh: <code>backtest BTCUSDT</code>"
-        pair = parts[1].upper()
-        try:
-            r = requests.post(f"{APP_URL}/backtest", json={"pair": pair, "side": "LONG", "entry": 100, "tp1": 110, "sl": 95, "timeframe": "1h"}, timeout=25)
-            d = r.json()
-            return (
-                f"📊 <b>Backtest {d.get('pair')}</b>\n"
-                f"💡 Hasil: {d.get('hit')}\n"
-                f"💰 PnL: {d.get('pnl_total')}%"
+            if "error" in d:
+                return f"⚠️ {d['error']}"
+            msg = (
+                "📈 <b>Statistik Performa AI</b>\n"
+                f"📊 Total sinyal: {d['total_signals']}\n"
+                f"✅ Winrate: {d['winrate']}%\n"
+                f"💰 Profit Factor: {d.get('profit_factor', 'N/A')}\n"
+                f"📉 Max Drawdown: {d.get('max_drawdown', 'N/A')}\n"
             )
+            return msg
         except Exception as e:
-            return f"⚠️ Gagal backtest: {e}"
-            
+            return f"⚠️ Gagal ambil statistik: {e}"
+
+    # ============================
     # 🔹 SCALP CEPAT
+    # ============================
     if text.startswith("scalp "):
         pair = text.split()[1].upper()
         try:
             r = requests.get(f"{APP_URL}/scalp_signal?pair={pair}&tf=3m&auto_log=true", timeout=25)
             d = r.json()
+            msg = (
+                f"⚡️ <b>Scalp {d.get('pair')}</b> ({d.get('timeframe')})\n"
+                f"💡 Signal: <b>{d.get('signal_type')}</b>\n"
+                f"🎯 Entry: {d.get('entry')}\n"
+                f"TP1: {d.get('tp1')} | TP2: {d.get('tp2')}\n"
+                f"🛡 SL: {d.get('sl')}\n"
+                f"📈 Confidence: {d.get('confidence')}\n"
+                f"🧠 {d.get('reasoning')}"
+            )
+            return msg
         except Exception as e:
             return f"⚠️ Gagal ambil scalp signal: {e}"
-        return (
-            f"⚡️ <b>Scalp {d.get('pair')}</b> ({d.get('timeframe')})\n"
-            f"💡 Signal: <b>{d.get('signal_type')}</b>\n"
-            f"🎯 Entry: {d.get('entry')}\n"
-            f"TP1: {d.get('tp1')} | TP2: {d.get('tp2')}\n"
-            f"🛡 SL: {d.get('sl')}\n"
-            f"📈 Confidence: {d.get('confidence')}\n"
-            f"🧠 {d.get('reasoning')}"
-        )
 
-    # 🔹 Prediksi Normal
+    # ============================
+    # 🔹 SIGNAL NORMAL
+    # ============================
     parts = text.split()
     if len(parts) == 0:
         return "⚠️ Format salah. Contoh: <code>BTCUSDT 15m</code>"
@@ -149,25 +151,26 @@ def handle_command(text):
     else:
         pair, tf = parts[0], parts[1]
 
-    url = f"{APP_URL}/pro_signal?pair={pair.upper()}&tf_main=1h&tf_entry={tf}&auto_log=true"
     try:
+        url = f"{APP_URL}/pro_signal?pair={pair.upper()}&tf_main=1h&tf_entry={tf}&auto_log=true"
         r = requests.get(url, timeout=30)
         d = r.json()
+        if "error" in d:
+            return f"⚠️ {d['error']}"
+
+        msg = (
+            f"📊 <b>{d.get('pair')}</b> ({d.get('timeframe')})\n"
+            f"💡 Signal: <b>{d.get('signal_type')}</b>\n"
+            f"🎯 Entry: {d.get('entry')}\n"
+            f"TP1: {d.get('tp1')} | TP2: {d.get('tp2')}\n"
+            f"🛡 SL: {d.get('sl')}\n"
+            f"📈 Confidence: {d.get('confidence')}\n"
+            f"🧠 {d.get('reasoning')}"
+        )
+        return msg
     except Exception as e:
-        return f"❌ Error: {e}"
+        return f"❌ Error fetch AI Agent: {e}"
 
-    if "error" in d:
-        return f"⚠️ {d['error']}"
-
-    return (
-        f"📊 <b>{d.get('pair')}</b> ({d.get('timeframe')})\n"
-        f"💡 Signal: <b>{d.get('signal_type')}</b>\n"
-        f"🎯 Entry: {d.get('entry')}\n"
-        f"TP1: {d.get('tp1')} | TP2: {d.get('tp2')}\n"
-        f"🛡 SL: {d.get('sl')}\n"
-        f"📈 Confidence: {d.get('confidence')}\n"
-        f"🧠 {d.get('reasoning')}"
-    )
 
 # ---------------- PROGRAM UTAMA ----------------
 def main():
@@ -175,8 +178,11 @@ def main():
     print(f"🤖 BOT AKTIF — Hubung ke: {APP_URL}")
     send_message(
         "🤖 <b>Pro Trader AI Bot Aktif!</b>\n"
-        "Ketik contoh:\n<code>BTCUSDT 15m</code> atau <code>XAUUSD 1h</code>\n\n"
-        "Perintah lain:\n- status\n- stats\n- log\n- scalp BTCUSDT"
+        "Ketik contoh:\n"
+        "- BTCUSDT 15m atau XAUUSD 1h\n"
+        "Perintah lain:\n"
+        "- backtest BTCUSDT\n"
+        "- status\n- stats\n- scalp BTCUSDT"
     )
 
     while True:
@@ -187,41 +193,9 @@ def main():
                     offset = update["update_id"] + 1
                     msg = update.get("message", {})
 
-                    # 🔹 Teks
                     if "text" in msg:
                         reply = handle_command(msg["text"])
                         send_message(reply)
-
-                    # 🔹 Gambar Chart
-                    elif "photo" in msg:
-                        photo = msg["photo"][-1]
-                        file_id = photo["file_id"]
-                        file_info = requests.get(
-                            f"https://api.telegram.org/bot{BOT_TOKEN}/getFile?file_id={file_id}"
-                        ).json()
-                        file_path = file_info["result"]["file_path"]
-                        file_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
-
-                        image_data = requests.get(file_url).content
-                        send_message("📷 Menganalisis gambar chart, mohon tunggu...")
-
-                        files = {"file": ("chart.jpg", image_data, "image/jpeg")}
-                        resp = requests.post(f"{APP_URL}/analyze_chart", files=files, timeout=60)
-
-                        if resp.status_code == 200:
-                            d = resp.json()
-                            caption = (
-                                f"📊 <b>{d.get('pair')}</b> ({d.get('timeframe')})\n"
-                                f"💡 Signal: <b>{d.get('signal_type')}</b>\n"
-                                f"🎯 Entry: {d.get('entry')}\n"
-                                f"TP1: {d.get('tp1')} | TP2: {d.get('tp2')}\n"
-                                f"🛡 SL: {d.get('sl')}\n"
-                                f"📈 Confidence: {d.get('confidence')}\n"
-                                f"🧠 {d.get('reasoning')}"
-                            )
-                            send_message(caption)
-                        else:
-                            send_message(f"⚠️ Gagal analisis gambar: {resp.text}")
 
             time.sleep(3)
         except Exception as e:

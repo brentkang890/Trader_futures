@@ -104,8 +104,8 @@ def handle_command(text):
             f"📈 Confidence: {d.get('confidence')}\n"
             f"🧠 {d.get('reasoning')}"
         )
-
-# 🔹 BACKTEST MANUAL
+      
+    # 🔹 BACKTEST MANUAL
     if text.startswith("backtest "):
         parts = text.split()
         if len(parts) < 2:
@@ -121,7 +121,7 @@ def handle_command(text):
             )
         except Exception as e:
             return f"⚠️ Gagal backtest: {e}"
-
+            
     # 🔹 SCALP CEPAT
     if text.startswith("scalp "):
         pair = text.split()[1].upper()

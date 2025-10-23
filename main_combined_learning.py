@@ -21,8 +21,9 @@ import requests
 import pandas as pd
 import numpy as np
 
-from fastapi import FastAPI, Query, UploadFile, File, Form, HTTPException
-from fastapi.responses import JSONResponse, FileResponse
+from fastapi import FastAPI, Query, UploadFile, File, Form, HTTPException, Request
+from fastapi.responses import JSONResponse, FileResponse, PlainTextResponse
+from fastapi.encoders import jsonable_encoder
 
 # technical libs
 import ta
@@ -45,9 +46,6 @@ except Exception:
 
 app = FastAPI(
     title="Pro Trader AI - Combined + Learning (ID)",
-    
-
-    
     description="Analisis Crypto (Binance) & Forex (TwelveData) + Pembelajaran Terintegrasi",
     version="1.0"
 )
@@ -75,7 +73,15 @@ _lock = threading.Lock()
 _last_retrain_count = 0
 _cached_model = None  # cache untuk model yang dimuat dari disk
 
-# ---------------- UTILITAS ----------------
+# ---------------- HELPERS ----------------
+def respond(obj: Any, status_code: int = 200):
+    """Safe JSON response using jsonable_encoder to handle numpy/pandas types."""
+    try:
+        return JSONResponse(content=jsonable_encoder(obj), status_code=status_code)
+    except Exception as e:
+        # fallback to plain text
+        return PlainTextResponse(str(obj), status_code=status_code)
+
 def ensure_trade_log():
     """Pastikan file trade_log.csv ada."""
     if not os.path.exists(TRADE_LOG_FILE):
@@ -122,7 +128,6 @@ def fetch_ohlc_twelvedata(symbol: str, interval: str="15m", limit: int=500) -> p
     """Ambil data time series dari TwelveData untuk forex (XAUUSD, EURUSD, dsb)."""
     if not TWELVEDATA_API_KEY:
         raise RuntimeError("TWELVEDATA_API_KEY_not_set")
-    # TwelveData interval mapping: keep to strings TwelveData expects
     mapping = {
         "1m": "1min", "3m": "1min", "5m": "5min", "15m": "15min",
         "30m": "30min", "1h": "1h", "4h": "4h", "1d": "1day"
@@ -148,10 +153,8 @@ def fetch_ohlc_twelvedata(symbol: str, interval: str="15m", limit: int=500) -> p
     for c in ["open", "high", "low", "close", "volume"]:
         if c not in df.columns:
             df[c] = 0.0
-    # sort ascending by datetime to match other sources
     if "datetime" in df.columns:
         df = df.sort_values("datetime").reset_index(drop=True)
-        # keep open_time as increasing idx
         df.insert(0, "open_time", pd.RangeIndex(start=0, stop=len(df)))
     else:
         df.insert(0, "open_time", pd.RangeIndex(start=0, stop=len(df)))
@@ -163,13 +166,11 @@ def fetch_ohlc_twelvedata(symbol: str, interval: str="15m", limit: int=500) -> p
 def fetch_ohlc_binance(symbol: str, interval: str, limit: int = 500) -> pd.DataFrame:
     """Try Binance (crypto). If fail, fallback to TwelveData for forex."""
     symbol = symbol.upper()
-    # Try Binance first
     try:
         params = {"symbol": symbol, "interval": interval, "limit": limit}
         r = requests.get(BINANCE_KLINES, params=params, timeout=10)
         if r.status_code == 200:
             data = r.json()
-            # Binance returns list of klines
             df = pd.DataFrame(data, columns=[
                 "open_time","open","high","low","close","volume","close_time",
                 "qav","num_trades","tb_base","tb_quote","ignore"
@@ -377,7 +378,6 @@ def ocr_y_axis_prices(img_cv):
     if not _HAS_TESSERACT:
         return {}
     h, w = img_cv.shape[:2]
-    # attempt a few crops if layout differs
     right_x = int(w*0.76)
     crops = [
         img_cv[int(h*0.02):int(h*0.98), right_x:w].copy(),
@@ -416,7 +416,6 @@ def ocr_y_axis_prices(img_cv):
 def detect_candles_from_plot(img_cv, y_map, max_bars=200):
     """Heuristic detection: HSV detection for colored candles. Returns DataFrame open/high/low/close."""
     h,w,_ = img_cv.shape
-    # safe crop for plot area
     top = int(h*0.06); bottom = int(h*0.94)
     left = int(w*0.06); right = int(w*0.94)
     if bottom <= top or right <= left:
@@ -444,13 +443,11 @@ def detect_candles_from_plot(img_cv, y_map, max_bars=200):
     ps = [y_map[y] for y in ys] if ys else None
     for c in contours:
         x,y,cw,ch = cv2.boundingRect(c)
-        # heuristics: width and height thresholds
         if cw < 4 or ch < 6:
             continue
         global_y_top = y + top
         global_y_bot = y + ch + top
         if ys and len(ys) > 1:
-            # map pixel rows to prices
             high = float(np.interp(global_y_top, ys, ps))
             low = float(np.interp(global_y_bot, ys, ps))
         else:
@@ -484,7 +481,6 @@ def compute_features_for_row(pair: str, timeframe: str, entry: float, tp: Option
     except Exception:
         return None
     kdf = kdf.tail(60).reset_index(drop=True)
-    # Force numeric
     for col in ['open','high','low','close','volume']:
         kdf[col] = pd.to_numeric(kdf[col], errors='coerce').fillna(0.0)
     close = kdf['close'].astype(float)
@@ -570,7 +566,6 @@ def train_and_save_model():
 
     joblib.dump({"clf": clf, "features": list(X.columns)}, MODEL_FILE)
 
-    # update cache supaya tidak perlu load dari disk tiap prediksi
     _cached_model = {"clf": clf, "features": list(X.columns)}
 
     try:
@@ -661,7 +656,6 @@ def get_crypto_sentiment():
 def get_macro_sentiment():
     """Ambil beberapa indikator makro sederhana (best-effort)."""
     out = {"dxy": None, "vix": None, "snp_change": None, "source": []}
-    # placeholder best-effort sources
     if ALPHA_API_KEY:
         try:
             out["source"].append("alphavantage/FX (placeholder)")
@@ -670,7 +664,6 @@ def get_macro_sentiment():
     return out
 
 def fuse_confidence(tech_conf: float, market: str, crypto_sent: dict=None, macro_sent: dict=None) -> float:
-    """Fusion rule to combine technical confidence with sentiment depending on market."""
     tech = float(tech_conf or 0.5)
     if market == "crypto":
         sent_score = 0.5
@@ -691,7 +684,6 @@ def fuse_confidence(tech_conf: float, market: str, crypto_sent: dict=None, macro
 
 # ---------------- POSTPROCESS + ENDPOINTS ----------------
 def _postprocess_with_learning(signal: Dict[str, Any]) -> Dict[str, Any]:
-    """Gabungkan hasil analisis teknikal + model AI pembelajaran (jika ada) + fusion sentiment."""
     try:
         market = detect_market(signal.get("pair", ""))
         crypto_sent = get_crypto_sentiment() if market == "crypto" else None
@@ -731,11 +723,10 @@ def _postprocess_with_learning(signal: Dict[str, Any]) -> Dict[str, Any]:
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "service": "Pro Trader AI - Learning (ID)"}
+    return respond({"status": "ok", "service": "Pro Trader AI - Learning (ID)"})
 
 @app.get("/pro_signal")
 def pro_signal(pair: str = Query(...), tf_main: str = Query("1h"), tf_entry: str = Query("15m"), limit: int = Query(300), auto_log: bool = Query(False)):
-    """Analisis sinyal jangka menengah (multi-timeframe)."""
     try:
         df_entry = fetch_ohlc_binance(pair, tf_entry, limit=limit)
     except Exception as e:
@@ -771,11 +762,10 @@ def pro_signal(pair: str = Query(...), tf_main: str = Query("1h"), tf_entry: str
         append_trade_log(logrec)
         check_and_trigger_retrain_if_needed()
 
-    return JSONResponse(res)
+    return respond(res)
 
 @app.get("/scalp_signal")
 def scalp_signal(pair: str = Query(...), tf: str = Query("3m"), limit: int = Query(300), auto_log: bool = Query(False)):
-    """Analisis sinyal scalping cepat."""
     try:
         df = fetch_ohlc_binance(pair, tf, limit=limit)
     except Exception as e:
@@ -803,11 +793,10 @@ def scalp_signal(pair: str = Query(...), tf: str = Query("3m"), limit: int = Que
         append_trade_log(logrec)
         check_and_trigger_retrain_if_needed()
 
-    return JSONResponse(res)
+    return respond(res)
 
 @app.post("/analyze_chart")
 def analyze_chart(file: UploadFile = File(...), pair: Optional[str] = Form(None), timeframe: Optional[str] = Form(None), auto_backtest: Optional[str] = Form("true")):
-    """Analisis chart dari gambar (screenshot TradingView dsb)."""
     auto_flag = auto_backtest.lower() != "false"
     try:
         contents = file.file.read()
@@ -853,11 +842,10 @@ def analyze_chart(file: UploadFile = File(...), pair: Optional[str] = Form(None)
         check_and_trigger_retrain_if_needed()
 
     res['bars_used'] = int(df_ohlc.shape[0])
-    return JSONResponse(res)
+    return respond(res)
 
 @app.post("/analyze_csv")
 def analyze_csv(file: UploadFile = File(...), pair: Optional[str] = Form(None), timeframe: Optional[str] = Form(None)):
-    """Analisis data historis (Forex) dari file CSV"""
     try:
         contents = file.file.read()
         df = pd.read_csv(io.BytesIO(contents))
@@ -878,26 +866,23 @@ def analyze_csv(file: UploadFile = File(...), pair: Optional[str] = Form(None), 
 
     res = hybrid_analyze(df2, pair=pair or "CSV", timeframe=timeframe or "csv")
     res = _postprocess_with_learning(res)
-    return JSONResponse(res)
+    return respond(res)
 
 @app.get("/sentiment")
 def sentiment():
-    """Endpoint ringkasan sentiment: crypto + macro (best-effort)."""
     c = get_crypto_sentiment()
     m = get_macro_sentiment()
-    return JSONResponse({"crypto_sentiment": c, "macro_sentiment": m})
+    return respond({"crypto_sentiment": c, "macro_sentiment": m})
 
 @app.get("/mode")
 def mode(pair: str = Query(...)):
-    """Kembalikan mode (crypto/forex) dan sumber yang akan digunakan."""
     p = pair.upper()
     m = detect_market(p)
     sources = {"crypto": ["binance", "coingecko", "alternative.me"], "forex": ["twelvedata (fallback: alphavantage)"]}
-    return JSONResponse({"pair": p, "mode": m, "data_sources": sources.get(m)})
+    return respond({"pair": p, "mode": m, "data_sources": sources.get(m)})
 
 @app.get("/context")
 def context(pair: str = Query(...), tf: str = Query("15m")):
-    """Kembalikan konteks analisis untuk pair: mode, sentiment, last price (best-effort)."""
     p = pair.upper()
     m = detect_market(p)
     c = get_crypto_sentiment() if m == "crypto" else None
@@ -908,7 +893,7 @@ def context(pair: str = Query(...), tf: str = Query("15m")):
         last_price = float(df['close'].astype(float).iloc[-1])
     except Exception:
         last_price = None
-    return JSONResponse({"pair": p, "mode": m, "last_price": last_price, "crypto_sentiment": c, "macro_sentiment": macro})
+    return respond({"pair": p, "mode": m, "last_price": last_price, "crypto_sentiment": c, "macro_sentiment": macro})
 
 @app.get("/learning_status")
 def learning_status():
@@ -924,11 +909,10 @@ def learning_status():
         info["trade_log_count"] = len(df)
     except:
         info["trade_log_count"] = 0
-    return JSONResponse(info)
+    return respond(info)
 
 @app.get("/model_debug")
 def model_debug():
-    """Endpoint debug model: fitur, last trained timestamp, importance (jika ada)."""
     info = {"model_exists": os.path.exists(MODEL_FILE), "last_trained": None, "features": None, "feature_importance": None}
     if os.path.exists(MODEL_FILE):
         try:
@@ -942,29 +926,28 @@ def model_debug():
                 info["feature_importance"] = dict(zip(features, [round(float(x),6) for x in imps]))
         except Exception as e:
             info["error_loading_model"] = str(e)
-    return JSONResponse(info)
+    return respond(info)
 
 @app.get("/retrain_learning")
 def retrain_learning():
-    """Paksa retrain model AI (synchronous request)."""
     res = train_and_save_model()
-    return JSONResponse(res)
+    return respond(res)
 
 @app.get("/logs")
 def get_logs(limit: int = Query(100)):
     ensure_trade_log()
     df = pd.read_csv(TRADE_LOG_FILE)
     df = df.tail(limit).to_dict(orient="records")
-    return JSONResponse({"logs": df})
+    return respond({"logs": df})
 
 @app.get("/logs_summary")
 def logs_summary():
     try:
         if not os.path.exists(TRADE_LOG_FILE):
-            return JSONResponse({"detail": "Belum ada log sinyal tersimpan."})
+            return respond({"detail": "Belum ada log sinyal tersimpan."})
         df = pd.read_csv(TRADE_LOG_FILE)
         if df.empty:
-            return JSONResponse({"detail": "Belum ada data sinyal terbaru."})
+            return respond({"detail": "Belum ada data sinyal terbaru."})
         last = df.iloc[-1]
         data = {
             "pair": last.get("pair", ""),
@@ -977,9 +960,9 @@ def logs_summary():
             "confidence": last.get("confidence", ""),
             "reasoning": last.get("reasoning", "")
         }
-        return JSONResponse(data)
+        return respond(data)
     except Exception as e:
-        return JSONResponse({"error": str(e)})
+        return respond({"error": str(e)})
 
 @app.get("/download_logs")
 def download_logs():
@@ -992,7 +975,7 @@ def ai_performance():
         ensure_trade_log()
         df = pd.read_csv(TRADE_LOG_FILE)
         if df.empty:
-            return JSONResponse({"error": "Belum ada data sinyal untuk dianalisis."})
+            return respond({"error": "Belum ada data sinyal untuk dianalisis."})
         total = len(df)
         tp_hits = df["backtest_hit"].astype(str).str.upper().str.startswith("TP").sum()
         sl_hits = df["backtest_hit"].astype(str).str.upper().str.startswith("SL").sum()
@@ -1032,9 +1015,9 @@ def ai_performance():
             "tf_stats": tf_stats,
             "model_status": "✅ Sudah Dilatih" if model_exists else "❌ Belum Ada Model"
         }
-        return JSONResponse(data)
+        return respond(data)
     except Exception as e:
-        return JSONResponse({"error": str(e)})
+        return respond({"error": str(e)})
 
 # ---------------- BACKTEST COMM ----------------
 def post_to_backtester(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -1060,41 +1043,6 @@ def startup_event():
             print("Loaded cached model on startup.")
         except Exception as e:
             print("Failed load cached model on startup:", e)
-
-# ---------------- JSON SANITIZER (FIX FOR "Out of range float values") ----------------
-import math, json
-from fastapi.responses import JSONResponse
-
-def sanitize_floats(obj):
-    """Recursively clean NaN, inf, -inf from any data structure before JSON serialization."""
-    if isinstance(obj, dict):
-        return {k: sanitize_floats(v) for k, v in obj.items()}
-    elif isinstance(obj, list):
-        return [sanitize_floats(v) for v in obj]
-    elif isinstance(obj, float):
-        if math.isnan(obj) or math.isinf(obj):
-            return 0.0
-        return float(obj)
-    return obj
-
-@app.middleware("http")
-async def sanitize_json_middleware(request, call_next):
-    """
-    Middleware untuk mencegah error:
-    ⚠️ "Out of range float values are not JSON compliant"
-    Membersihkan semua NaN/inf/-inf sebelum dikirim ke client.
-    """
-    response = await call_next(request)
-    try:
-        if isinstance(response, JSONResponse):
-            body = response.body.decode("utf-8")
-            if body.strip().startswith("{") or body.strip().startswith("["):
-                data = json.loads(body)
-                cleaned = sanitize_floats(data)
-                response.body = json.dumps(cleaned, ensure_ascii=False).encode("utf-8")
-    except Exception as e:
-        print("Sanitize middleware error:", e)
-    return response
 
 # Run server:
 # uvicorn main_combined_learning:app --host 0.0.0.0 --port $PORT

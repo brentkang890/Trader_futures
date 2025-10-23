@@ -45,6 +45,9 @@ except Exception:
 
 app = FastAPI(
     title="Pro Trader AI - Combined + Learning (ID)",
+    
+
+    
     description="Analisis Crypto (Binance) & Forex (TwelveData) + Pembelajaran Terintegrasi",
     version="1.0"
 )
@@ -1057,6 +1060,41 @@ def startup_event():
             print("Loaded cached model on startup.")
         except Exception as e:
             print("Failed load cached model on startup:", e)
+
+# ---------------- JSON SANITIZER (FIX FOR "Out of range float values") ----------------
+import math, json
+from fastapi.responses import JSONResponse
+
+def sanitize_floats(obj):
+    """Recursively clean NaN, inf, -inf from any data structure before JSON serialization."""
+    if isinstance(obj, dict):
+        return {k: sanitize_floats(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [sanitize_floats(v) for v in obj]
+    elif isinstance(obj, float):
+        if math.isnan(obj) or math.isinf(obj):
+            return 0.0
+        return float(obj)
+    return obj
+
+@app.middleware("http")
+async def sanitize_json_middleware(request, call_next):
+    """
+    Middleware untuk mencegah error:
+    ⚠️ "Out of range float values are not JSON compliant"
+    Membersihkan semua NaN/inf/-inf sebelum dikirim ke client.
+    """
+    response = await call_next(request)
+    try:
+        if isinstance(response, JSONResponse):
+            body = response.body.decode("utf-8")
+            if body.strip().startswith("{") or body.strip().startswith("["):
+                data = json.loads(body)
+                cleaned = sanitize_floats(data)
+                response.body = json.dumps(cleaned, ensure_ascii=False).encode("utf-8")
+    except Exception as e:
+        print("Sanitize middleware error:", e)
+    return response
 
 # Run server:
 # uvicorn main_combined_learning:app --host 0.0.0.0 --port $PORT

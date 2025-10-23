@@ -1,9 +1,9 @@
-# ================================
-# 🔧 Base image: Python + system deps (OCR + OpenCV)
-# ================================
+# ======================================================
+# 🤖 PRO TRADER AI - UNIVERSAL DOCKERFILE
+# ======================================================
 FROM python:3.10-slim
 
-# Install dependencies & system libs for OpenCV + Tesseract OCR
+# Install system dependencies for OCR and OpenCV
 RUN apt-get update && apt-get install -y \
     build-essential \
     tesseract-ocr \
@@ -11,34 +11,25 @@ RUN apt-get update && apt-get install -y \
     libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
-# ================================
-# 📂 Set working directory
-# ================================
+# Set working directory
 WORKDIR /app
 
-# ================================
-# 📦 Copy project files
-# ================================
-COPY requirements.txt requirements.txt
-COPY main_combined_learning.py .
-COPY telegram_bot.py .
-
-# ================================
-# 📦 Install Python dependencies
-# ================================
+# Copy dependencies and source code
+COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
+COPY . .
 
-# ================================
-# ⚙️ Environment Variables
-# ================================
-# (Railway akan override ini lewat "Variables" tab)
-ENV PORT=8000
+# Default environment
 ENV PYTHONUNBUFFERED=1
-ENV BOT_TOKEN=""
-ENV CHAT_ID=""
-ENV APP_URL=""
+ENV PORT=8000
+ENV TARGET_FILE=main_combined_learning.py
 
-# ================================
-# 🚀 Run FastAPI + Telegram Bot together
-# ================================
-CMD sh -c "uvicorn main_combined_learning:app --host 0.0.0.0 --port ${PORT:-8000} & python telegram_bot.py"
+# Universal start command
+CMD bash -c "\
+if [ \"$TARGET_FILE\" = 'telegram_bot.py' ]; then \
+    echo '💬 Menjalankan Telegram Bot...' && python telegram_bot.py; \
+elif [ \"$TARGET_FILE\" = 'backtester.py' ]; then \
+    echo '📊 Menjalankan Backtester di port ${PORT}...' && uvicorn backtester:app --host 0.0.0.0 --port ${PORT}; \
+else \
+    echo '🧠 Menjalankan AI Agent di port ${PORT}...' && uvicorn main_combined_learning:app --host 0.0.0.0 --port ${PORT}; \
+fi"

@@ -1,12 +1,13 @@
-# ======================================================
-# 🤖 PRO TRADER AI - UNIVERSAL DOCKERFILE (FINAL)
-# ======================================================
+# ================================================================
+# 🤖 PRO TRADER AI - UNIVERSAL DOCKERFILE (AI + Backtester + Telegram Bot)
+# ================================================================
 
+# -------------------------------
+# 🐍 Base image Python + system libs
+# -------------------------------
 FROM python:3.10-slim
 
-# ------------------------------------------------------
-# 🧰 Install dependencies for OpenCV & OCR (Tesseract)
-# ------------------------------------------------------
+# Install dependencies for OCR (Tesseract) & OpenCV
 RUN apt-get update && apt-get install -y \
     build-essential \
     tesseract-ocr \
@@ -14,38 +15,32 @@ RUN apt-get update && apt-get install -y \
     libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
-# ------------------------------------------------------
+# -------------------------------
 # 📂 Set working directory
-# ------------------------------------------------------
+# -------------------------------
 WORKDIR /app
 
-# ------------------------------------------------------
-# 📦 Copy dependencies and source code
-# ------------------------------------------------------
+# -------------------------------
+# 📦 Copy dependency list
+# -------------------------------
 COPY requirements.txt .
+
+# Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
+
+# -------------------------------
+# 📦 Copy all source code
+# -------------------------------
 COPY . .
 
-# ------------------------------------------------------
-# ⚙️ Environment Variables (default)
-# Railway akan override secara otomatis
-# ------------------------------------------------------
+# -------------------------------
+# ⚙️ Default Environment Variables
+# -------------------------------
 ENV PYTHONUNBUFFERED=1
 ENV PORT=8000
-ENV TARGET_FILE=main_combined_learning.py
 
-# ------------------------------------------------------
-# 🚀 Universal CMD
-# Jalankan salah satu dari:
-# - main_combined_learning.py (AI Agent)
-# - backtester.py (Backtester)
-# - telegram_bot.py (Bot Telegram)
-# ------------------------------------------------------
-CMD bash -c "\
-if [ \"$TARGET_FILE\" = 'telegram_bot.py' ]; then \
-    echo '💬 Menjalankan Telegram Bot...' && python telegram_bot.py; \
-elif [ \"$TARGET_FILE\" = 'backtester.py' ]; then \
-    echo '📊 Menjalankan Backtester di port ${PORT}...' && uvicorn backtester:app --host 0.0.0.0 --port ${PORT}; \
-else \
-    echo '🧠 Menjalankan AI Agent di port ${PORT}...' && uvicorn main_combined_learning:app --host 0.0.0.0 --port ${PORT}; \
-fi"
+# -------------------------------
+# 🚀 Default command
+# (Railway akan override sesuai “Start Command”)
+# -------------------------------
+CMD ["uvicorn", "main_combined_learning:app", "--host", "0.0.0.0", "--port", "8000"]

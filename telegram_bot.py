@@ -105,6 +105,23 @@ def handle_command(text):
             f"🧠 {d.get('reasoning')}"
         )
 
+# 🔹 BACKTEST MANUAL
+    if text.startswith("backtest "):
+        parts = text.split()
+        if len(parts) < 2:
+            return "⚠️ Format salah. Contoh: <code>backtest BTCUSDT</code>"
+        pair = parts[1].upper()
+        try:
+            r = requests.post(f"{APP_URL}/backtest", json={"pair": pair, "side": "LONG", "entry": 100, "tp1": 110, "sl": 95, "timeframe": "1h"}, timeout=25)
+            d = r.json()
+            return (
+                f"📊 <b>Backtest {d.get('pair')}</b>\n"
+                f"💡 Hasil: {d.get('hit')}\n"
+                f"💰 PnL: {d.get('pnl_total')}%"
+            )
+        except Exception as e:
+            return f"⚠️ Gagal backtest: {e}"
+
     # 🔹 SCALP CEPAT
     if text.startswith("scalp "):
         pair = text.split()[1].upper()

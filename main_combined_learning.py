@@ -1,7 +1,7 @@
 # main_combined_learning.py
 """
 Pro Trader AI - Combined + Learning (Bahasa Indonesia)
-- Analisis Crypto & Forex (Binance / AlphaVantage)
+- Analisis Crypto & Forex (Binance / TwelveData)
 - Auto-logging sinyal ke trade_log.csv
 - Integrated Learning (RandomForest) + model cache + retrain background
 - Chart OCR + candle detection (best-effort)
@@ -45,7 +45,7 @@ except Exception:
 
 app = FastAPI(
     title="Pro Trader AI - Combined + Learning (ID)",
-    description="Analisis Crypto (Binance) & Forex (AlphaVantage) + Pembelajaran Terintegrasi",
+    description="Analisis Crypto (Binance) & Forex (TwelveData) + Pembelajaran Terintegrasi",
     version="1.0"
 )
 
@@ -57,7 +57,10 @@ MIN_SAMPLES_TO_TRAIN = int(os.environ.get("MIN_SAMPLES_TO_TRAIN", 50))
 N_SIGNALS_TO_RETRAIN = int(os.environ.get("N_SIGNALS_TO_RETRAIN", 50))
 BINANCE_KLINES = "https://api.binance.com/api/v3/klines"
 
-ALPHA_API_KEY = os.environ.get("ALPHA_API_KEY", "")
+TWELVEDATA_API_KEY = os.environ.get("TWELVEDATA_API_KEY", "")
+TWELVEDATA_URL = "https://api.twelvedata.com/time_series"
+
+ALPHA_API_KEY = os.environ.get("ALPHA_API_KEY", "")  # kept if needed elsewhere
 ALPHA_URL = "https://www.alphavantage.co/query"
 
 # sentiment endpoints (best-effort)
@@ -75,9 +78,13 @@ def ensure_trade_log():
     if not os.path.exists(TRADE_LOG_FILE):
         with open(TRADE_LOG_FILE, "w", newline="") as f:
             writer = csv.writer(f)
-            writer.writerow(["timestamp", "pair", "signal_type", "entry", "tp1", "tp2", "sl", "confidence"])
+            writer.writerow([
+                "timestamp", "pair", "timeframe", "signal_type",
+                "entry", "tp1", "tp2", "sl", "confidence",
+                "reasoning", "backtest_hit", "backtest_pnl"
+            ])
 
-def append_trade_log(logrec):
+def append_trade_log(logrec: Dict[str, Any]):
     """Tambahkan 1 baris log hasil sinyal ke trade_log.csv"""
     ensure_trade_log()
     with open(TRADE_LOG_FILE, "a", newline="") as f:
@@ -85,12 +92,16 @@ def append_trade_log(logrec):
         writer.writerow([
             datetime.utcnow().isoformat(),
             logrec.get("pair"),
+            logrec.get("timeframe"),
             logrec.get("signal_type"),
             logrec.get("entry"),
             logrec.get("tp1"),
             logrec.get("tp2"),
             logrec.get("sl"),
-            logrec.get("confidence")
+            logrec.get("confidence"),
+            logrec.get("reasoning"),
+            logrec.get("backtest_hit"),
+            logrec.get("backtest_pnl")
         ])
 
 def detect_market(pair: str) -> str:
@@ -98,17 +109,90 @@ def detect_market(pair: str) -> str:
     p = (pair or "").upper()
     if any(x in p for x in ["USDT", "BUSD", "BTC", "ETH", "SOL", "BNB", "ADA", "DOGE"]):
         return "crypto"
+    # untuk simbol seperti EURUSD, XAUUSD, GBPJPY, dll.
     if len(p) >= 6 and p[-3:].isalpha() and p[:-3].isalpha():
         return "forex"
     return "crypto"
 
 # ---------------- FETCH OHLC ----------------
+def fetch_ohlc_twelvedata(symbol: str, interval: str="15m", limit: int=500) -> pd.DataFrame:
+    """Ambil data time series dari TwelveData untuk forex (XAUUSD, EURUSD, dsb)."""
+    if not TWELVEDATA_API_KEY:
+        raise RuntimeError("TWELVEDATA_API_KEY_not_set")
+    # TwelveData interval mapping: keep to strings TwelveData expects
+    mapping = {
+        "1m": "1min", "3m": "1min", "5m": "5min", "15m": "15min",
+        "30m": "30min", "1h": "1h", "4h": "4h", "1d": "1day"
+    }
+    iv = mapping.get(interval, interval)
+    params = {
+        "symbol": symbol,
+        "interval": iv,
+        "outputsize": limit,
+        "apikey": TWELVEDATA_API_KEY,
+        "format": "JSON"
+    }
+    r = requests.get(TWELVEDATA_URL, params=params, timeout=15)
+    r.raise_for_status()
+    j = r.json()
+    if "status" in j and j.get("status") == "error":
+        raise RuntimeError(f"TwelveData error: {j.get('message')}")
+    values = j.get("values")
+    if not values:
+        raise RuntimeError(f"TwelveData no data for {symbol}: {j}")
+    df = pd.DataFrame(values)
+    # ensure required cols
+    for c in ["open", "high", "low", "close", "volume"]:
+        if c not in df.columns:
+            df[c] = 0.0
+    # sort ascending by datetime to match other sources
+    if "datetime" in df.columns:
+        df = df.sort_values("datetime").reset_index(drop=True)
+        # keep open_time as increasing idx
+        df.insert(0, "open_time", pd.RangeIndex(start=0, stop=len(df)))
+    else:
+        df.insert(0, "open_time", pd.RangeIndex(start=0, stop=len(df)))
+    for c in ["open", "high", "low", "close", "volume"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    df = df[["open_time", "open", "high", "low", "close", "volume"]].reset_index(drop=True)
+    return df.tail(limit).reset_index(drop=True)
+
+def fetch_ohlc_binance(symbol: str, interval: str, limit: int = 500) -> pd.DataFrame:
+    """Try Binance (crypto). If fail, fallback to TwelveData for forex."""
+    symbol = symbol.upper()
+    # Try Binance first
+    try:
+        params = {"symbol": symbol, "interval": interval, "limit": limit}
+        r = requests.get(BINANCE_KLINES, params=params, timeout=10)
+        if r.status_code == 200:
+            data = r.json()
+            # Binance returns list of klines
+            df = pd.DataFrame(data, columns=[
+                "open_time","open","high","low","close","volume","close_time",
+                "qav","num_trades","tb_base","tb_quote","ignore"
+            ])
+            for c in ["open","high","low","close","volume"]:
+                df[c] = pd.to_numeric(df[c], errors="coerce")
+            df = df[["open_time","open","high","low","close","volume"]].reset_index(drop=True)
+            return df
+    except Exception:
+        pass
+
+    # Fallback to TwelveData for forex or any non-Binance symbol
+    try:
+        return fetch_ohlc_twelvedata(symbol, interval, limit)
+    except Exception as e:
+        # last fallback: AlphaVantage if TwelveData not configured
+        try:
+            return fetch_ohlc_alpha_forex(symbol, interval, limit)
+        except Exception:
+            raise RuntimeError(f"fetch_ohlc_failed_for_{symbol}: {e}")
+
 def fetch_ohlc_alpha_forex(symbol: str, interval: str="15m", limit: int=500) -> pd.DataFrame:
-    """Fallback untuk pair Forex (contoh XAUUSD, EURUSD) via AlphaVantage FX_INTRADAY."""
+    """Fallback lama: AlphaVantage FX_INTRADAY — tetap tersedia jika TwelveData tidak dipakai."""
     if not ALPHA_API_KEY:
         raise RuntimeError("ALPHA_API_KEY_not_set")
     symbol = symbol.upper()
-    # naive split: e.g. EURUSD -> EUR / USD
     from_sym = symbol[:3]
     to_sym = symbol[3:]
     mapping = {"1m":"1min","3m":"5min","5m":"5min","15m":"15min","30m":"30min","1h":"60min","4h":"60min","1d":"daily"}
@@ -132,32 +216,6 @@ def fetch_ohlc_alpha_forex(symbol: str, interval: str="15m", limit: int=500) -> 
     df["volume"] = 0.0
     df.insert(0, "open_time", pd.RangeIndex(start=0, stop=len(df)))
     return df[["open_time","open","high","low","close","volume"]]
-
-def fetch_ohlc_binance(symbol: str, interval: str, limit: int = 500) -> pd.DataFrame:
-    """Try Binance (crypto). If fail, fallback to AlphaVantage (forex)."""
-    symbol = symbol.upper()
-    # Try Binance first
-    try:
-        params = {"symbol": symbol, "interval": interval, "limit": limit}
-        r = requests.get(BINANCE_KLINES, params=params, timeout=10)
-        if r.status_code == 200:
-            data = r.json()
-            df = pd.DataFrame(data, columns=[
-                "open_time","open","high","low","close","volume","close_time",
-                "qav","num_trades","tb_base","tb_quote","ignore"
-            ])
-            for c in ["open","high","low","close","volume"]:
-                df[c] = pd.to_numeric(df[c], errors="coerce")
-            df = df[["open_time","open","high","low","close","volume"]].reset_index(drop=True)
-            return df
-    except Exception:
-        pass
-
-    # Fallback to AlphaVantage for forex
-    try:
-        return fetch_ohlc_alpha_forex(symbol, interval, limit)
-    except Exception as e:
-        raise RuntimeError(f"fetch_ohlc_failed_for_{symbol}: {e}")
 
 # ---------------- INDICATORS ----------------
 def ema(series: pd.Series, n: int):
@@ -423,6 +481,9 @@ def compute_features_for_row(pair: str, timeframe: str, entry: float, tp: Option
     except Exception:
         return None
     kdf = kdf.tail(60).reset_index(drop=True)
+    # Force numeric
+    for col in ['open','high','low','close','volume']:
+        kdf[col] = pd.to_numeric(kdf[col], errors='coerce').fillna(0.0)
     close = kdf['close'].astype(float)
     high = kdf['high'].astype(float)
     low = kdf['low'].astype(float)
@@ -471,7 +532,7 @@ def build_dataset_from_trade_log():
         try:
             feats = compute_features_for_row(
                 str(r['pair']),
-                str(r['timeframe'] or "15m"),
+                str(r.get('timeframe', "15m")),
                 float(r['entry']),
                 r.get('tp1', None),
                 float(r['sl'])
@@ -828,7 +889,7 @@ def mode(pair: str = Query(...)):
     """Kembalikan mode (crypto/forex) dan sumber yang akan digunakan."""
     p = pair.upper()
     m = detect_market(p)
-    sources = {"crypto": ["binance", "coingecko", "alternative.me"], "forex": ["alphavantage (fallback)"]}
+    sources = {"crypto": ["binance", "coingecko", "alternative.me"], "forex": ["twelvedata (fallback: alphavantage)"]}
     return JSONResponse({"pair": p, "mode": m, "data_sources": sources.get(m)})
 
 @app.get("/context")

@@ -75,12 +75,35 @@ _cached_model = None  # cache untuk model yang dimuat dari disk
 
 # ---------------- HELPERS ----------------
 def respond(obj: Any, status_code: int = 200):
-    """Safe JSON response using jsonable_encoder to handle numpy/pandas types."""
+    """Safe JSON response — always return valid JSON, handle NaN/inf/None gracefully."""
+    import json
+
+    def clean_value(v):
+        """Convert NaN/Inf and unsupported types to safe JSON values"""
+        if isinstance(v, float):
+            if np.isnan(v) or np.isinf(v):
+                return 0.0
+        if isinstance(v, (np.int64, np.int32)):
+            return int(v)
+        if isinstance(v, (np.float32, np.float64)):
+            return float(v)
+        if isinstance(v, dict):
+            return {str(k): clean_value(val) for k, val in v.items()}
+        if isinstance(v, list):
+            return [clean_value(val) for val in v]
+        return v
+
     try:
-        return JSONResponse(content=jsonable_encoder(obj), status_code=status_code)
+        encoded = jsonable_encoder(obj)
+        cleaned = clean_value(encoded)
+        return JSONResponse(content=cleaned, status_code=status_code)
     except Exception as e:
-        # fallback to plain text
-        return PlainTextResponse(str(obj), status_code=status_code)
+        print("⚠️ respond() fallback:", e)
+        try:
+            safe_str = json.dumps(str(obj))
+            return JSONResponse(content={"fallback": safe_str}, status_code=status_code)
+        except Exception:
+            return PlainTextResponse(str(obj), status_code=status_code)
 
 def ensure_trade_log():
     """Pastikan file trade_log.csv ada."""
@@ -973,34 +996,46 @@ def download_logs():
 def ai_performance():
     try:
         ensure_trade_log()
+        pd.options.mode.use_inf_as_na = True
         df = pd.read_csv(TRADE_LOG_FILE)
         if df.empty:
             return respond({"error": "Belum ada data sinyal untuk dianalisis."})
+
         total = len(df)
         tp_hits = df["backtest_hit"].astype(str).str.upper().str.startswith("TP").sum()
         sl_hits = df["backtest_hit"].astype(str).str.upper().str.startswith("SL").sum()
         winrate = round((tp_hits / total) * 100, 2) if total > 0 else 0
-        avg_conf = round(pd.to_numeric(df.get("confidence", pd.Series([])), errors="coerce").mean(), 3)
-        pnl_values = pd.to_numeric(df.get("backtest_pnl", pd.Series([])), errors="coerce").dropna()
+
+        avg_conf = pd.to_numeric(df.get("confidence", pd.Series([], dtype=float)), errors="coerce").mean()
+        if pd.isna(avg_conf) or np.isinf(avg_conf):
+            avg_conf = 0.0
+        avg_conf = round(float(avg_conf), 3)
+
+        pnl_values = pd.to_numeric(df.get("backtest_pnl", pd.Series([], dtype=float)), errors="coerce").dropna()
         total_pnl = float(pnl_values.sum()) if not pnl_values.empty else 0.0
+
         profit_factor = None
         if not pnl_values.empty and (pnl_values < 0).any():
             prof = pnl_values[pnl_values > 0].sum()
             loss = abs(pnl_values[pnl_values < 0].sum())
             profit_factor = round(prof / loss, 2) if loss != 0 else None
+
         max_drawdown = float(pnl_values.min()) if not pnl_values.empty else 0.0
+
         pair_stats = []
         for pair, group in df.groupby("pair"):
             tp_pair = group["backtest_hit"].astype(str).str.upper().str.startswith("TP").sum()
             wr_pair = round((tp_pair / len(group)) * 100, 2)
             pair_stats.append({"pair": pair, "signals": len(group), "winrate": wr_pair})
         pair_stats = sorted(pair_stats, key=lambda x: x["signals"], reverse=True)
+
         tf_stats = []
         for tf, group in df.groupby("timeframe"):
             tp_tf = group["backtest_hit"].astype(str).str.upper().str.startswith("TP").sum()
             wr_tf = round((tp_tf / len(group)) * 100, 2)
             tf_stats.append({"timeframe": tf, "signals": len(group), "winrate": wr_tf})
         tf_stats = sorted(tf_stats, key=lambda x: x["signals"], reverse=True)
+
         model_exists = os.path.exists(MODEL_FILE)
         data = {
             "total_signals": total,

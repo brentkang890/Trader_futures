@@ -1,207 +1,211 @@
-# ======================================================
-# 🤖 PRO TRADER AI - FINAL TELEGRAM BOT
-# Analisis Otomatis Crypto & Forex + Chart Reader + Backtest
-# ======================================================
-
 import os
-import time
+import telebot
 import requests
+from telebot.types import InputFile
 
-# ---------------- KONFIG ----------------
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-CHAT_ID = os.environ.get("CHAT_ID")
-APP_URL = os.environ.get("APP_URL")  # URL AI Agent
-BACKTEST_URL = os.environ.get("BACKTEST_URL")  # URL Backtester (Railway)
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+CHAT_ID = os.getenv("CHAT_ID")
+APP_URL = os.getenv("APP_URL")  # AI Agent URL
+BACKTEST_URL = os.getenv("BACKTEST_URL")  # Optional
 
-if not BOT_TOKEN or not CHAT_ID or not APP_URL:
-    raise ValueError("❌ Variabel BOT_TOKEN, CHAT_ID, atau APP_URL belum diatur di Railway!")
+bot = telebot.TeleBot(BOT_TOKEN)
 
-# ---------------- UTILITAS ----------------
-def send_message(text, parse_mode="HTML"):
-    """Kirim pesan ke Telegram"""
-    try:
-        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-        payload = {"chat_id": CHAT_ID, "text": text[:4096], "parse_mode": parse_mode}
-        requests.post(url, json=payload, timeout=15)
-    except Exception as e:
-        print("[ERROR] Kirim pesan gagal:", e)
-
-
-def get_updates(offset=None):
-    """Ambil pesan terbaru dari Telegram"""
-    try:
-        url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
-        params = {"timeout": 100, "offset": offset}
-        return requests.get(url, params=params, timeout=120).json()
-    except Exception as e:
-        print("[ERROR] Gagal ambil update:", e)
-        return {}
-
-
-# ---------------- COMMAND HANDLER ----------------
-def handle_command(text):
-    if not text:
-        return "⚠️ Pesan kosong."
-    text = text.strip().lower()
-
-    # ============================
-    # 🔹 BACKTEST COMMAND
-    # ============================
-    if text.startswith("backtest"):
-        try:
-            parts = text.split()
-            if len(parts) < 2:
-                return "⚙️ Format: <code>backtest BTCUSDT</code> atau <code>backtest XAUUSD</code>"
-
-            pair = parts[1].upper()
-
-            payload = {
-                "pair": pair,
-                "side": "LONG",      # bisa diubah jadi SHORT
-                "entry": 30000,
-                "tp1": 31000,
-                "sl": 29500,
-                "timeframe": "15m"
-            }
-
-            target_url = BACKTEST_URL or f"{APP_URL.replace('production','faithful-truth')}/backtest"
-            r = requests.post(target_url, json=payload, timeout=30)
-            d = r.json()
-
-            if "error" in d:
-                return f"⚠️ Backtest gagal: {d['error']}"
-
-            msg = (
-                f"🧮 <b>Backtest Result</b>\n"
-                f"📊 Pair: {d.get('pair')}\n"
-                f"💡 Side: {d.get('side')}\n"
-                f"🎯 Hit: {d.get('hit')}\n"
-                f"💰 PnL: {d.get('pnl_total')}%\n"
-                f"📈 Market: {d.get('market')}"
-            )
-            return msg
-        except Exception as e:
-            return f"⚠️ Gagal jalankan backtest: {e}"
-
-    # ============================
-    # 🔹 STATUS MODEL
-    # ============================
-    if text == "status":
-        try:
-            r = requests.get(f"{APP_URL}/learning_status", timeout=20)
-            d = r.json()
-            msg = (
-                "🤖 <b>Status AI Agent</b>\n"
-                f"📦 Model: {'✅ Ada' if d.get('model_exists') else '❌ Tidak ada'}\n"
-                f"📊 Log Data: {d.get('trade_log_count', 0)} sinyal"
-            )
-            return msg
-        except Exception as e:
-            return f"⚠️ Gagal ambil status: {e}"
-
-    # ============================
-    # 🔹 STATISTIK
-    # ============================
-    if text == "stats":
-        try:
-            r = requests.get(f"{APP_URL}/ai_performance", timeout=25)
-            d = r.json()
-            if "error" in d:
-                return f"⚠️ {d['error']}"
-            msg = (
-                "📈 <b>Statistik Performa AI</b>\n"
-                f"📊 Total sinyal: {d['total_signals']}\n"
-                f"✅ Winrate: {d['winrate']}%\n"
-                f"💰 Profit Factor: {d.get('profit_factor', 'N/A')}\n"
-                f"📉 Max Drawdown: {d.get('max_drawdown', 'N/A')}\n"
-            )
-            return msg
-        except Exception as e:
-            return f"⚠️ Gagal ambil statistik: {e}"
-
-    # ============================
-    # 🔹 SCALP CEPAT
-    # ============================
-    if text.startswith("scalp "):
-        pair = text.split()[1].upper()
-        try:
-            r = requests.get(f"{APP_URL}/scalp_signal?pair={pair}&tf=3m&auto_log=true", timeout=25)
-            d = r.json()
-            msg = (
-                f"⚡️ <b>Scalp {d.get('pair')}</b> ({d.get('timeframe')})\n"
-                f"💡 Signal: <b>{d.get('signal_type')}</b>\n"
-                f"🎯 Entry: {d.get('entry')}\n"
-                f"TP1: {d.get('tp1')} | TP2: {d.get('tp2')}\n"
-                f"🛡 SL: {d.get('sl')}\n"
-                f"📈 Confidence: {d.get('confidence')}\n"
-                f"🧠 {d.get('reasoning')}"
-            )
-            return msg
-        except Exception as e:
-            return f"⚠️ Gagal ambil scalp signal: {e}"
-
-    # ============================
-    # 🔹 SIGNAL NORMAL
-    # ============================
-    parts = text.split()
-    if len(parts) == 0:
-        return "⚠️ Format salah. Contoh: <code>BTCUSDT 15m</code>"
-    elif len(parts) == 1:
-        pair, tf = parts[0], "15m"
-    else:
-        pair, tf = parts[0], parts[1]
-
-    try:
-        url = f"{APP_URL}/pro_signal?pair={pair.upper()}&tf_main=1h&tf_entry={tf}&auto_log=true"
-        r = requests.get(url, timeout=30)
-        d = r.json()
-        if "error" in d:
-            return f"⚠️ {d['error']}"
-
-        msg = (
-            f"📊 <b>{d.get('pair')}</b> ({d.get('timeframe')})\n"
-            f"💡 Signal: <b>{d.get('signal_type')}</b>\n"
-            f"🎯 Entry: {d.get('entry')}\n"
-            f"TP1: {d.get('tp1')} | TP2: {d.get('tp2')}\n"
-            f"🛡 SL: {d.get('sl')}\n"
-            f"📈 Confidence: {d.get('confidence')}\n"
-            f"🧠 {d.get('reasoning')}"
-        )
-        return msg
-    except Exception as e:
-        return f"❌ Error fetch AI Agent: {e}"
-
-
-# ---------------- PROGRAM UTAMA ----------------
-def main():
-    offset = None
-    print(f"🤖 BOT AKTIF — Hubung ke: {APP_URL}")
-    send_message(
-        "🤖 <b>Pro Trader AI Bot Aktif!</b>\n"
-        "Ketik contoh:\n"
-        "- BTCUSDT 15m atau XAUUSD 1h\n"
+# ================================
+# 🔹 /start Command
+# ================================
+@bot.message_handler(commands=['start'])
+def start(message):
+    text = (
+        "🤖 *Pro Trader AI Bot*\n\n"
+        "Kirim pair dan timeframe seperti:\n"
+        "`BTCUSDT 15m` atau `XAUUSD 1h`\n\n"
+        "📊 Kirim *gambar chart* untuk analisis otomatis.\n"
+        "📂 Kirim *file .csv* untuk analisis data historis.\n\n"
         "Perintah lain:\n"
-        "- backtest BTCUSDT\n"
-        "- status\n- stats\n- scalp BTCUSDT"
+        "• /stats — Lihat performa AI\n"
+        "• /status — Cek status model & learning\n"
+        "• /backtest <pair> — Jalankan backtest manual\n"
     )
+    bot.reply_to(message, text, parse_mode="Markdown")
 
-    while True:
-        try:
-            updates = get_updates(offset)
-            if "result" in updates:
-                for update in updates["result"]:
-                    offset = update["update_id"] + 1
-                    msg = update.get("message", {})
+# ================================
+# 🔹 Analisis Pair / Timeframe
+# ================================
+@bot.message_handler(func=lambda msg: msg.text and msg.text.strip() != "")
+def handle_message(message):
+    text = message.text.strip().upper()
+    parts = text.split()
 
-                    if "text" in msg:
-                        reply = handle_command(msg["text"])
-                        send_message(reply)
+    if len(parts) >= 2:
+        pair = parts[0]
+        tf = parts[1]
+    else:
+        pair = parts[0]
+        tf = "15m"
 
-            time.sleep(3)
-        except Exception as e:
-            print("[ERROR LOOP]", e)
-            time.sleep(5)
+    bot.reply_to(message, f"🔎 Menganalisis {pair} ({tf})...")
 
+    try:
+        url = f"{APP_URL}/pro_signal"
+        params = {"pair": pair, "tf_main": "1h", "tf_entry": tf, "auto_log": True}
+        res = requests.get(url, params=params, timeout=30)
 
-if __name__ == "__main__":
-    main()
+        if res.status_code != 200:
+            bot.reply_to(message, f"⚠️ Gagal: {res.text}")
+            return
+
+        data = res.json()
+        signal = data.get("signal_type", "WAIT")
+        entry = data.get("entry", 0)
+        tp1 = data.get("tp1", 0)
+        sl = data.get("sl", 0)
+        conf = data.get("confidence", 0)
+        reason = data.get("reasoning", "-")
+
+        reply = (
+            f"📊 *Hasil Analisis {pair} ({tf})*\n\n"
+            f"💡 Signal: `{signal}`\n"
+            f"🎯 Entry: `{entry}`\n"
+            f"TP1: `{tp1}` | SL: `{sl}`\n"
+            f"📈 Confidence: `{conf}`\n"
+            f"🧠 Reason: {reason}"
+        )
+        bot.send_message(message.chat.id, reply, parse_mode="Markdown")
+
+    except Exception as e:
+        bot.reply_to(message, f"❌ Error: {e}")
+
+# ================================
+# 🔹 Upload Gambar Chart
+# ================================
+@bot.message_handler(content_types=['photo'])
+def handle_photo(message):
+    bot.reply_to(message, "🖼️ Menganalisis chart dari gambar...")
+
+    try:
+        file_info = bot.get_file(message.photo[-1].file_id)
+        downloaded_file = bot.download_file(file_info.file_path)
+
+        files = {'file': ("chart.jpg", downloaded_file, 'image/jpeg')}
+        res = requests.post(f"{APP_URL}/analyze_chart", files=files, timeout=60)
+
+        if res.status_code != 200:
+            bot.reply_to(message, f"⚠️ Gagal menganalisis chart: {res.text}")
+            return
+
+        data = res.json()
+        signal = data.get("signal_type", "WAIT")
+        entry = data.get("entry", 0)
+        tp1 = data.get("tp1", 0)
+        sl = data.get("sl", 0)
+        conf = data.get("confidence", 0)
+        reason = data.get("reasoning", "-")
+
+        reply = (
+            f"🖼️ *Analisis Chart Gambar*\n\n"
+            f"💡 Signal: `{signal}`\n"
+            f"🎯 Entry: `{entry}`\n"
+            f"TP1: `{tp1}` | SL: `{sl}`\n"
+            f"📈 Confidence: `{conf}`\n"
+            f"🧠 Reason: {reason}"
+        )
+        bot.send_message(message.chat.id, reply, parse_mode="Markdown")
+
+    except Exception as e:
+        bot.reply_to(message, f"⚠️ Error: {e}")
+
+# ================================
+# 🔹 Upload File CSV (NEW FEATURE)
+# ================================
+@bot.message_handler(content_types=['document'])
+def handle_csv_upload(message):
+    try:
+        doc = message.document
+        if not doc.file_name.lower().endswith('.csv'):
+            bot.reply_to(message, "⚠️ Hanya file .csv yang didukung untuk analisis.")
+            return
+
+        bot.reply_to(message, "📂 File CSV diterima, sedang dianalisis...")
+
+        file_info = bot.get_file(doc.file_id)
+        downloaded_file = bot.download_file(file_info.file_path)
+
+        files = {'file': (doc.file_name, downloaded_file, 'text/csv')}
+        res = requests.post(f"{APP_URL}/analyze_csv", files=files, timeout=60)
+
+        if res.status_code == 200:
+            data = res.json()
+            signal = data.get("signal_type", "WAIT")
+            entry = data.get("entry", 0)
+            tp1 = data.get("tp1", 0)
+            sl = data.get("sl", 0)
+            conf = data.get("confidence", 0)
+            reason = data.get("reasoning", "-")
+
+            reply = (
+                f"📊 *Analisis CSV Berhasil*\n\n"
+                f"💡 Signal: `{signal}`\n"
+                f"🎯 Entry: `{entry}`\n"
+                f"TP1: `{tp1}` | SL: `{sl}`\n"
+                f"📈 Confidence: `{conf}`\n"
+                f"🧠 Reason: {reason}"
+            )
+        else:
+            reply = f"❌ Gagal menganalisis CSV: {res.text}"
+
+        bot.send_message(message.chat.id, reply, parse_mode="Markdown")
+
+    except Exception as e:
+        bot.send_message(message.chat.id, f"⚠️ Error: {e}")
+
+# ================================
+# 🔹 Command: /stats
+# ================================
+@bot.message_handler(commands=['stats'])
+def stats(message):
+    try:
+        res = requests.get(f"{APP_URL}/ai_performance", timeout=30)
+        if res.status_code != 200:
+            bot.reply_to(message, f"⚠️ Gagal: {res.text}")
+            return
+        data = res.json()
+        reply = (
+            f"📈 *AI Performance*\n\n"
+            f"🏁 Total Signals: {data.get('total_signals')}\n"
+            f"✅ TP: {data.get('tp_hits')} | ❌ SL: {data.get('sl_hits')}\n"
+            f"🎯 Winrate: {data.get('winrate')}%\n"
+            f"💰 Total PnL: {data.get('total_pnl')}\n"
+            f"⚖️ Profit Factor: {data.get('profit_factor')}\n"
+            f"📉 Max Drawdown: {data.get('max_drawdown')}\n"
+            f"🧠 Model: {data.get('model_status')}"
+        )
+        bot.send_message(message.chat.id, reply, parse_mode="Markdown")
+    except Exception as e:
+        bot.reply_to(message, f"⚠️ Error: {e}")
+
+# ================================
+# 🔹 Command: /status
+# ================================
+@bot.message_handler(commands=['status'])
+def status(message):
+    try:
+        res = requests.get(f"{APP_URL}/learning_status", timeout=30)
+        if res.status_code != 200:
+            bot.reply_to(message, f"⚠️ Gagal: {res.text}")
+            return
+        data = res.json()
+        reply = (
+            f"📚 *Learning Status*\n\n"
+            f"Model Exists: {data.get('model_exists')}\n"
+            f"Trade Log Count: {data.get('trade_log_count')}\n"
+            f"Features: {data.get('features')}"
+        )
+        bot.send_message(message.chat.id, reply, parse_mode="Markdown")
+    except Exception as e:
+        bot.reply_to(message, f"⚠️ Error: {e}")
+
+# ================================
+# 🚀 Run Bot
+# ================================
+print("🤖 Telegram Bot sedang berjalan...")
+bot.infinity_polling()

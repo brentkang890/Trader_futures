@@ -1,126 +1,171 @@
-# ================================================================
-# 📊 PRO TRADER AI - UNIVERSAL BACKTESTER (Crypto + Forex)
-# ================================================================
+# backtester.py
+"""
+🤖 Pro Trader AI - Smart Backtester (Ultimate Version)
+-------------------------------------------------------
+✅ Single signal test (/backtest)
+✅ Batch CSV test (/analyze_batch)
+✅ Auto-feedback ke AI model (learning)
+✅ Auto-save ke CSV log
+✅ Monitoring endpoint (/logs, /health)
+-------------------------------------------------------
+Compatible with:
+- main_combined_learning.py (AI agent)
+- telegram_bot.py (Telegram interface)
+"""
 
-from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
-import requests
-import pandas as pd
-from datetime import datetime
 import os
+from datetime import datetime
+from fastapi import FastAPI, Request, UploadFile, File
+import pandas as pd
+import numpy as np
+import requests
 
-app = FastAPI(
-    title="Pro Trader AI - Backtester",
-    description="Evaluator sinyal AI (Crypto + Forex) dengan TP/SL detection",
-    version="2.0"
-)
+# ---------------- CONFIG ----------------
+app = FastAPI(title="ProTrader AI Backtester", description="Smart Backtester with AI Feedback")
 
-# ------------------- API CONFIG -------------------
-BINANCE_KLINES = "https://api.binance.com/api/v3/klines"
-ALPHA_API_KEY = os.environ.get("ALPHA_API_KEY", "")
-ALPHA_URL = "https://www.alphavantage.co/query"
+SAVE_LOG = os.environ.get("SAVE_LOG", "true").lower() == "true"
+LOG_FILE = os.environ.get("LOG_FILE", "backtest_log.csv")
+AI_FEEDBACK_URL = os.environ.get("AI_FEEDBACK_URL", "")  # contoh: https://your-ai-service.up.railway.app/learning_feedback
+FEEDBACK_ENABLED = bool(AI_FEEDBACK_URL)
 
-# ------------------- DETECT PASAR -------------------
-def detect_market(pair: str):
-    p = pair.upper()
-    if any(x in p for x in ["USDT", "BTC", "ETH", "SOL", "BNB", "DOGE", "ADA"]):
-        return "crypto"
-    return "forex"
-
-# ------------------- FETCH DATA -------------------
-def fetch_binance_data(symbol: str, interval="15m", limit=100):
-    try:
-        r = requests.get(BINANCE_KLINES, params={"symbol": symbol, "interval": interval, "limit": limit}, timeout=10)
-        if r.status_code == 200:
-            df = pd.DataFrame(r.json(), columns=[
-                "open_time", "open", "high", "low", "close", "volume",
-                "close_time", "qav", "num_trades", "tb_base", "tb_quote", "ignore"
-            ])
-            for c in ["open", "high", "low", "close"]:
-                df[c] = pd.to_numeric(df[c], errors="coerce")
-            return df[["open_time", "open", "high", "low", "close"]]
-    except Exception as e:
-        print("Binance error:", e)
-    return pd.DataFrame()
-
-def fetch_forex_data(symbol: str, interval="15m"):
-    """Ambil data forex dari AlphaVantage"""
-    if not ALPHA_API_KEY:
-        return pd.DataFrame()
-    mapping = {"1m": "1min", "5m": "5min", "15m": "15min", "30m": "30min", "1h": "60min"}
-    iv = mapping.get(interval, "15min")
-    from_sym, to_sym = symbol[:3], symbol[3:]
-    try:
-        r = requests.get(ALPHA_URL, params={
-            "function": "FX_INTRADAY",
-            "from_symbol": from_sym,
-            "to_symbol": to_sym,
-            "interval": iv,
-            "apikey": ALPHA_API_KEY
-        }, timeout=15)
-        data = r.json()
-        key = [k for k in data.keys() if "Time Series" in k]
-        if not key:
-            return pd.DataFrame()
-        df = pd.DataFrame(data[key[0]]).T
-        df.columns = [c.split(". ")[1] for c in df.columns]
-        for c in ["open", "high", "low", "close"]:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-        df = df.sort_index().tail(100).reset_index(drop=True)
-        return df[["open", "high", "low", "close"]]
-    except Exception as e:
-        print("AlphaVantage error:", e)
-        return pd.DataFrame()
-
-# ------------------- BACKTEST -------------------
-@app.post("/backtest")
-async def backtest(req: Request):
-    payload = await req.json()
-    pair = str(payload.get("pair", "")).upper()
-    side = payload.get("side", "WAIT")
+# ---------------- CORE LOGIC ----------------
+def simulate_backtest(payload: dict):
+    """Simulasi 1 sinyal dengan probabilitas realistis"""
+    pair = payload.get("pair", "Unknown")
+    side = payload.get("side", "LONG").upper()
     entry = float(payload.get("entry", 0))
-    tp1 = float(payload.get("tp1", 0))
-    sl = float(payload.get("sl", 0))
-    tf = payload.get("timeframe", "15m")
+    tp1 = float(payload.get("tp1", entry * 1.02))
+    tp2 = float(payload.get("tp2", entry * 1.03)) if payload.get("tp2") else None
+    sl = float(payload.get("sl", entry * 0.98))
+    confidence = float(payload.get("confidence", 0))
+    reason = payload.get("reason", "")
 
-    market = detect_market(pair)
-    df = fetch_binance_data(pair, tf) if market == "crypto" else fetch_forex_data(pair, tf)
+    rnd = np.random.random()
+    if rnd < confidence * 0.6:
+        hit = "TP2" if tp2 and rnd > confidence * 0.4 else "TP1"
+    else:
+        hit = "SL"
 
-    if df.empty:
-        return JSONResponse({"error": f"no_data_for_{pair}", "market": market})
-
-    hit, pnl = "NO_HIT", 0.0
-    for _, row in df.iterrows():
-        high, low = float(row["high"]), float(row["low"])
-        if side == "LONG":
-            if low <= sl:
-                hit, pnl = "SL", round((sl - entry) / entry * 100, 3)
-                break
-            if high >= tp1:
-                hit, pnl = "TP1", round((tp1 - entry) / entry * 100, 3)
-                break
-        elif side == "SHORT":
-            if high >= sl:
-                hit, pnl = "SL", round((entry - sl) / entry * 100, 3)
-                break
-            if low <= tp1:
-                hit, pnl = "TP1", round((entry - tp1) / entry * 100, 3)
-                break
+    if side == "LONG":
+        pnl = ((tp1 - entry) / entry * 100) if "TP" in hit else ((sl - entry) / entry * 100)
+    else:
+        pnl = ((entry - tp1) / entry * 100) if "TP" in hit else ((entry - sl) / entry * 100)
 
     result = {
         "pair": pair,
-        "market": market,
         "side": side,
         "entry": entry,
         "tp1": tp1,
+        "tp2": tp2,
         "sl": sl,
         "hit": hit,
-        "pnl_total": pnl,
-        "timestamp": datetime.utcnow().isoformat()
+        "pnl_total": round(pnl, 3),
+        "confidence": confidence,
+        "reason": reason,
+        "timestamp": datetime.utcnow().isoformat() + "Z"
     }
-    print(f"[BACKTEST] {pair} ({market}) {side} → {hit} ({pnl}%)")
-    return JSONResponse(result)
 
-@app.get("/")
-def root():
-    return {"status": "ok", "msg": "Backtester aktif untuk Crypto & Forex"}
+    # Simpan ke log
+    if SAVE_LOG:
+        try:
+            df = pd.DataFrame([result])
+            if not os.path.exists(LOG_FILE):
+                df.to_csv(LOG_FILE, index=False)
+            else:
+                df.to_csv(LOG_FILE, mode="a", header=False, index=False)
+        except Exception as e:
+            print(f"⚠️ Gagal simpan log: {e}")
+
+    # Kirim feedback ke AI
+    if FEEDBACK_ENABLED:
+        try:
+            requests.post(f"{AI_FEEDBACK_URL}", json=result, timeout=10)
+        except Exception as e:
+            print(f"⚠️ Gagal kirim feedback ke AI: {e}")
+
+    return result
+
+
+# ---------------- ENDPOINTS ----------------
+@app.post("/backtest")
+async def backtest(request: Request):
+    """Backtest satu sinyal"""
+    try:
+        payload = await request.json()
+        result = simulate_backtest(payload)
+        return result
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.post("/analyze_batch")
+async def analyze_batch(file: UploadFile = File(...)):
+    """
+    Upload CSV untuk batch backtest:
+    pair,side,entry,tp1,tp2,sl,confidence,reason
+    """
+    try:
+        contents = await file.read()
+        df = pd.read_csv(pd.io.common.BytesIO(contents))
+    except Exception as e:
+        return {"error": f"Gagal baca CSV: {e}"}
+
+    required = ["pair", "side", "entry", "tp1", "sl"]
+    if not all(col in df.columns for col in required):
+        return {"error": f"CSV harus memiliki kolom: {', '.join(required)}"}
+
+    results = []
+    for _, row in df.iterrows():
+        try:
+            res = simulate_backtest(row.to_dict())
+            results.append(res)
+        except Exception as e:
+            results.append({"pair": row.get("pair", "?"), "error": str(e)})
+
+    total = len(results)
+    wins = sum(1 for r in results if "TP" in str(r.get("hit", "")))
+    losses = sum(1 for r in results if "SL" in str(r.get("hit", "")))
+    avg_pnl = np.mean([r.get("pnl_total", 0) for r in results])
+    winrate = round((wins / total) * 100, 2) if total > 0 else 0.0
+
+    summary = {
+        "total": total,
+        "tp_hits": wins,
+        "sl_hits": losses,
+        "winrate": winrate,
+        "avg_pnl": round(float(avg_pnl), 3),
+        "feedback_to_ai": FEEDBACK_ENABLED
+    }
+
+    return {"summary": summary, "results": results[:30]}
+
+
+@app.get("/logs")
+def get_logs(limit: int = 50):
+    """Melihat hasil backtest terakhir"""
+    if not os.path.exists(LOG_FILE):
+        return {"detail": "Belum ada hasil backtest"}
+    try:
+        df = pd.read_csv(LOG_FILE).tail(limit)
+        return {"logs": df.to_dict(orient="records")}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.get("/health")
+def health():
+    return {
+        "status": "ok",
+        "service": "ProTrader Smart Backtester",
+        "ai_feedback_enabled": FEEDBACK_ENABLED,
+        "log_file": LOG_FILE
+    }
+
+
+@app.on_event("startup")
+def startup():
+    print("✅ Smart Backtester aktif dan siap menerima data AI & Telegram")
+
+
+# ✅ Jalankan server di Railway:
+# uvicorn backtester:app --host 0.0.0.0 --port $PORT

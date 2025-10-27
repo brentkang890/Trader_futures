@@ -268,6 +268,169 @@ def breakout_of_structure(df: pd.DataFrame, window:int=20):
     if prev <= high_sw and last > high_sw: return "BOS_UP"
     if prev >= low_sw and last < low_sw: return "BOS_DOWN"
     return None
+    
+# ---------------- SMC HELPERS (POI / OB / FVG / LIQ / PATTERN / APEX) ----------------
+def _rolling_argrelextrema(series: pd.Series, order: int = 3, mode: str = "max"):
+    idxs = []
+    if len(series) < order*2+1: 
+        return idxs
+    for i in range(order, len(series)-order):
+        window = series.iloc[i-order:i+order+1]
+        center = series.iloc[i]
+        if mode == "max" and center == window.max():
+            idxs.append(i)
+        if mode == "min" and center == window.min():
+            idxs.append(i)
+    return idxs
+
+def find_swings(df: pd.DataFrame, order:int=3):
+    highs = _rolling_argrelextrema(df['high'], order, "max")
+    lows  = _rolling_argrelextrema(df['low'],  order, "min")
+    return highs, lows
+
+def detect_supply_demand_zones(df: pd.DataFrame, lookback:int=200, min_touches:int=2, tolerance:float=0.002):
+    """
+    Heuristik: zona supply ~ dekat swing-high signifikan, demand ~ dekat swing-low signifikan.
+    tolerance = 0.2% default dari harga untuk 'sentuhan' ulang
+    """
+    d = df.tail(lookback).reset_index(drop=True)
+    highs, lows = find_swings(d, order=3)
+    zones = {"supply": [], "demand": []}
+    # supply
+    for i in highs:
+        level = float(d['high'].iloc[i])
+        touches = (np.abs(d['high']-level)/level < tolerance).sum()
+        if touches >= min_touches:
+            zones["supply"].append({"level": round(level,8), "touches": int(touches)})
+    # demand
+    for i in lows:
+        level = float(d['low'].iloc[i])
+        touches = (np.abs(d['low']-level)/level < tolerance).sum()
+        if touches >= min_touches:
+            zones["demand"].append({"level": round(level,8), "touches": int(touches)})
+    # sort by kedekatan ke harga sekarang
+    px = float(d['close'].iloc[-1])
+    zones["supply"] = sorted(zones["supply"], key=lambda z: abs(z["level"]-px))[:5]
+    zones["demand"] = sorted(zones["demand"], key=lambda z: abs(z["level"]-px))[:5]
+    return zones
+
+def detect_order_blocks(df: pd.DataFrame, window:int=20):
+    """
+    OB sederhana: Bullish OB = bearish candle terakhir sebelum BOS naik; Bearish OB sebaliknya.
+    Kita aproksimasi: cari candle dengan body besar yang langsung diikuti move continuation.
+    """
+    d = df.tail(max(window+5, 40)).reset_index(drop=True)
+    res = {"bullish_ob": None, "bearish_ob": None}
+    rng = range(2, len(d)-2)
+    for i in rng:
+        o,c,prev_c = float(d['open'].iloc[i]), float(d['close'].iloc[i]), float(d['close'].iloc[i-1])
+        hi,lo = float(d['high'].iloc[i]), float(d['low'].iloc[i])
+        body = abs(c-o)
+        atrv = (d['high']-d['low']).rolling(14).mean().iloc[i] if i>=14 else (d['high']-d['low']).mean()
+        if atrv == 0 or pd.isna(atrv): atrv = (d['high']-d['low']).mean()
+        big_body = body > 0.6*atrv
+
+        # Bearish OB kandidat -> diikuti 2 close turun
+        if o < c and big_body and float(d['close'].iloc[i+1]) > c and float(d['close'].iloc[i+2]) > c:
+            # sebenarnya ini bullish momentum bar -> OB bearish cari kebalikannya
+            pass
+        # Bullish OB: bearish candle besar, lalu 2 close naik (break away)
+        if o > c and big_body and float(d['close'].iloc[i+1]) > c and float(d['close'].iloc[i+2]) > d['close'].iloc[i+1]:
+            res["bullish_ob"] = {"open": round(o,8), "close": round(c,8)}
+        # Bearish OB: bullish candle besar, lalu 2 close turun
+        if o < c and big_body and float(d['close'].iloc[i+1]) < c and float(d['close'].iloc[i+2]) < d['close'].iloc[i+1]:
+            res["bearish_ob"] = {"open": round(o,8), "close": round(c,8)}
+    return res
+
+def detect_fvg(df: pd.DataFrame, lookback:int=120):
+    """
+    Fair Value Gap (FVG) klasik: celah antara high candle n-1 dengan low candle n+1 (bullish gap) atau sebaliknya.
+    """
+    d = df.tail(lookback).reset_index(drop=True)
+    gaps = {"bullish_fvg": [], "bearish_fvg": []}
+    for i in range(1, len(d)-1):
+        hi_prev = float(d['high'].iloc[i-1]); lo_prev = float(d['low'].iloc[i-1])
+        hi_next = float(d['high'].iloc[i+1]); lo_next = float(d['low'].iloc[i+1])
+        # bullish FVG jika low(i+1) > high(i-1)
+        if lo_next > hi_prev:
+            gaps["bullish_fvg"].append({"from": round(hi_prev,8), "to": round(lo_next,8)})
+        # bearish FVG jika high(i+1) < low(i-1)
+        if hi_next < lo_prev:
+            gaps["bearish_fvg"].append({"from": round(hi_next,8), "to": round(lo_prev,8)})
+    # ambil yang paling dekat harga
+    px = float(d['close'].iloc[-1])
+    for k in gaps:
+        gaps[k] = sorted(gaps[k], key=lambda g: min(abs(g["from"]-px), abs(g["to"]-px)))[:3]
+    return gaps
+
+def detect_liquidity_grab(df: pd.DataFrame, lookback:int=100, wick_ratio:float=0.6):
+    """
+    Liquidity grab: candle yang tusuk level ekstrem lalu close balik (long wick).
+    """
+    d = df.tail(lookback).reset_index(drop=True)
+    events = []
+    swingH = d['high'].rolling(20).max()
+    swingL = d['low'].rolling(20).min()
+    for i in range(20, len(d)):
+        o,c,h,l = map(float, d[['open','close','high','low']].iloc[i])
+        body = abs(c-o)
+        upper_wick = h - max(o,c)
+        lower_wick = min(o,c) - l
+        # ambil grab atas / bawah
+        grab_up = h > float(swingH.iloc[i-1]) and upper_wick > wick_ratio*(upper_wick+lower_wick+body)
+        grab_dn = l < float(swingL.iloc[i-1]) and lower_wick > wick_ratio*(upper_wick+lower_wick+body)
+        if grab_up:
+            events.append({"type":"liq_grab_up", "level": round(h,8), "index": int(i)})
+        if grab_dn:
+            events.append({"type":"liq_grab_down", "level": round(l,8), "index": int(i)})
+    return events[-3:]  # terakhir-terakhir saja
+
+def detect_head_and_shoulders(df: pd.DataFrame, lookback:int=150, tol:float=0.015):
+    """
+    Deteksi H&S sederhana berbasis swing high (toleransi tinggi kiri/kanan mirip).
+    """
+    d = df.tail(lookback).reset_index(drop=True)
+    highs, lows = find_swings(d, order=3)
+    if len(highs) < 3:
+        return None
+    # ambil tiga high terakhir
+    hs = highs[-3:]
+    hL, hH, hR = [float(d['high'].iloc[i]) for i in hs]
+    cond_lr_mirror = abs(hL - hR)/max(hL,hR) < tol
+    cond_head_higher = hH > hL and hH > hR
+    if cond_lr_mirror and cond_head_higher:
+        return {"pattern":"H&S_Top", "indices": hs, "left": round(hL,8), "head": round(hH,8), "right": round(hR,8)}
+    # inverse H&S pakai swing low
+    if len(lows) >= 3:
+        ls = lows[-3:]
+        lL, lH, lR = [float(d['low'].iloc[i]) for i in ls]
+        cond_lr_mirror2 = abs(lL - lR)/max(lL,lR) < tol
+        cond_head_lower = lH < lL and lH < lR
+        if cond_lr_mirror2 and cond_head_lower:
+            return {"pattern":"Inv_H&S", "indices": ls, "left": round(lL,8), "head": round(lH,8), "right": round(lR,8)}
+    return None
+
+def detect_apex_compression(df: pd.DataFrame, window:int=50, slope_tol:float=0.0005):
+    """
+    Apex = range menyempit (ATR menurun) + dua trendline konvergen (pakai high/low linear fit).
+    """
+    d = df.tail(max(window, 50)).reset_index(drop=True)
+    if d.shape[0] < 20:
+        return None
+    x = np.arange(len(d))
+    hi = d['high'].astype(float).values
+    lo = d['low'].astype(float).values
+    # regresi linear
+    m_hi, b_hi = np.polyfit(x, hi, 1)
+    m_lo, b_lo = np.polyfit(x, lo, 1)
+    # konvergen jika m_hi < 0 dan m_lo > 0 atau jarak hi-lo menyempit
+    rng = (hi - lo)
+    narrowing = (pd.Series(rng).rolling(10).mean().iloc[-1] < pd.Series(rng).rolling(10).mean().iloc[0])
+    if narrowing and (m_hi < -slope_tol and m_lo > slope_tol):
+        apx_top = float(m_hi*x[-1] + b_hi)
+        apx_bot = float(m_lo*x[-1] + b_lo)
+        return {"apex_top": round(apx_top,8), "apex_bot": round(apx_bot,8)}
+    return None
 
 # ---------------- STRATEGI HYBRID ----------------
 def hybrid_analyze(df: pd.DataFrame, pair:Optional[str]=None, timeframe:Optional[str]=None) -> dict:
@@ -330,6 +493,62 @@ def hybrid_analyze(df: pd.DataFrame, pair:Optional[str]=None, timeframe:Optional
 
     confidence = float(sum(conf)/len(conf))
     reasoning = " · ".join(reasons)
+# --- SMC enrichment ---
+    try:
+        zones = detect_supply_demand_zones(df, lookback=180)
+        ob    = detect_order_blocks(df, window=30)
+        fvg   = detect_fvg(df, lookback=150)
+        liq   = detect_liquidity_grab(df, lookback=120)
+        hs    = detect_head_and_shoulders(df, lookback=160)
+        apex  = detect_apex_compression(df, window=60)
+
+        # Perkuat confidence bila entry dekat demand (untuk LONG) atau dekat supply (untuk SHORT)
+        near_boost = 0.0
+        px = price
+        if signal == "LONG" and zones.get("demand"):
+            nearest_demand = min(zones["demand"], key=lambda z: abs(z["level"]-px))
+            if abs(nearest_demand["level"]-px)/px < 0.004:  # ±0.4%
+                near_boost += 0.05
+                reasons.append(f"Dekat Demand POI (~{nearest_demand['level']}).")
+        if signal == "SHORT" and zones.get("supply"):
+            nearest_supply = min(zones["supply"], key=lambda z: abs(z["level"]-px))
+            if abs(nearest_supply["level"]-px)/px < 0.004:
+                near_boost += 0.05
+                reasons.append(f"Dekat Supply POI (~{nearest_supply['level']}).")
+
+        # FVG magnet: jika ada FVG terdekat searah, tambah keyakinan kecil
+        if signal == "LONG" and fvg["bullish_fvg"]:
+            reasons.append("Bullish FVG terdekat berpotensi menjadi magnet harga.")
+            near_boost += 0.03
+        if signal == "SHORT" and fvg["bearish_fvg"]:
+            reasons.append("Bearish FVG terdekat berpotensi menjadi magnet harga.")
+            near_boost += 0.03
+
+        # Liquidity grab baru-baru ini -> tambah konfluensi pembalikan
+        if liq:
+            last_liq = liq[-1]["type"]
+            reasons.append(f"Liquidity event: {last_liq}.")
+            near_boost += 0.02
+
+        # Head & Shoulder jadi peringatan kebalikan trend
+        if hs:
+            reasons.append(f"Pattern terdeteksi: {hs['pattern']}.")
+            # jika H&S top tapi sinyal LONG -> kurangi sedikit
+            if hs["pattern"] == "H&S_Top" and signal == "LONG":
+                near_boost -= 0.05
+            if hs["pattern"] == "Inv_H&S" and signal == "SHORT":
+                near_boost -= 0.05
+
+        # Apex compression -> breakout bias: jika RSI netral, tambah sedikit
+        if apex and 35 < rsi_now < 70:
+            reasons.append("Apex/volatility compression — potensi break.")
+            near_boost += 0.02
+
+        confidence = float(sum(conf)/len(conf)) + near_boost
+        confidence = max(0.0, min(1.0, confidence))
+    except Exception as _e:
+        # kalau enrichment gagal, pakai confidence awal
+        confidence = float(sum(conf)/len(conf))
     return {
         "pair": pair or "",
         "timeframe": timeframe or "",
@@ -340,6 +559,12 @@ def hybrid_analyze(df: pd.DataFrame, pair:Optional[str]=None, timeframe:Optional
         "sl": round(sl,8),
         "confidence": round(confidence,3),
         "reasoning": reasoning
+        "poi": zones if 'zones' in locals() else None,
+        "order_blocks": ob if 'ob' in locals() else None,
+        "fvg": fvg if 'fvg' in locals() else None,
+        "liquidity_events": liq if 'liq' in locals() else None,
+        "patterns": hs if 'hs' in locals() else None,
+        "apex": apex if 'apex' in locals() else None
     }
 
 # ---------------- SCALPING ENGINE ----------------

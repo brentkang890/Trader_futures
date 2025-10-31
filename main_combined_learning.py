@@ -1,12 +1,7 @@
 # main_combined_learning.py
 """
 Pro Trader AI - Combined + Learning (Bahasa Indonesia)
-- Analisis Crypto & Forex (Binance / TwelveData)
-- Auto-logging sinyal ke trade_log.csv
-- Integrated Learning (RandomForest) + model cache + retrain background
-- Chart OCR + candle detection (best-effort)
-- Sentiment fusion (best-effort)
-- Endpoints: /pro_signal, /scalp_signal, /analyze_chart, /analyze_csv, /learning_status, /retrain_learning, /ai_performance, /logs, /logs_summary, /download_logs, /model_debug, /sentiment, /mode, /context
+SMC Pro + Mode Hybrid + Auto Position Sizing (Risk 2% default)
 """
 import os
 import io
@@ -45,9 +40,9 @@ except Exception:
     _HAS_TESSERACT = False
 
 app = FastAPI(
-    title="Pro Trader AI - Combined + Learning (ID)",
-    description="Analisis Crypto (Binance) & Forex (TwelveData) + Pembelajaran Terintegrasi",
-    version="1.0"
+    title="Pro Trader AI - Combined + Learning (ID) (SMC Pro)",
+    description="Analisis Crypto (Binance) & Forex (TwelveData) + SMC Pro + Auto Sizing",
+    version="1.1"
 )
 
 # ---------------- KONFIG ----------------
@@ -67,6 +62,14 @@ ALPHA_URL = "https://www.alphavantage.co/query"
 # sentiment endpoints (best-effort)
 FNG_URL = "https://api.alternative.me/fng/"
 COINGECKO_GLOBAL = "https://api.coingecko.com/api/v3/global"
+
+# --- RISK & MODE CONFIG ---
+RISK_PERCENT = float(os.environ.get("RISK_PERCENT", 0.02))  # default 2%
+ACCOUNT_BALANCE = float(os.environ.get("ACCOUNT_BALANCE", "0"))  # optional, for sizing
+CURRENT_MODE = os.environ.get("TRADING_MODE", "auto").lower()  # auto|agresif|moderate|konservatif
+
+# SMC profile file
+SMC_PROFILE_FILE = os.environ.get("SMC_PROFILE_FILE", "smc_profiles.pkl")
 
 # thread-safety + caching
 _lock = threading.Lock()
@@ -98,7 +101,7 @@ def respond(obj: Any, status_code: int = 200):
         cleaned = clean_value(encoded)
         return JSONResponse(content=cleaned, status_code=status_code)
     except Exception as e:
-        print("⚠️ respond() fallback:", e)
+        print("respond() fallback:", e)
         try:
             safe_str = json.dumps(str(obj))
             return JSONResponse(content={"fallback": safe_str}, status_code=status_code)
@@ -145,6 +148,36 @@ def detect_market(pair: str) -> str:
     if len(p) >= 6 and p[-3:].isalpha() and p[:-3].isalpha():
         return "forex"
     return "crypto"
+
+# ---------------- MODE & POSITION SIZING HELPERS ----------------
+def set_mode(mode: str):
+    global CURRENT_MODE
+    m = (mode or "auto").lower()
+    if m not in ("auto","agresif","aggressive","moderate","moderat","konservatif"):
+        raise ValueError("mode_tidak_valid")
+    # normalize synonyms
+    if m == "aggressive":
+        m = "agresif"
+    if m == "moderat":
+        m = "moderate"
+    CURRENT_MODE = m
+    return CURRENT_MODE
+
+def get_mode():
+    return CURRENT_MODE
+
+def position_size(entry: float, sl: float) -> dict:
+    """Hitung ukuran posisi berdasar risiko RISK_PERCENT dari ACCOUNT_BALANCE (opsional)."""
+    if entry <= 0 or sl <= 0 or entry == sl:
+        return {"size": None, "risk_amount": None}
+    if ACCOUNT_BALANCE <= 0:
+        return {"size": None, "risk_amount": None}
+    risk_amount = ACCOUNT_BALANCE * RISK_PERCENT
+    per_unit_risk = abs(entry - sl)
+    if per_unit_risk == 0:
+        return {"size": None, "risk_amount": round(risk_amount, 2)}
+    size = risk_amount / per_unit_risk
+    return {"size": round(size, 6), "risk_amount": round(risk_amount, 2)}
 
 # ---------------- FETCH OHLC ----------------
 def fetch_ohlc_twelvedata(symbol: str, interval: str="15m", limit: int=500) -> pd.DataFrame:
@@ -269,12 +302,164 @@ def breakout_of_structure(df: pd.DataFrame, window:int=20):
     if prev >= low_sw and last < low_sw: return "BOS_DOWN"
     return None
 
-# ---------------- STRATEGI HYBRID ----------------
+# ---------------- SMC PROFILE & AUTO-TUNE (LOAD DEFAULTS) ----------------
+import joblib as _joblib  # alias for smc profile save/load
+
+_default_smc_profiles = {
+    "crypto_major": {
+        "pattern": ["BTC", "ETH", "BNB", "ADA", "SOL"],
+        "bos_window": 18,
+        "ob_lookback": 90,
+        "fvg_lookback": 70,
+        "tol_equal": 0.001,
+        "rr_target": 2.2,
+        "fib_zone": 0.5
+    },
+    "altcoin": {
+        "pattern": ["USDT", "PEPE", "BONK", "SHIB", "SOL"],
+        "bos_window": 14,
+        "ob_lookback": 60,
+        "fvg_lookback": 50,
+        "tol_equal": 0.0015,
+        "rr_target": 1.8,
+        "fib_zone": 0.618
+    },
+    "forex": {
+        "pattern": ["EUR", "USD", "JPY", "XAU", "GBP", "AUD"],
+        "bos_window": 25,
+        "ob_lookback": 200,
+        "fvg_lookback": 100,
+        "tol_equal": 0.0003,
+        "rr_target": 3.0,
+        "fib_zone": 0.382
+    }
+}
+
+try:
+    if os.path.exists(SMC_PROFILE_FILE):
+        smc_profiles = _joblib.load(SMC_PROFILE_FILE)
+    else:
+        smc_profiles = _default_smc_profiles.copy()
+        _joblib.dump(smc_profiles, SMC_PROFILE_FILE)
+except Exception as e:
+    print("SMC profile load error:", e)
+    smc_profiles = _default_smc_profiles.copy()
+
+def save_smc_profiles():
+    try:
+        _joblib.dump(smc_profiles, SMC_PROFILE_FILE)
+    except Exception as e:
+        print("Failed save smc profiles:", e)
+
+def get_smc_profile(pair: str) -> dict:
+    """Return SMC profile dict for given pair (best-effort)."""
+    if not pair:
+        return smc_profiles.get("crypto_major")
+    p = pair.upper()
+    # simple heuristics: check major symbols first
+    for name, prof in smc_profiles.items():
+        for pat in prof.get("pattern", []):
+            if pat.upper() in p:
+                return prof
+    if any(x in p for x in ["USDT", "BUSD", "BTC", "ETH"]):
+        return smc_profiles.get("crypto_major")
+    if len(p) >= 6 and p[-3:].isalpha() and p[:-3].isalpha():
+        return smc_profiles.get("forex")
+    return smc_profiles.get("crypto_major")
+
+# ---------------- SMC DETECTIONS (param-driven wrappers) ----------------
+def detect_equal_levels(series: pd.Series, tol: float = 0.0005) -> list:
+    """Cari equal highs/lows sederhana (liquidity)."""
+    lvls = []
+    s = series.tail(120).reset_index(drop=True)
+    for i in range(2, len(s)):
+        if s[i-1] == 0 or s[i] == 0:
+            continue
+        if abs(s[i] - s[i-1]) / s[i] < tol:
+            lvls.append(float((s[i] + s[i-1]) / 2))
+    return sorted(set(lvls))
+
+def detect_fvg(df: pd.DataFrame, lookback: int = 60) -> list:
+    """Cari FVG bullish/bearish (gap body-to-body sederhana)."""
+    fvg = []
+    sub = df.tail(lookback).reset_index(drop=True)
+    for i in range(2, len(sub)):
+        # Bullish FVG: low(i) > high(i-2)
+        if float(sub['low'].iloc[i]) > float(sub['high'].iloc[i-2]):
+            fvg.append({"type":"bull","upper": float(sub['low'].iloc[i]), "lower": float(sub['high'].iloc[i-2])})
+        # Bearish FVG: high(i) < low(i-2)
+        if float(sub['high'].iloc[i]) < float(sub['low'].iloc[i-2]):
+            fvg.append({"type":"bear","upper": float(sub['low'].iloc[i-2]), "lower": float(sub['high'].iloc[i])})
+    return fvg
+
+def detect_order_blocks(df: pd.DataFrame, lookback: int = 120) -> list:
+    """OB sederhana: candle berlawanan sebelum BOS; pakai body-range sebagai zona."""
+    obs = []
+    sub = df.tail(lookback).reset_index(drop=True)
+    for i in range(3, len(sub)):
+        prev_bull = float(sub['close'].iloc[i-1]) > float(sub['open'].iloc[i-1])
+        prev_bear = float(sub['close'].iloc[i-1]) < float(sub['open'].iloc[i-1])
+        # Bull OB: candle merah terakhir sebelum kenaikan kuat
+        if prev_bear and float(sub['close'].iloc[i]) > float(sub['high'].iloc[i-1]):
+            ob_low  = float(min(sub['open'].iloc[i-1], sub['close'].iloc[i-1]))
+            ob_high = float(max(sub['open'].iloc[i-1], sub['close'].iloc[i-1]))
+            obs.append({"type":"bull","low":ob_low,"high":ob_high})
+        # Bear OB: candle hijau terakhir sebelum penurunan kuat
+        if prev_bull and float(sub['close'].iloc[i]) < float(sub['low'].iloc[i-1]):
+            ob_low  = float(min(sub['open'].iloc[i-1], sub['close'].iloc[i-1]))
+            ob_high = float(max(sub['open'].iloc[i-1], sub['close'].iloc[i-1]))
+            obs.append({"type":"bear","low":ob_low,"high":ob_high})
+    # dedup & kompres
+    dedup = []
+    for z in obs:
+        if not any(abs(z['low']-x['low'])<1e-9 and abs(z['high']-x['high'])<1e-9 and z['type']==x['type'] for x in dedup):
+            dedup.append(z)
+    return dedup
+
+def smc_context(df: pd.DataFrame, profile: Optional[dict] = None) -> dict:
+    """Return SMC context using profile parameters (bos_window, ob_lookback, fvg_lookback, tol_equal)."""
+    if profile is None:
+        profile = get_smc_profile(None)
+    bos = breakout_of_structure(df, window=int(profile.get("bos_window", 20)))
+    swing_high = float(df['high'].tail(80).max())
+    swing_low  = float(df['low'].tail(80).min())
+    mid = swing_low + (swing_high - swing_low) * (profile.get("fib_zone", 0.5))
+    ob  = detect_order_blocks(df, lookback=int(profile.get("ob_lookback", 120)))
+    fvg = detect_fvg(df, lookback=int(profile.get("fvg_lookback", 60)))
+    eql_highs = detect_equal_levels(df['high'], tol=float(profile.get("tol_equal", 0.0005)))
+    eql_lows  = detect_equal_levels(df['low'], tol=float(profile.get("tol_equal", 0.0005)))
+    return {
+        "bos": bos,
+        "premium_discount_50": mid,
+        "order_blocks": ob,
+        "fvgs": fvg,
+        "eq_highs": eql_highs,
+        "eq_lows": eql_lows,
+        "profile_used": profile
+    }
+
+# ---------------- PLACEHOLDER: hybrid_analyze (full implementation continues in Part 2) ----------------
+def hybrid_analyze(df: pd.DataFrame, pair:Optional[str]=None, timeframe:Optional[str]=None) -> dict:
+    """
+    STRATEGI HYBRID (SMC Pro) - implementasi lengkap dilanjutkan di Part 2.
+    Fungsi ini akan:
+     - Hitung EMA/RSi/ATR
+     - Ambil SMC context via get_smc_profile(pair)
+     - Tentukan mode (auto/manual) dan sesuaikan TP/SL/Entry
+     - Integrasikan ML model & sentiment
+     - Kembalikan dict sinyal termasuk position sizing dan smc metadata
+    """
+    # Implementation continued in Part 2
+    raise NotImplementedError("hybrid_analyze belum diimplementasikan di bagian ini. Lanjutkan ke Part 2.")
+# ---------------- STRATEGI HYBRID (implementasi penuh) ----------------
 def hybrid_analyze(df: pd.DataFrame, pair:Optional[str]=None, timeframe:Optional[str]=None) -> dict:
     df = df.copy().dropna().reset_index(drop=True)
     if df.shape[0] < 12:
         return {"error":"data_tidak_cukup", "message":"Perlu minimal 12 candle untuk analisis."}
 
+    # pilih profile berdasarkan pair
+    profile = get_smc_profile(pair or "")
+    # compute basic indicators
     df['ema20'] = ema(df['close'],20)
     df['ema50'] = ema(df['close'],50)
     df['rsi14'] = rsi(df['close'],14)
@@ -288,30 +473,73 @@ def hybrid_analyze(df: pd.DataFrame, pair:Optional[str]=None, timeframe:Optional
     atr_now = float(last['atr14']) if not np.isnan(last['atr14']) else price*0.001
 
     recent_high, recent_low = detect_sr(df, lookback=120)
-    bos = breakout_of_structure(df, window=20)
-    swing_high = df['high'].tail(80).max()
-    swing_low  = df['low'].tail(80).min()
-    diff = swing_high - swing_low
-    fib_618 = swing_high - diff*0.618 if diff>0 else price
+    bos = breakout_of_structure(df, window=int(profile.get("bos_window", 20)))
+    swing_high = float(df['high'].tail(80).max())
+    swing_low  = float(df['low'].tail(80).min())
+    diff = swing_high - swing_low if swing_high and swing_low else price*0.01
+    fib_zone = float(profile.get("fib_zone", 0.5))
+    fib_618 = swing_high - diff * 0.618 if diff>0 else price
+
+    # SMC context with profile
+    smc = smc_context(df, profile=profile)
+
+    # Mode otomatis berdasar kondisi tren/volatilitas
+    mode = get_mode()
+    if mode == "auto":
+        trend_strength = abs((ema20 - ema50) / price) if price else 0.0
+        choppy = float(atr_now/price) < 0.003 if price else True
+        if trend_strength > 0.01 and not choppy:
+            mode = "agresif"
+        elif trend_strength > 0.004:
+            mode = "moderate"
+        else:
+            mode = "konservatif"
 
     reasons, conf = [], []
     trend = "bullish" if ema20 > ema50 else "bearish"
 
+    # default safe values
+    entry = price
+    signal = "WAIT"
+    sl = price * 0.995
+    tp1 = price * 1.002
+    tp2 = price * 1.004
+
+    # LONG conditions
     if bos == "BOS_UP" or (trend == "bullish" and price > ema20):
         entry = price
-        sl = recent_low - atr_now*0.6
-        rr = entry - sl if entry>sl else price*0.01
-        tp1 = entry + rr*1.5
-        tp2 = entry + rr*2.5
+        sl = recent_low - atr_now*0.6 if recent_low and atr_now else price - atr_now
+        rr = entry - sl if entry>sl else max( (entry*0.01), 1e-8 )
+        tp1 = entry + rr * 1.5
+        tp2 = entry + rr * 2.5
         reasons.append("Bias LONG — BOS naik & EMA searah.")
         conf.append(0.9 if trend=="bullish" else 0.6)
         conf.append(0.9 if price >= fib_618 else 0.65)
         conf.append(1.0 if 30 < rsi_now < 75 else 0.5)
         signal="LONG"
+
+        # Premium/Discount filter (beli lebih bagus di bawah mid)
+        if price > smc['premium_discount_50'] and mode in ("moderate","konservatif"):
+            conf.append(0.2)
+            reasons.append("Harga di zona premium (PD) — hati-hati.")
+        # Validasi OB/FVG/Liquidity (cek beberapa last zones)
+        bull_ob_hit = any(z['type']=="bull" and z['low']<=price<=z['high'] for z in smc.get('order_blocks', [])[-6:])
+        bull_fvg_near = any(g['type']=="bull" and g['lower']<=price<=g['upper'] for g in smc.get('fvgs', [])[-6:])
+        liq_above = any(lvl>price for lvl in smc.get('eq_highs', []))
+        if bull_ob_hit: conf.append(0.12); reasons.append("Mitigasi Bull OB.")
+        if bull_fvg_near: conf.append(0.08); reasons.append("Di dalam/near Bull FVG.")
+        if liq_above: conf.append(0.06); reasons.append("Ada equal highs di atas (target likuiditas).")
+        # Mode tuning
+        if mode == "agresif":
+            tp1 = entry + rr*1.2; tp2 = entry + rr*2.0
+        elif mode == "konservatif":
+            tp1 = entry + rr*1.8; tp2 = entry + rr*3.0
+
+    # SHORT conditions
     elif bos == "BOS_DOWN" or (trend == "bearish" and price < ema20):
         entry = price
-        sl = recent_high + atr_now*0.6
-        rr = sl - entry if sl>entry else price*0.01
+        sl = recent_high + atr_now*0.6 if recent_high and atr_now else price + atr_now
+        rr = sl - entry if sl>entry else max((price*0.01), 1e-8)
         tp1 = entry - rr*1.5
         tp2 = entry - rr*2.5
         reasons.append("Bias SHORT — BOS turun & EMA searah bearish.")
@@ -319,18 +547,43 @@ def hybrid_analyze(df: pd.DataFrame, pair:Optional[str]=None, timeframe:Optional
         conf.append(0.9 if price <= fib_618 else 0.65)
         conf.append(1.0 if 25 < rsi_now < 70 else 0.5)
         signal="SHORT"
+
+        # Premium/Discount filter for sells
+        if price < smc['premium_discount_50'] and mode in ("moderate","konservatif"):
+            conf.append(0.2)
+            reasons.append("Harga di zona discount untuk sell — hati-hati.")
+        bear_ob_hit = any(z['type']=="bear" and z['low']<=price<=z['high'] for z in smc.get('order_blocks', [])[-6:])
+        bear_fvg_near = any(g['type']=="bear" and g['lower']<=price<=g['upper'] for g in smc.get('fvgs', [])[-6:])
+        liq_below = any(lvl<price for lvl in smc.get('eq_lows', []))
+        if bear_ob_hit: conf.append(0.12); reasons.append("Mitigasi Bear OB.")
+        if bear_fvg_near: conf.append(0.08); reasons.append("Di dalam/near Bear FVG.")
+        if liq_below: conf.append(0.06); reasons.append("Ada equal lows di bawah (target likuiditas).")
+        if mode == "agresif":
+            tp1 = entry - rr*1.2; tp2 = entry - rr*2.0
+        elif mode == "konservatif":
+            tp1 = entry - rr*1.8; tp2 = entry - rr*3.0
+
     else:
+        # WAIT / no clear bias
         entry = price
-        sl = recent_low * 0.995
+        sl = recent_low * 0.995 if recent_low else price * 0.997
         tp1 = entry + (entry-sl)*1.2
         tp2 = entry + (entry-sl)*2.0
         reasons.append("Belum ada arah jelas — tunggu konfirmasi TF lebih tinggi.")
         conf.append(0.25)
         signal="WAIT"
 
-    confidence = float(sum(conf)/len(conf))
+    # compute tech confidence
+    try:
+        confidence = float(sum(conf)/len(conf))
+    except Exception:
+        confidence = 0.5
     reasoning = " · ".join(reasons)
-    return {
+
+    # position sizing
+    sizing = position_size(entry, sl)
+
+    result = {
         "pair": pair or "",
         "timeframe": timeframe or "",
         "signal_type": signal,
@@ -339,14 +592,29 @@ def hybrid_analyze(df: pd.DataFrame, pair:Optional[str]=None, timeframe:Optional
         "tp2": round(tp2,8),
         "sl": round(sl,8),
         "confidence": round(confidence,3),
-        "reasoning": reasoning
+        "reasoning": reasoning,
+        "risk_percent": RISK_PERCENT,
+        "position_size": sizing.get("size"),
+        "risk_amount": sizing.get("risk_amount"),
+        "mode_used": mode,
+        "smc": {
+            "bos": smc.get("bos"),
+            "pd": round(float(smc.get("premium_discount_50", price)), 8),
+            "eq_highs": smc.get("eq_highs", [])[-3:],
+            "eq_lows": smc.get("eq_lows", [])[-3:],
+            "profile_used": smc.get("profile_used", {})
+        }
     }
 
-# ---------------- SCALPING ENGINE ----------------
+    return result
+
+# ---------------- SCALPING ENGINE (diperbarui untuk sizing & smc profile) ----------------
 def scalp_engine(df: pd.DataFrame, pair:Optional[str]=None, tf:Optional[str]=None) -> dict:
     if df.shape[0] < 30:
         return {"error": "data_tidak_cukup"}
 
+    # pick profile
+    profile = get_smc_profile(pair or "")
     df['ema8'] = ema(df['close'], 8)
     df['ema21'] = ema(df['close'], 21)
     df['rsi14'] = rsi(df['close'], 14)
@@ -358,6 +626,18 @@ def scalp_engine(df: pd.DataFrame, pair:Optional[str]=None, tf:Optional[str]=Non
     vol_mean = df['volume'].tail(40).mean() if df.shape[0] >= 40 else df['volume'].mean()
     vol_spike = float(last['volume']) > (vol_mean * 1.8 if vol_mean > 0 else False)
 
+    smc = smc_context(df, profile=profile)
+    mode = get_mode()
+    if mode == "auto":
+        trend_strength = abs((df['ema8'].iloc[-1] - df['ema21'].iloc[-1]) / price) if price else 0.0
+        if trend_strength > 0.008:
+            mode = "agresif"
+        elif trend_strength > 0.003:
+            mode = "moderate"
+        else:
+            mode = "konservatif"
+
+    # conditions for scalp entries
     if float(last['ema8']) > float(last['ema21']) and vol_spike and 35 < float(last['rsi14']) < 75:
         entry = price
         sl = entry - atr_now * 0.6
@@ -383,6 +663,8 @@ def scalp_engine(df: pd.DataFrame, pair:Optional[str]=None, tf:Optional[str]=Non
         conf = 0.3
         signal = "WAIT"
 
+    sizing = position_size(entry, sl)
+
     return {
         "pair": pair or "",
         "timeframe": tf or "",
@@ -392,10 +674,14 @@ def scalp_engine(df: pd.DataFrame, pair:Optional[str]=None, tf:Optional[str]=Non
         "tp2": round(tp2, 8),
         "sl": round(sl, 8),
         "confidence": round(conf, 3),
-        "reasoning": reason
+        "reasoning": reason,
+        "risk_percent": RISK_PERCENT,
+        "position_size": sizing.get("size"),
+        "risk_amount": sizing.get("risk_amount"),
+        "mode_used": mode
     }
 
-# ---------------- IMAGE OCR HELPERS ----------------
+# ---------------- IMAGE OCR HELPERS (detect harga & candles dari gambar chart) ----------------
 def ocr_y_axis_prices(img_cv):
     """Extract numeric labels from right-side y-axis using tesseract (best-effort)."""
     if not _HAS_TESSERACT:
@@ -413,7 +699,7 @@ def ocr_y_axis_prices(img_cv):
             gray = cv2.resize(gray, None, fx=1.4, fy=1.4, interpolation=cv2.INTER_CUBIC)
             _, th = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
             th = cv2.medianBlur(th, 3)
-            config = "--psm 6 --oem 3 -c tessedit_char_whitelist=0123456789.,"
+            config = "--psm 6 --oem 3 -c tessedit_char_whitelist=0123456789.," 
             txt = pytesseract.image_to_string(th, config=config)
             lines = [l.strip() for l in txt.splitlines() if l.strip()]
             parsed = []
@@ -597,6 +883,13 @@ def train_and_save_model():
     except:
         _last_retrain_count = 0
 
+    # spawn autotune in background (non-blocking)
+    try:
+        t = threading.Thread(target=lambda: auto_tune_smc_parameters(min_signals_required=50), daemon=True)
+        t.start()
+    except Exception as e:
+        print("autotune spawn failed:", e)
+
     return {"status": "trained", "samples": len(y), "auc": auc, "report": report}
 
 def predict_with_model(payload: Dict[str, Any]):
@@ -650,498 +943,190 @@ def check_and_trigger_retrain_if_needed():
         except Exception as e:
             print("check_retrain error", e)
 
-# ---------------- SENTIMENT HELPERS ----------------
-def get_crypto_sentiment():
-    """Ambil Fear & Greed + BTC dominance (best-effort)."""
-    out = {"fear_greed": None, "fng_value": None, "btc_dominance": None, "source": []}
+# Part 2 complete — lanjut ke Part 3 (endpoints, startup, backtester comms, smc autotune API).
+# ---------------- FASTAPI ENDPOINTS ----------------
+
+@app.get("/")
+def root():
+    return respond({
+        "service": "Pro Trader AI (SMC Pro + AutoTune)",
+        "status": "✅ aktif",
+        "mode": get_mode(),
+        "risk_percent": RISK_PERCENT,
+        "smc_profiles_loaded": list(smc_profiles.keys())
+    })
+
+@app.get("/set_mode")
+def set_trading_mode(mode: str = Query(...)):
     try:
-        r = requests.get(FNG_URL, params={"limit": 1}, timeout=8)
-        j = r.json()
-        if "data" in j and len(j["data"])>0:
-            d = j["data"][0]
-            out["fear_greed"] = d.get("value_classification")
-            out["fng_value"] = int(d.get("value")) if d.get("value") else None
-            out["source"].append("alternative.me/fng")
-    except Exception:
-        pass
-    try:
-        r = requests.get(COINGECKO_GLOBAL, timeout=8)
-        j = r.json()
-        mp = j.get("data", {}).get("market_cap_percentage", {})
-        btc_dom = mp.get("btc") or mp.get("btc_dominance")
-        if btc_dom is not None:
-            out["btc_dominance"] = round(float(btc_dom), 2)
-            out["source"].append("coingecko/global")
-    except Exception:
-        pass
-    return out
-
-def get_macro_sentiment():
-    """Ambil beberapa indikator makro sederhana (best-effort)."""
-    out = {"dxy": None, "vix": None, "snp_change": None, "source": []}
-    if ALPHA_API_KEY:
-        try:
-            out["source"].append("alphavantage/FX (placeholder)")
-        except Exception:
-            pass
-    return out
-
-def fuse_confidence(tech_conf: float, market: str, crypto_sent: dict=None, macro_sent: dict=None) -> float:
-    tech = float(tech_conf or 0.5)
-    if market == "crypto":
-        sent_score = 0.5
-        if crypto_sent:
-            fng = crypto_sent.get("fng_value")
-            btc_dom = crypto_sent.get("btc_dominance")
-            if fng is not None:
-                sent_score = min(1.0, max(0.0, (fng/100.0)))
-            if btc_dom is not None:
-                sent_score = (sent_score + (btc_dom/100.0))/2.0
-        final = 0.65 * tech + 0.35 * sent_score
-    else:
-        macro_score = 0.5
-        if macro_sent:
-            macro_score = 0.5
-        final = 0.7 * tech + 0.3 * macro_score
-    return round(max(0.0, min(1.0, final)), 3)
-
-# ---------------- POSTPROCESS + ENDPOINTS ----------------
-def _postprocess_with_learning(signal: Dict[str, Any]) -> Dict[str, Any]:
-    try:
-        market = detect_market(signal.get("pair", ""))
-        crypto_sent = get_crypto_sentiment() if market == "crypto" else None
-        macro_sent = get_macro_sentiment() if market == "forex" else None
-
-        model_prob = None
-        if os.path.exists(MODEL_FILE):
-            try:
-                pred = predict_with_model({
-                    "pair": signal.get("pair"),
-                    "timeframe": signal.get("timeframe"),
-                    "entry": signal.get("entry"),
-                    "tp": signal.get("tp1"),
-                    "sl": signal.get("sl")
-                })
-                model_prob = pred.get("prob", None)
-                signal["model_prob"] = round(model_prob, 3) if model_prob is not None else None
-            except Exception as e:
-                signal["model_error"] = str(e)
-
-        orig = float(signal.get("confidence", 0.5))
-        fused = fuse_confidence(orig, market, crypto_sent, macro_sent)
-        if model_prob is not None:
-            fused = round(max(0.0, min(1.0, 0.85 * fused + 0.15 * model_prob)), 3)
-        signal["confidence"] = fused
-        signal["market_mode"] = market
-        signal["sentiment"] = {"crypto": crypto_sent, "macro": macro_sent}
-        if model_prob is not None and model_prob < 0.25:
-            signal["vetoed_by_model"] = True
-            signal["signal_type"] = "WAIT"
-        else:
-            signal["vetoed_by_model"] = False
-
+        m = set_mode(mode)
+        return respond({"ok": True, "mode": m})
     except Exception as e:
-        signal["postprocess_error"] = str(e)
-    return signal
+        return respond({"error": str(e)})
 
-@app.get("/health")
-def health():
-    return respond({"status": "ok", "service": "Pro Trader AI - Learning (ID)"})
+@app.get("/get_mode")
+def get_trading_mode():
+    return respond({"mode": get_mode()})
 
 @app.get("/pro_signal")
-def pro_signal(pair: str = Query(...), tf_main: str = Query("1h"), tf_entry: str = Query("15m"), limit: int = Query(300), auto_log: bool = Query(False)):
+def pro_signal(pair: str = Query(...), tf_main: str = Query("1h"), tf_entry: str = Query("15m"),
+               auto_log: bool = Query(False)):
     try:
-        df_entry = fetch_ohlc_binance(pair, tf_entry, limit=limit)
+        df = fetch_ohlc_binance(pair, tf_entry, limit=500)
+        result = hybrid_analyze(df, pair=pair, timeframe=tf_entry)
+        # optional backtest/probability integration
+        try:
+            pred = predict_with_model(result)
+            result["ml_prob"] = round(pred.get("prob", 0.0), 3)
+            result["ml_features"] = pred.get("features", {})
+        except Exception as e:
+            result["ml_prob"] = None
+            result["ml_error"] = str(e)
+
+        if auto_log:
+            append_trade_log(result)
+            check_and_trigger_retrain_if_needed()
+        return respond(result)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"fetch_failed: {e}")
-
-    res = hybrid_analyze(df_entry, pair=pair, timeframe=tf_entry)
-    try:
-        df_main = fetch_ohlc_binance(pair, tf_main, limit=200)
-        ema20_main = float(ema(df_main['close'], 20).iloc[-1])
-        ema50_main = float(ema(df_main['close'], 50).iloc[-1])
-        res['context_main_trend'] = "bullish" if ema20_main > ema50_main else "bearish"
-    except:
-        pass
-
-    res = _postprocess_with_learning(res)
-
-    if auto_log:
-        payload_bt = {
-            "pair": res["pair"], "timeframe": res["timeframe"], "side": res["signal_type"],
-            "entry": res["entry"], "tp1": res.get("tp1"), "tp2": res.get("tp2"),
-            "sl": res["sl"], "confidence": res["confidence"], "reason": res["reasoning"]
-        }
-        bt_res = post_to_backtester(payload_bt)
-        res["backtest_raw"] = bt_res
-
-        logrec = {
-            "pair": res["pair"], "timeframe": res["timeframe"], "signal_type": res["signal_type"],
-            "entry": res["entry"], "tp1": res.get("tp1"), "tp2": res.get("tp2"),
-            "sl": res["sl"], "confidence": res["confidence"], "reasoning": res["reasoning"],
-            "backtest_hit": bt_res.get("hit") if isinstance(bt_res, dict) else None,
-            "backtest_pnl": bt_res.get("pnl_total") if isinstance(bt_res, dict) else None
-        }
-        append_trade_log(logrec)
-        check_and_trigger_retrain_if_needed()
-
-    return respond(res)
+        return respond({"error": str(e)})
 
 @app.get("/scalp_signal")
-def scalp_signal(pair: str = Query(...), tf: str = Query("3m"), limit: int = Query(300), auto_log: bool = Query(False)):
+def scalp_signal(pair: str = Query(...), tf: str = Query("3m"), auto_log: bool = Query(False)):
     try:
-        df = fetch_ohlc_binance(pair, tf, limit=limit)
+        df = fetch_ohlc_binance(pair, tf, limit=300)
+        result = scalp_engine(df, pair=pair, tf=tf)
+        if auto_log:
+            append_trade_log(result)
+            check_and_trigger_retrain_if_needed()
+        return respond(result)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"fetch_failed: {e}")
-
-    res = scalp_engine(df, pair=pair, tf=tf)
-    res = _postprocess_with_learning(res)
-
-    if auto_log:
-        payload_bt = {
-            "pair": res["pair"], "timeframe": res["timeframe"], "side": res["signal_type"],
-            "entry": res["entry"], "tp1": res.get("tp1"), "tp2": res.get("tp2"),
-            "sl": res["sl"], "confidence": res["confidence"], "reason": res["reasoning"]
-        }
-        bt_res = post_to_backtester(payload_bt)
-        res["backtest_raw"] = bt_res
-
-        logrec = {
-            "pair": res["pair"], "timeframe": res["timeframe"], "signal_type": res["signal_type"],
-            "entry": res["entry"], "tp1": res.get("tp1"), "tp2": res.get("tp2"),
-            "sl": res["sl"], "confidence": res["confidence"], "reasoning": res["reasoning"],
-            "backtest_hit": bt_res.get("hit") if isinstance(bt_res, dict) else None,
-            "backtest_pnl": bt_res.get("pnl_total") if isinstance(bt_res, dict) else None
-        }
-        append_trade_log(logrec)
-        check_and_trigger_retrain_if_needed()
-
-    return respond(res)
+        return respond({"error": str(e)})
 
 @app.post("/analyze_chart")
-def analyze_chart(file: UploadFile = File(...), pair: Optional[str] = Form(None), timeframe: Optional[str] = Form(None), auto_backtest: Optional[str] = Form("true")):
-    auto_flag = auto_backtest.lower() != "false"
+def analyze_chart(file: UploadFile = File(...)):
     try:
-        contents = file.file.read()
-        pil = Image.open(io.BytesIO(contents)).convert("RGB")
-        img_cv = cv2.cvtColor(np.array(pil), cv2.COLOR_RGB2BGR)
+        data = file.file.read()
+        img_cv = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
+        if img_cv is None:
+            raise ValueError("gambar_tidak_valid")
+        ymap = ocr_y_axis_prices(img_cv)
+        df = detect_candles_from_plot(img_cv, ymap)
+        if df.empty:
+            raise ValueError("gagal_deteksi_candlestick")
+        result = hybrid_analyze(df, pair="UNKNOWN", timeframe="chart")
+        return respond(result)
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"gambar_tidak_valid: {e}")
+        return respond({"error": str(e)})
 
-    if not _HAS_TESSERACT:
-        raise HTTPException(status_code=400, detail="tesseract_ocr_tidak_tersedia")
-
-    y_map = {}
-    try:
-        y_map = ocr_y_axis_prices(img_cv)
-    except:
-        y_map = {}
-
-    df_ohlc = detect_candles_from_plot(img_cv, y_map, max_bars=200)
-    if df_ohlc.empty:
-        raise HTTPException(status_code=400, detail="gagal_membaca_chart")
-
-    for col in ['open', 'high', 'low', 'close']:
-        df_ohlc[col] = pd.to_numeric(df_ohlc[col], errors='coerce')
-    df_ohlc = df_ohlc.dropna().reset_index(drop=True)
-
-    res = hybrid_analyze(df_ohlc, pair=pair or "IMG", timeframe=timeframe or "img")
-    res = _postprocess_with_learning(res)
-
-    if auto_flag:
-        bt_res = post_to_backtester({
-            "pair": res["pair"], "timeframe": res["timeframe"], "side": res["signal_type"],
-            "entry": res["entry"], "tp1": res.get("tp1"), "tp2": res.get("tp2"),
-            "sl": res["sl"], "confidence": res["confidence"], "reason": res["reasoning"]
-        })
-        res["backtest_raw"] = bt_res
-        append_trade_log({
-            "pair": res["pair"], "timeframe": res["timeframe"], "signal_type": res["signal_type"],
-            "entry": res["entry"], "tp1": res["tp1"], "tp2": res["tp2"], "sl": res["sl"],
-            "confidence": res["confidence"], "reasoning": res["reasoning"],
-            "backtest_hit": bt_res.get("hit") if isinstance(bt_res, dict) else None,
-            "backtest_pnl": bt_res.get("pnl_total") if isinstance(bt_res, dict) else None
-        })
-        check_and_trigger_retrain_if_needed()
-
-    res['bars_used'] = int(df_ohlc.shape[0])
-    return respond(res)
-
-# ==========================================================
-# ENHANCED ENDPOINT: /analyze_csv
-# - Auto log ke trade_log.csv
-# - Auto trigger retrain learning
-# - Auto backtest integration
-# ==========================================================
 @app.post("/analyze_csv")
-def analyze_csv(
-    file: UploadFile = File(...),
-    pair: Optional[str] = Form(None),
-    timeframe: Optional[str] = Form(None),
-    auto_backtest: Optional[str] = Form("true"),
-    auto_log: Optional[str] = Form("true")
-):
-    """
-    Analisis file CSV candlestick (open, high, low, close)
-    dan otomatis simpan hasil ke trade_log.csv + retrain model jika perlu.
-    """
-    auto_bt = auto_backtest.lower() != "false"
-    auto_lg = auto_log.lower() != "false"
-
+def analyze_csv(file: UploadFile = File(...)):
     try:
-        contents = file.file.read()
-        df = pd.read_csv(io.BytesIO(contents))
+        df = pd.read_csv(file.file)
+        if not {"open","high","low","close"}.issubset(df.columns):
+            raise ValueError("csv_tidak_valid: perlu kolom open,high,low,close")
+        pair = file.filename.replace(".csv","")
+        result = hybrid_analyze(df, pair=pair, timeframe="csv")
+        return respond(result)
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"invalid_csv: {e}")
+        return respond({"error": str(e)})
 
-    # Pastikan kolom valid
-    df.columns = [c.strip().lower() for c in df.columns]
-    def find_col(k): return next((c for c in df.columns if k in c), None)
-    o, h, l, ccol = find_col('open'), find_col('high'), find_col('low'), find_col('close')
-    if not all([o, h, l, ccol]):
-        raise HTTPException(status_code=400, detail="kolom_tidak_lengkap (butuh open, high, low, close)")
-
-    # Ubah kolom ke format standar
-    df2 = df[[o, h, l, ccol]].rename(columns={o: 'open', h: 'high', l: 'low', ccol: 'close'})
-    for col in ['open', 'high', 'low', 'close']:
-        df2[col] = pd.to_numeric(df2[col], errors='coerce')
-    df2 = df2.dropna().reset_index(drop=True)
-
-    # Analisis teknikal
-    res = hybrid_analyze(df2, pair=pair or "CSV", timeframe=timeframe or "csv")
-    res = _postprocess_with_learning(res)
-
-    # Backtest otomatis (kalau BACKTEST_URL aktif)
-    bt_res = {}
-    if auto_bt and res.get("signal_type") != "WAIT":
-        bt_payload = {
-            "pair": res["pair"],
-            "timeframe": res["timeframe"],
-            "side": res["signal_type"],
-            "entry": res["entry"],
-            "tp1": res.get("tp1"),
-            "tp2": res.get("tp2"),
-            "sl": res["sl"],
-            "confidence": res["confidence"],
-            "reason": res["reasoning"]
-        }
-        bt_res = post_to_backtester(bt_payload)
-        res["backtest_raw"] = bt_res
-
-    # Simpan otomatis ke trade_log.csv
-    if auto_lg:
-        backtest_hit = bt_res.get("hit") or bt_res.get("result") or bt_res.get("outcome")
-        backtest_pnl = bt_res.get("pnl_total") or bt_res.get("pnl") or bt_res.get("profit")
-        append_trade_log({
-            "pair": res["pair"],
-            "timeframe": res["timeframe"],
-            "signal_type": res["signal_type"],
-            "entry": res["entry"],
-            "tp1": res.get("tp1"),
-            "tp2": res.get("tp2"),
-            "sl": res["sl"],
-            "confidence": res["confidence"],
-            "reasoning": res["reasoning"],
-            "backtest_hit": backtest_hit,
-            "backtest_pnl": backtest_pnl
-        })
-
-        # Retrain otomatis kalau cukup sinyal
-        check_and_trigger_retrain_if_needed()
-
-    # Tambahkan info tambahan
-    res["bars_used"] = int(df2.shape[0])
-    res["auto_logged"] = auto_lg
-    res["auto_retrain_triggered"] = auto_lg
-    return respond(res)
-
-@app.get("/sentiment")
-def sentiment():
-    c = get_crypto_sentiment()
-    m = get_macro_sentiment()
-    return respond({"crypto_sentiment": c, "macro_sentiment": m})
-
-@app.get("/mode")
-def mode(pair: str = Query(...)):
-    p = pair.upper()
-    m = detect_market(p)
-    sources = {"crypto": ["binance", "coingecko", "alternative.me"], "forex": ["twelvedata (fallback: alphavantage)"]}
-    return respond({"pair": p, "mode": m, "data_sources": sources.get(m)})
-
-@app.get("/context")
-def context(pair: str = Query(...), tf: str = Query("15m")):
-    p = pair.upper()
-    m = detect_market(p)
-    c = get_crypto_sentiment() if m == "crypto" else None
-    macro = get_macro_sentiment() if m == "forex" else None
-    last_price = None
+@app.post("/retrain_learning")
+def retrain_learning():
     try:
-        df = fetch_ohlc_binance(p, tf, limit=5)
-        last_price = float(df['close'].astype(float).iloc[-1])
-    except Exception:
-        last_price = None
-    return respond({"pair": p, "mode": m, "last_price": last_price, "crypto_sentiment": c, "macro_sentiment": macro})
+        res = train_and_save_model()
+        return respond(res)
+    except Exception as e:
+        return respond({"error": str(e)})
 
 @app.get("/learning_status")
 def learning_status():
-    info = {"model_exists": os.path.exists(MODEL_FILE)}
-    if info["model_exists"]:
-        try:
-            mod = joblib.load(MODEL_FILE)
-            info["features"] = mod.get("features")
-        except:
-            info["features"] = None
     try:
-        df = pd.read_csv(TRADE_LOG_FILE) if os.path.exists(TRADE_LOG_FILE) else pd.DataFrame()
-        info["trade_log_count"] = len(df)
-    except:
-        info["trade_log_count"] = 0
-    return respond(info)
-
-@app.get("/model_debug")
-def model_debug():
-    info = {"model_exists": os.path.exists(MODEL_FILE), "last_trained": None, "features": None, "feature_importance": None}
-    if os.path.exists(MODEL_FILE):
-        try:
+        model_exists = os.path.exists(MODEL_FILE)
+        features = []
+        if model_exists:
             mod = joblib.load(MODEL_FILE)
-            clf = mod.get("clf")
-            features = mod.get("features")
-            info["features"] = features
-            info["last_trained"] = datetime.fromtimestamp(os.path.getmtime(MODEL_FILE)).isoformat()
-            if hasattr(clf, "feature_importances_"):
-                imps = clf.feature_importances_.tolist()
-                info["feature_importance"] = dict(zip(features, [round(float(x),6) for x in imps]))
-        except Exception as e:
-            info["error_loading_model"] = str(e)
-    return respond(info)
+            features = mod.get("features", [])
+        df = pd.read_csv(TRADE_LOG_FILE) if os.path.exists(TRADE_LOG_FILE) else pd.DataFrame()
+        return respond({
+            "model_exists": model_exists,
+            "trade_log_count": len(df),
+            "features": features
+        })
+    except Exception as e:
+        return respond({"error": str(e)})
 
-@app.get("/retrain_learning")
-def retrain_learning():
-    res = train_and_save_model()
-    return respond(res)
-
-@app.get("/logs")
-def get_logs(limit: int = Query(100)):
-    ensure_trade_log()
-    df = pd.read_csv(TRADE_LOG_FILE)
-    df = df.tail(limit).to_dict(orient="records")
-    return respond({"logs": df})
+@app.get("/ai_performance")
+def ai_performance():
+    try:
+        df = pd.read_csv(TRADE_LOG_FILE)
+        total = len(df)
+        if total == 0:
+            return respond({"error": "belum_ada_data"})
+        hit = df['backtest_hit'].astype(str).str.upper()
+        tp_hits = hit.str.startswith("TP").sum()
+        sl_hits = hit.str.startswith("SL").sum()
+        winrate = round(tp_hits/total*100,2) if total>0 else 0.0
+        pnl = pd.to_numeric(df.get("backtest_pnl", pd.Series([0]*total)), errors='coerce').fillna(0)
+        profit_factor = round(abs(pnl[pnl>0].sum() / abs(pnl[pnl<0].sum()+1e-9)),3) if len(pnl)>0 else 0
+        return respond({
+            "total_signals": total,
+            "winrate": winrate,
+            "profit_factor": profit_factor,
+            "model_status": "trained" if os.path.exists(MODEL_FILE) else "not_trained"
+        })
+    except Exception as e:
+        return respond({"error": str(e)})
 
 @app.get("/logs_summary")
 def logs_summary():
     try:
         if not os.path.exists(TRADE_LOG_FILE):
-            return respond({"detail": "Belum ada log sinyal tersimpan."})
+            return respond({"error":"tidak_ada_log"})
         df = pd.read_csv(TRADE_LOG_FILE)
         if df.empty:
-            return respond({"detail": "Belum ada data sinyal terbaru."})
-        last = df.iloc[-1]
-        data = {
-            "pair": last.get("pair", ""),
-            "timeframe": last.get("timeframe", ""),
-            "signal_type": last.get("signal_type", ""),
-            "entry": last.get("entry", ""),
-            "tp1": last.get("tp1", ""),
-            "tp2": last.get("tp2", ""),
-            "sl": last.get("sl", ""),
-            "confidence": last.get("confidence", ""),
-            "reasoning": last.get("reasoning", "")
-        }
-        return respond(data)
+            return respond({"error":"log_kosong"})
+        last = df.iloc[-1].to_dict()
+        return respond(last)
     except Exception as e:
         return respond({"error": str(e)})
 
 @app.get("/download_logs")
 def download_logs():
-    ensure_trade_log()
-    return FileResponse(TRADE_LOG_FILE, media_type="text/csv", filename="trade_log.csv")
+    if not os.path.exists(TRADE_LOG_FILE):
+        raise HTTPException(status_code=404, detail="tidak_ada_log")
+    return FileResponse(TRADE_LOG_FILE, filename="trade_log.csv", media_type="text/csv")
 
-@app.get("/ai_performance")
-def ai_performance():
+@app.get("/smc_profiles")
+def smc_profiles_api():
+    return respond(smc_profiles)
+
+@app.get("/force_autotune")
+def force_autotune(min_signals: int = Query(50)):
     try:
-        ensure_trade_log()
-        pd.options.mode.use_inf_as_na = True
-        df = pd.read_csv(TRADE_LOG_FILE)
-        if df.empty:
-            return respond({"error": "Belum ada data sinyal untuk dianalisis."})
-
-        total = len(df)
-        tp_hits = df["backtest_hit"].astype(str).str.upper().str.startswith("TP").sum()
-        sl_hits = df["backtest_hit"].astype(str).str.upper().str.startswith("SL").sum()
-        winrate = round((tp_hits / total) * 100, 2) if total > 0 else 0
-
-        avg_conf = pd.to_numeric(df.get("confidence", pd.Series([], dtype=float)), errors="coerce").mean()
-        if pd.isna(avg_conf) or np.isinf(avg_conf):
-            avg_conf = 0.0
-        avg_conf = round(float(avg_conf), 3)
-
-        pnl_values = pd.to_numeric(df.get("backtest_pnl", pd.Series([], dtype=float)), errors="coerce").dropna()
-        total_pnl = float(pnl_values.sum()) if not pnl_values.empty else 0.0
-
-        profit_factor = None
-        if not pnl_values.empty and (pnl_values < 0).any():
-            prof = pnl_values[pnl_values > 0].sum()
-            loss = abs(pnl_values[pnl_values < 0].sum())
-            profit_factor = round(prof / loss, 2) if loss != 0 else None
-
-        max_drawdown = float(pnl_values.min()) if not pnl_values.empty else 0.0
-
-        pair_stats = []
-        for pair, group in df.groupby("pair"):
-            tp_pair = group["backtest_hit"].astype(str).str.upper().str.startswith("TP").sum()
-            wr_pair = round((tp_pair / len(group)) * 100, 2)
-            pair_stats.append({"pair": pair, "signals": len(group), "winrate": wr_pair})
-        pair_stats = sorted(pair_stats, key=lambda x: x["signals"], reverse=True)
-
-        tf_stats = []
-        for tf, group in df.groupby("timeframe"):
-            tp_tf = group["backtest_hit"].astype(str).str.upper().str.startswith("TP").sum()
-            wr_tf = round((tp_tf / len(group)) * 100, 2)
-            tf_stats.append({"timeframe": tf, "signals": len(group), "winrate": wr_tf})
-        tf_stats = sorted(tf_stats, key=lambda x: x["signals"], reverse=True)
-
-        model_exists = os.path.exists(MODEL_FILE)
-        data = {
-            "total_signals": total,
-            "tp_hits": int(tp_hits),
-            "sl_hits": int(sl_hits),
-            "winrate": winrate,
-            "avg_confidence": avg_conf,
-            "total_pnl": total_pnl,
-            "profit_factor": profit_factor,
-            "max_drawdown": max_drawdown,
-            "pair_stats": pair_stats,
-            "tf_stats": tf_stats,
-            "model_status": "✅ Sudah Dilatih" if model_exists else "❌ Belum Ada Model"
-        }
-        return respond(data)
+        res = auto_tune_smc_parameters(min_signals_required=min_signals, force=True)
+        return respond(res)
     except Exception as e:
         return respond({"error": str(e)})
-
-# ---------------- BACKTEST COMM ----------------
-def post_to_backtester(payload: Dict[str, Any]) -> Dict[str, Any]:
-    if not BACKTEST_URL:
-        return {"error": "BACKTEST_URL_not_configured"}
-    try:
-        r = requests.post(BACKTEST_URL, json=payload, timeout=15)
-        try:
-            return r.json()
-        except:
-            return {"status_code": r.status_code, "text": r.text}
-    except Exception as e:
-        return {"error": "backtester_unreachable", "detail": str(e)}
 
 # ---------------- STARTUP ----------------
 @app.on_event("startup")
 def startup_event():
     ensure_trade_log()
+    # load model cache
     global _cached_model
     if os.path.exists(MODEL_FILE):
         try:
             _cached_model = joblib.load(MODEL_FILE)
-            print("Loaded cached model on startup.")
+            print("[Startup] model loaded:", MODEL_FILE)
         except Exception as e:
-            print("Failed load cached model on startup:", e)
+            print("[Startup] gagal load model:", e)
+    else:
+        print("[Startup] model belum ada, nanti dilatih otomatis.")
 
-# Run server:
-# uvicorn main_combined_learning:app --host 0.0.0.0 --port $PORT
+    print("[Startup] mode awal:", get_mode(), "risk:", RISK_PERCENT)
+    print("[Startup] smc profiles:", list(smc_profiles.keys()))
+
+# ---------------- MAIN ----------------
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT",8000)))

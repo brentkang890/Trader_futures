@@ -10,3 +10,4 @@ pillow
 opencv-python-headless
 pytesseract
 python-multipart
+python-telegram-bot

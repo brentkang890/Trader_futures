@@ -1,255 +1,141 @@
-# telegram_bot.py
-"""
-🤖 Pro Trader AI Telegram Bot
-- Versi emoji (UTF-8 aman untuk Railway)
-- Support: sinyal, backtest, status, stats, log, scalp, upload CSV & chart
-"""
-
 import os
-import time
 import requests
+from telegram import Update
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
+# Load environment variables
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
-APP_URL = os.environ.get("APP_URL", "https://web-production-af34.up.railway.app")
-BACKTEST_URL = os.environ.get("BACKTEST_URL")
+APP_URL = os.environ.get("APP_URL", "http://127.0.0.1:8000")
 
-if not BOT_TOKEN or not CHAT_ID or not APP_URL:
-    raise ValueError("❌ Environment variables BOT_TOKEN, CHAT_ID, APP_URL harus diset.")
-
-def send_message(text, parse_mode="HTML"):
+# Helper function
+async def send_message(context, text, chat_id=None):
     try:
-        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-        payload = {"chat_id": CHAT_ID, "text": text[:4096], "parse_mode": parse_mode}
-        requests.post(url, json=payload, timeout=15)
+        await context.bot.send_message(chat_id=chat_id or CHAT_ID, text=text)
     except Exception as e:
-        print("[ERROR] send_message:", e)
+        print("Send message error:", e)
 
-def get_updates(offset=None):
+# ---------------- COMMANDS ----------------
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = (
+        "🤖 *Pro Trader AI Bot (SMC Pro)* Siap digunakan!\n\n"
+        "Perintah yang tersedia:\n"
+        "/scalp <pair> — Sinyal scalping cepat (contoh: /scalp BTCUSDT)\n"
+        "/pro <pair> — Analisis penuh SMC Pro (contoh: /pro SOLUSDT)\n"
+        "/mode <auto/agresif/moderate/konservatif> — Ubah mode strategi\n"
+        "/performance — Cek performa AI\n"
+        "/logs — Lihat hasil sinyal terakhir\n"
+        "/retrain — Latih ulang model AI\n"
+        "/autotune — Jalankan auto-tune SMC\n"
+    )
+    await update.message.reply_text(msg, parse_mode="Markdown")
+
+async def scalp(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("❌ Gunakan format: /scalp BTCUSDT")
+        return
+    pair = context.args[0].upper()
+    url = f"{APP_URL}/scalp_signal?pair={pair}&auto_log=true"
     try:
-        url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
-        params = {"timeout": 100, "offset": offset}
-        return requests.get(url, params=params, timeout=120).json()
+        res = requests.get(url, timeout=30).json()
+        text = f"⚡ *Scalp Signal* — {pair}\n" \
+               f"Signal: {res.get('signal_type')}\n" \
+               f"Entry: {res.get('entry')}\n" \
+               f"TP1: {res.get('tp1')}\nTP2: {res.get('tp2')}\nSL: {res.get('sl')}\n" \
+               f"Confidence: {res.get('confidence')}\nMode: {res.get('mode_used')}"
+        await update.message.reply_text(text, parse_mode="Markdown")
     except Exception as e:
-        print("[ERROR] get_updates:", e)
-        return {}
+        await update.message.reply_text(f"❌ Error: {e}")
 
-def download_file(file_id):
+async def pro(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("❌ Gunakan format: /pro BTCUSDT")
+        return
+    pair = context.args[0].upper()
+    url = f"{APP_URL}/pro_signal?pair={pair}&auto_log=true"
     try:
-        info = requests.get(f"https://api.telegram.org/bot{BOT_TOKEN}/getFile?file_id={file_id}").json()
-        path = info["result"]["file_path"]
-        url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{path}"
-        r = requests.get(url, timeout=60)
-        return r.content
+        res = requests.get(url, timeout=60).json()
+        text = f"📊 *Pro Signal (SMC)* — {pair}\n" \
+               f"Signal: {res.get('signal_type')}\nEntry: {res.get('entry')}\n" \
+               f"TP1: {res.get('tp1')} | TP2: {res.get('tp2')}\nSL: {res.get('sl')}\n" \
+               f"Mode: {res.get('mode_used')}\nRisk: {res.get('risk_percent')*100:.1f}%\n" \
+               f"Position Size: {res.get('position_size')}\n" \
+               f"Confidence: {res.get('confidence')}\n" \
+               f"Reasoning: {res.get('reasoning')[:400]}..."
+        await update.message.reply_text(text, parse_mode="Markdown")
     except Exception as e:
-        print("download_file error:", e)
-        return None
+        await update.message.reply_text(f"❌ Error: {e}")
 
-def handle_command(text):
-    if not text:
-        return "⚠️ Pesan kosong."
-    t = text.strip().lower()
-
-    # 🧠 START
-    if t in ("start", "/start"):
-        return (
-            "🤖 <b>Pro Trader AI Bot Aktif!</b>\n\n"
-            "📈 Contoh:\n"
-            "- BTCUSDT 15m atau XAUUSD 1h\n\n"
-            "🧩 Perintah lain:\n"
-            "- backtest BTCUSDT\n"
-            "- status\n"
-            "- stats\n"
-            "- log\n"
-            "- scalp BTCUSDT\n\n"
-            "📄 Kirim file CSV untuk analisis otomatis."
-        )
-
-    # 🧪 BACKTEST
-    if t.startswith("backtest"):
-        try:
-            parts = t.split()
-            if len(parts) < 2:
-                return "⚙️ Format: <code>backtest BTCUSDT</code>"
-            pair = parts[1].upper()
-            payload = {"pair": pair, "side": "LONG", "entry": 30000, "tp1": 31000, "sl": 29500, "timeframe": "15m"}
-            url = BACKTEST_URL or f"{APP_URL.rstrip('/')}/backtest"
-            r = requests.post(url, json=payload, timeout=30)
-            d = r.json()
-            if "error" in d:
-                return f"⚠️ Backtest error: {d.get('error')}"
-            return (
-                f"📊 <b>Backtest {d.get('pair')}</b>\n"
-                f"🎯 Hit: {d.get('hit')}\n"
-                f"💰 PnL: {d.get('pnl_total')}\n"
-            )
-        except Exception as e:
-            return f"⚠️ Gagal backtest: {e}"
-
-    # 📊 STATUS MODEL
-    if t == "status":
-        try:
-            r = requests.get(f"{APP_URL.rstrip('/')}/learning_status", timeout=15)
-            d = r.json()
-            return (
-                f"🤖 <b>Status Model</b>\n"
-                f"📦 Model: {'✅ Ada' if d.get('model_exists') else '❌ Tidak ada'}\n"
-                f"🧮 Data log: {d.get('trade_log_count', 0)} sinyal\n"
-                f"🧠 Fitur: {', '.join(d.get('features', [])) if d.get('features') else '-'}"
-            )
-        except Exception as e:
-            return f"⚠️ Error ambil status: {e}"
-
-    # 📈 STATISTIK
-    if t == "stats":
-        try:
-            r = requests.get(f"{APP_URL.rstrip('/')}/ai_performance", timeout=20)
-            d = r.json()
-            if "error" in d:
-                return f"⚠️ {d['error']}"
-            return (
-                f"📊 <b>Statistik AI</b>\n"
-                f"📈 Total sinyal: {d.get('total_signals')}\n"
-                f"✅ Winrate: {d.get('winrate')}%\n"
-                f"💹 Profit factor: {d.get('profit_factor')}\n"
-                f"🤖 Model: {d.get('model_status')}"
-            )
-        except Exception as e:
-            return f"⚠️ Error ambil stats: {e}"
-
-    # 🧾 LOG
-    if t == "log":
-        try:
-            r = requests.get(f"{APP_URL.rstrip('/')}/logs_summary", timeout=15)
-            d = r.json()
-            if "detail" in d:
-                return d["detail"]
-            return (
-                f"📜 <b>Log Terakhir</b>\n"
-                f"📊 {d.get('pair')} ({d.get('timeframe')})\n"
-                f"💡 Signal: {d.get('signal_type')}\n"
-                f"🎯 Entry: {d.get('entry')}\n"
-                f"🏁 TP1: {d.get('tp1')} | TP2: {d.get('tp2')}\n"
-                f"🛑 SL: {d.get('sl')}\n"
-                f"📊 Confidence: {d.get('confidence')}\n"
-                f"🧠 {d.get('reasoning')}"
-            )
-        except Exception as e:
-            return f"⚠️ Error ambil log: {e}"
-
-    # ⚡ SCALPING
-    if t.startswith("scalp "):
-        try:
-            pair = t.split()[1].upper()
-            r = requests.get(f"{APP_URL.rstrip('/')}/scalp_signal?pair={pair}&tf=3m&auto_log=true", timeout=20)
-            d = r.json()
-            return (
-                f"⚡ <b>Scalp {d.get('pair')}</b> ({d.get('timeframe')})\n"
-                f"💡 Signal: {d.get('signal_type')}\n"
-                f"🎯 Entry: {d.get('entry')}\n"
-                f"🏁 TP1: {d.get('tp1')} | 🛑 SL: {d.get('sl')}\n"
-                f"📊 Confidence: {d.get('confidence')}"
-            )
-        except Exception as e:
-            return f"⚠️ Error scalp: {e}"
-
-    # Default: PRO SIGNAL
-    parts = t.split()
-    if len(parts) == 0:
-        return "❌ Format salah. Contoh: <code>BTCUSDT 15m</code>"
-    pair = parts[0].upper()
-    tf = parts[1] if len(parts) > 1 else "15m"
+async def mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Gunakan format: /mode auto atau /mode agresif")
+        return
+    mode = context.args[0].lower()
+    url = f"{APP_URL}/set_mode?mode={mode}"
     try:
-        r = requests.get(f"{APP_URL.rstrip('/')}/pro_signal?pair={pair}&tf_main=1h&tf_entry={tf}&auto_log=true", timeout=25)
-        d = r.json()
-        if "error" in d:
-            return f"⚠️ {d['error']}"
-        return (
-            f"📊 <b>{d.get('pair')} ({d.get('timeframe')})</b>\n"
-            f"💡 Signal: {d.get('signal_type')}\n"
-            f"🎯 Entry: {d.get('entry')}\n"
-            f"🏁 TP1: {d.get('tp1')} | 🛑 SL: {d.get('sl')}\n"
-            f"📊 Confidence: {d.get('confidence')}\n"
-            f"🧠 {d.get('reasoning', '')}"
-        )
+        res = requests.get(url).json()
+        msg = f"✅ Mode trading diubah ke *{res.get('mode')}*"
+        await update.message.reply_text(msg, parse_mode="Markdown")
     except Exception as e:
-        return f"⚠️ Error pro_signal: {e}"
+        await update.message.reply_text(f"❌ Error: {e}")
 
+async def performance(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        res = requests.get(f"{APP_URL}/ai_performance").json()
+        text = f"📈 *AI Performance*\n" \
+               f"Total Sinyal: {res.get('total_signals')}\n" \
+               f"Winrate: {res.get('winrate')}%\nProfit Factor: {res.get('profit_factor')}\n" \
+               f"Model: {res.get('model_status')}"
+        await update.message.reply_text(text, parse_mode="Markdown")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error: {e}")
+
+async def logs(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        res = requests.get(f"{APP_URL}/logs_summary").json()
+        text = f"🧾 *Log Terakhir*\nPair: {res.get('pair')}\nSignal: {res.get('signal_type')}\n" \
+               f"Entry: {res.get('entry')}\nSL: {res.get('sl')}\nTP1: {res.get('tp1')}\n" \
+               f"Confidence: {res.get('confidence')}\nReason: {res.get('reasoning')[:300]}..."
+        await update.message.reply_text(text, parse_mode="Markdown")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error: {e}")
+
+async def retrain(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🧠 Melatih ulang model AI... tunggu sebentar.")
+    try:
+        res = requests.post(f"{APP_URL}/retrain_learning").json()
+        await update.message.reply_text(f"✅ Retrain selesai!\nStatus: {res.get('status')}\nSamples: {res.get('samples')}")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error retrain: {e}")
+
+async def autotune(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("⚙️ Menjalankan auto-tune SMC parameters...")
+    try:
+        res = requests.get(f"{APP_URL}/force_autotune").json()
+        tuned = res.get("tuned", [])
+        msg = f"✅ Auto-Tune selesai. {len(tuned)} profil disesuaikan."
+        await update.message.reply_text(msg)
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error autotune: {e}")
+
+# ---------------- MAIN ----------------
 def main():
-    offset = None
-    send_message("🤖 Pro Trader AI Bot aktif!\nKetik /start untuk daftar perintah.")
-    while True:
-        try:
-            upd = get_updates(offset)
-            if "result" in upd:
-                for u in upd["result"]:
-                    offset = u["update_id"] + 1
-                    msg = u.get("message", {})
+    if not BOT_TOKEN:
+        raise ValueError("BOT_TOKEN belum diatur di environment!")
 
-                    # text
-                    if "text" in msg:
-                        reply = handle_command(msg["text"])
-                        send_message(reply)
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("scalp", scalp))
+    app.add_handler(CommandHandler("pro", pro))
+    app.add_handler(CommandHandler("mode", mode))
+    app.add_handler(CommandHandler("performance", performance))
+    app.add_handler(CommandHandler("logs", logs))
+    app.add_handler(CommandHandler("retrain", retrain))
+    app.add_handler(CommandHandler("autotune", autotune))
 
-                    # photo
-                    elif "photo" in msg:
-                        photo = msg["photo"][-1]
-                        file_data = download_file(photo["file_id"])
-                        if not file_data:
-                            send_message("⚠️ Gagal download gambar.")
-                            continue
-                        send_message("🖼️ Menganalisis chart, mohon tunggu...")
-                        files = {"file": ("chart.jpg", file_data, "image/jpeg")}
-                        try:
-                            r = requests.post(f"{APP_URL.rstrip('/')}/analyze_chart", files=files, timeout=60)
-                            if r.status_code == 200:
-                                d = r.json()
-                                send_message(
-                                    f"📊 {d.get('pair')} ({d.get('timeframe')})\n"
-                                    f"💡 Signal: {d.get('signal_type')}\n"
-                                    f"🎯 Entry: {d.get('entry')}\n"
-                                    f"🏁 TP1: {d.get('tp1')} | 🛑 SL: {d.get('sl')}\n"
-                                    f"📊 Confidence: {d.get('confidence')}"
-                                )
-                            else:
-                                send_message(f"⚠️ Gagal analisis gambar: {r.text}")
-                        except Exception as e:
-                            send_message(f"⚠️ Error analisis gambar: {e}")
-
-                    # document (CSV)
-                    elif "document" in msg:
-                        doc = msg["document"]
-                        fname = doc.get("file_name", "")
-                        mime = doc.get("mime_type", "")
-                        file_data = download_file(doc["file_id"])
-                        if not file_data:
-                            send_message("⚠️ Gagal download file.")
-                            continue
-                        if fname.lower().endswith(".csv") or mime in ("text/csv", "application/vnd.ms-excel"):
-                            send_message("📄 CSV diterima, sedang dianalisis oleh AI...")
-                            files = {"file": (fname, file_data, "text/csv")}
-                            try:
-                                r = requests.post(f"{APP_URL.rstrip('/')}/analyze_csv", files=files, timeout=60)
-                                if r.status_code == 200:
-                                    d = r.json()
-                                    send_message(
-                                        f"✅ Hasil analisis CSV:\n"
-                                        f"📊 {d.get('pair', 'CSV')} ({d.get('timeframe', '')})\n"
-                                        f"💡 Signal: {d.get('signal_type')}\n"
-                                        f"🎯 Entry: {d.get('entry')}\n"
-                                        f"🏁 TP1: {d.get('tp1')} | 🛑 SL: {d.get('sl')}\n"
-                                        f"📊 Confidence: {d.get('confidence')}"
-                                    )
-                                else:
-                                    send_message(f"⚠️ Gagal analisis CSV: {r.text}")
-                            except Exception as e:
-                                send_message(f"⚠️ Error analisis CSV: {e}")
-                        else:
-                            send_message("⚠️ Hanya file CSV yang didukung.")
-            time.sleep(1.5)
-        except Exception as e:
-            print("Loop error:", e)
-            time.sleep(5)
+    print("🤖 Telegram bot running...")
+    app.run_polling()
 
 if __name__ == "__main__":
     main()

@@ -1,310 +1,301 @@
-"""
-telegram_bot.py
-Pro Trader AI Hybrid (SMC + ICT PRO + XGBoost)
-Final Version — Smart Context + Natural Input + Auto Notify + Professional Greeting
-"""
+# telegram_bot_auto_signal.py
+# Auto Signal Master Bot
+# - Auto-scan crypto + forex (selected major pairs) every 1 hour
+# - Send only strong signals (confidence >= 0.8)
+# - Support manual commands, CSV & chart upload, scalp, and /force to bypass filter
 
 import os
 import re
 import time
+import json
 import requests
-import threading
+from datetime import datetime
+from threading import Event
 
-# ===============================
-# CONFIG
-# ===============================
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-CHAT_ID = os.getenv("CHAT_ID")
-APP_URL = os.getenv("APP_URL", "https://your-app-name.up.railway.app")
+from telegram import Update, InputFile
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 
-AUTO_MODE = os.getenv("AUTO_MODE", "HYBRID")  # SIGNAL_UPDATE / STATUS_UPDATE / HYBRID
-AUTO_INTERVAL_MIN = int(os.getenv("AUTO_INTERVAL_MIN", 60))
+# Scheduler
+from apscheduler.schedulers.background import BackgroundScheduler
 
-if not BOT_TOKEN or not CHAT_ID or not APP_URL:
-    raise ValueError("❌ Env BOT_TOKEN, CHAT_ID, dan APP_URL harus diset di Railway.")
+# ---------------- CONFIG ----------------
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+CHAT_ID = os.getenv("CHAT_ID", "")  # your personal chat id where auto signals are sent
+APP_URL = os.getenv("APP_URL", "https://web-production-af34.up.railway.app").rstrip("/")
+if not APP_URL.startswith("http"):
+    APP_URL = "https://" + APP_URL
 
-# ===============================
-# CORE TELEGRAM FUNCTIONS
-# ===============================
-def send_message(text, parse_mode="HTML"):
+API_TIMEOUT = int(os.getenv("API_TIMEOUT", "25"))
+STRONG_SIGNAL_THRESHOLD = float(os.getenv("STRONG_SIGNAL_THRESHOLD", "0.8"))
+AUTO_SCAN_HOURS = int(os.getenv("AUTO_SCAN_HOURS", "1"))  # every N hours; user wanted every 1 hour
+
+# You can override pair lists via environment variable AUTO_PAIRS (comma separated)
+AUTO_PAIRS_CRYPTO = os.getenv("AUTO_PAIRS_CRYPTO", "").strip()
+if AUTO_PAIRS_CRYPTO:
+    AUTO_PAIRS_CRYPTO = [p.strip().upper() for p in AUTO_PAIRS_CRYPTO.split(",")]
+else:
+    AUTO_PAIRS_CRYPTO = [
+        "BTCUSDT","ETHUSDT","SOLUSDT","BNBUSDT","XRPUSDT","ADAUSDT","LTCUSDT","DOGEUSDT","MATICUSDT","DOTUSDT",
+        "AVAXUSDT","LINKUSDT","TRXUSDT","ATOMUSDT","XLMUSDT","UNIUSDT","SANDUSDT","AXSUSDT","EOSUSDT","FTMUSDT"
+    ]
+
+AUTO_PAIRS_FOREX = os.getenv("AUTO_PAIRS_FOREX", "").strip()
+if AUTO_PAIRS_FOREX:
+    AUTO_PAIRS_FOREX = [p.strip().upper() for p in AUTO_PAIRS_FOREX.split(",")]
+else:
+    AUTO_PAIRS_FOREX = [
+        "XAUUSD","EURUSD","GBPUSD","USDJPY","AUDUSD","NZDUSD","USDCAD","USDCHF","EURJPY","GBPJPY"
+    ]
+
+# Timeframes to check (we'll request /pro_signal with tf_entry)
+AUTO_TIMEFRAMES = os.getenv("AUTO_TIMEFRAMES", "").strip()
+if AUTO_TIMEFRAMES:
+    AUTO_TIMEFRAMES = [t.strip().lower() for t in AUTO_TIMEFRAMES.split(",")]
+else:
+    AUTO_TIMEFRAMES = ["15m", "1h", "4h"]
+
+# Merge full scan list (crypto + forex)
+AUTO_PAIRS = list(dict.fromkeys(AUTO_PAIRS_CRYPTO + AUTO_PAIRS_FOREX))
+
+# ---------------- HELPERS ----------------
+def format_signal(result: dict) -> str:
+    """Pretty-format a signal dict into Telegram message (HTML)."""
+    if not isinstance(result, dict):
+        return "⚠️ Tidak bisa membaca hasil sinyal."
+    if "error" in result:
+        return f"❌ Error: {result.get('error')}"
     try:
-        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-        payload = {"chat_id": CHAT_ID, "text": text[:4096], "parse_mode": parse_mode}
-        requests.post(url, json=payload, timeout=15)
+        lines = []
+        lines.append(f"📊 <b>{result.get('pair','?')}</b> ({result.get('timeframe','?')})")
+        lines.append(f"💡 <b>{result.get('signal_type','?')}</b>")
+        lines.append(f"🎯 Entry: <code>{result.get('entry')}</code>")
+        lines.append(f"🎯 TP1: <code>{result.get('tp1')}</code> | TP2: <code>{result.get('tp2')}</code>")
+        lines.append(f"🛑 SL: <code>{result.get('sl')}</code>")
+        if result.get("confidence") is not None:
+            lines.append(f"📊 Confidence: {result.get('confidence')}")
+        if result.get("position_size"):
+            lines.append(f"📈 Position: {result.get('position_size')}")
+        if result.get("market_mode"):
+            lines.append(f"🪙 Market: {result.get('market_mode')}")
+        if result.get("reasoning"):
+            # shorten reasoning if too long
+            reasoning = str(result.get("reasoning"))[:800]
+            lines.append(f"🧠 Reasoning: {reasoning}")
+        return "\n".join(lines)
     except Exception as e:
-        print("[ERROR] send_message:", e)
+        return f"⚠️ Format error: {e}"
 
-def get_updates(offset=None):
-    try:
-        url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
-        params = {"timeout": 100, "offset": offset}
-        return requests.get(url, params=params, timeout=120).json()
-    except Exception as e:
-        print("[ERROR] get_updates:", e)
-        return {}
-
-def download_file(file_id):
-    try:
-        info = requests.get(f"https://api.telegram.org/bot{BOT_TOKEN}/getFile?file_id={file_id}").json()
-        path = info["result"]["file_path"]
-        url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{path}"
-        r = requests.get(url, timeout=60)
-        return r.content
-    except Exception as e:
-        print("download_file error:", e)
-        return None
-
-# ===============================
-# SMART CONTEXT + AUTO TRANSLATE
-# ===============================
-last_pair_context = None
-
-def detect_pair_and_tf(text: str):
-    global last_pair_context
-
-    translate_map = {
-        "menit": "m", "jam": "h", "hari": "d",
-        "m15": "15m", "h1": "1h", "h4": "4h",
-        "1jam": "1h", "4jam": "4h",
-        "gold": "XAUUSD", "emas": "XAUUSD",
-        "bitcoin": "BTCUSDT", "btc": "BTCUSDT",
-        "eth": "ETHUSDT", "sol": "SOLUSDT",
-        "euro": "EURUSD"
+def parse_pair_tf(text: str):
+    """
+    Robust pair+tf parser for manual messages.
+    Accept forms: 'BTCUSDT 15m', 'btc/usdt 15M', 'analisa btcusdt 1h', 'gold 1h'
+    """
+    if not text:
+        return None, "15m"
+    t = text.upper().replace("/", " ").replace("_", " ").strip()
+    # try find timeframe like 15M 1H 4H etc
+    tf_match = re.search(r"(\d+\s*[MHWD])", t)
+    tf = tf_match.group(1).replace(" ", "").lower() if tf_match else "15m"
+    # remove known verbs
+    t_clean = re.sub(r"\b(ANALISA|ANALYZE|ANALYSE|CHECK|FORCE|SCALP)\b", " ", t, flags=re.IGNORECASE).strip()
+    # common aliases
+    aliases = {
+        "GOLD": "XAUUSD", "EMAS": "XAUUSD",
+        "BITCOIN": "BTCUSDT", "BTC": "BTCUSDT",
+        "ETH": "ETHUSDT", "SOL": "SOLUSDT", "EUR": "EURUSD"
     }
-    for k, v in translate_map.items():
-        text = re.sub(k, v, text, flags=re.IGNORECASE)
+    for a,v in aliases.items():
+        if a in t_clean:
+            return v, tf
+    # try token pattern
+    m = re.search(r"([A-Z0-9]{3,6})\s*([A-Z]{3,4})", t_clean)
+    if m:
+        pair = (m.group(1) + m.group(2)).upper()
+        return pair, tf
+    # contiguous pattern like BTCUSDT15M
+    m2 = re.search(r"([A-Z]{3,6}(?:USDT|USD|EUR|JPY|GBP|IDR|BTC|ETH))", t_clean)
+    if m2:
+        return m2.group(1).upper(), tf
+    # fallback: try first token
+    token = t_clean.split()[0] if t_clean.split() else None
+    if token:
+        return token.replace(" ", "").upper(), tf
+    return None, tf
 
-    pair_match = re.search(r"\b([A-Z]{3,6}(USDT|USD|EUR|JPY|GBP|IDR))\b", text.upper())
-    tf_match = re.search(r"(\d+[mhHdD])", text)
-
-    pair = pair_match.group(1) if pair_match else last_pair_context
-    tf = tf_match.group(1).lower() if tf_match else "15m"
-
-    if pair:
-        last_pair_context = pair
-    return pair, tf
-
-def handle_smart_message(text: str):
-    pair, tf = detect_pair_and_tf(text)
-    if not pair:
-        return "⚠️ Tidak menemukan pair dalam pesan kamu. Contoh: <code>BTCUSDT 15m</code>"
+def send_request_get(endpoint: str, params: dict = None, timeout: int = API_TIMEOUT):
+    url = f"{APP_URL.rstrip('/')}/{endpoint.lstrip('/')}"
     try:
-        send_message(f"🤖 Menganalisis {pair} ({tf}) berdasarkan perintah kamu...")
-        r = requests.post(f"{APP_URL.rstrip('/')}/signal", json={"pair": pair, "timeframe": tf}, timeout=60)
-        d = r.json()
-        if "error" in d:
-            return f"⚠️ {d['error']}"
-        return (
-            f"📊 <b>{d.get('pair')} ({d.get('timeframe')})</b>\n"
-            f"💡 <b>{d.get('signal_type')}</b>\n"
-            f"🎯 Entry: {d.get('entry')}\n"
-            f"🏁 TP1: {d.get('tp1')} | TP2: {d.get('tp2')}\n"
-            f"🛑 SL: {d.get('sl')}\n"
-            f"📊 Confidence: {d.get('confidence')}\n"
-            f"🧠 Reasoning: {d.get('reasoning')}"
-        )
-    except Exception as e:
-        return f"⚠️ Error analisis: {e}"
-
-# ===============================
-# COMMAND HANDLER
-# ===============================
-def handle_command(text):
-    t = text.strip().lower()
-
-    # START (Professional Greeting)
-    if t in ("/start", "start"):
-        return (
-            "🤖 <b>Selamat datang, Trader!</b>\n\n"
-            "Saya <b>Pro Trader AI</b> — asisten pribadi kamu di dunia Forex & Crypto.\n"
-            "Saya menggunakan strategi <b>ICT (Inner Circle Trader)</b> dan <b>Smart Money Concepts</b>, "
-            "serta didukung oleh <b>Machine Learning XGBoost</b> yang terus belajar dari hasil trading kamu.\n\n"
-            "📈 <b>Saya bisa bantu kamu:</b>\n"
-            "• Analisis otomatis: <code>BTCUSDT 15m</code>\n"
-            "• Prediksi arah pasar multi-timeframe\n"
-            "• Baca file CSV dan chart untuk deteksi pola\n"
-            "• Kirim sinyal otomatis tiap jam (AI Mode)\n"
-            "• Menjelaskan reasoning di balik setiap sinyal\n\n"
-            "💡 <b>Contoh:</b>\n"
-            "<code>analisa XAUUSD 1h</code> atau <code>ETHUSDT 4h</code>\n\n"
-            "🚀 Ayo kita mulai perjalanan trading profesional bersama!"
-        )
-
-    # SIGNAL
-    if t.startswith("/signal"):
-        parts = t.split()
-        if len(parts) < 2:
-            return "⚙️ Format: <code>/signal BTCUSDT 15m</code>"
-        pair = parts[1].upper()
-        tf = parts[2] if len(parts) > 2 else "15m"
-        send_message(f"⏳ Menganalisis {pair} ({tf}) ...")
-        r = requests.post(f"{APP_URL.rstrip('/')}/signal", json={"pair": pair, "timeframe": tf}, timeout=60)
-        d = r.json()
-        if "error" in d:
-            return f"⚠️ {d['error']}"
-        return (
-            f"📊 <b>{d.get('pair')} ({d.get('timeframe')})</b>\n"
-            f"💡 <b>{d.get('signal_type')}</b>\n"
-            f"🎯 Entry: {d.get('entry')}\n"
-            f"🏁 TP1: {d.get('tp1')} | TP2: {d.get('tp2')}\n"
-            f"🛑 SL: {d.get('sl')}\n"
-            f"📊 Confidence: {d.get('confidence')}\n"
-            f"🧠 Reasoning: {d.get('reasoning')}"
-        )
-
-    # SCALP
-    if t.startswith("/scalp"):
-        parts = t.split()
-        pair = parts[1].upper() if len(parts) > 1 else "BTCUSDT"
-        r = requests.get(f"{APP_URL.rstrip('/')}/scalp_signal?pair={pair}&tf=3m", timeout=40)
-        d = r.json()
-        return (
-            f"⚡ <b>Scalp {pair}</b>\n"
-            f"💡 {d.get('signal_type')} | Conf: {d.get('confidence')}\n"
-            f"🎯 Entry: {d.get('entry')}\n"
-            f"🏁 TP1: {d.get('tp1')} | 🛑 SL: {d.get('sl')}\n"
-            f"🧠 {d.get('reasoning')}"
-        )
-
-    # STATUS
-    if t == "/status":
-        r1 = requests.get(f"{APP_URL.rstrip('/')}/learning_status", timeout=10).json()
-        r2 = requests.get(f"{APP_URL.rstrip('/')}/ai_performance", timeout=10).json()
-        return (
-            f"🤖 <b>Status Model AI</b>\n"
-            f"📦 Model: {'✅ Ada' if r1.get('model_exists') else '❌ Tidak ada'}\n"
-            f"🧮 Log: {r1.get('trade_log_count', 0)} data\n"
-            f"🧠 Algo: {r1.get('algo')}\n\n"
-            f"📈 <b>Performa:</b>\n"
-            f"✅ Winrate: {r2.get('winrate')}%\n"
-            f"💹 Profit Factor: {r2.get('profit_factor')}"
-        )
-
-    # RETRAIN
-    if t == "/retrain":
-        send_message("🔁 Melatih ulang model AI...")
-        r = requests.post(f"{APP_URL.rstrip('/')}/retrain_learning", timeout=120)
-        d = r.json()
-        return f"✅ Model retrain selesai!\n📊 Sample: {d.get('samples')}"
-
-    # NATURAL INPUT
-    if any(k in t for k in ["analisa", "cek", "lihat", "prediksi", "signal", "sinyal", "buy", "sell", "tolong"]):
-        return handle_smart_message(text)
-
-    # PAIR ONLY
-    parts = t.split()
-    if len(parts) >= 1:
-        pair = parts[0].upper()
-        tf = parts[1] if len(parts) > 1 else "15m"
-        if re.match(r"^[A-Z0-9]+(USDT|USD|EUR|JPY|GBP|IDR)?$", pair):
-            return handle_smart_message(text)
-
-    return "❌ Perintah tidak dikenal. Ketik /start untuk daftar lengkap."
-
-# ===============================
-# AUTO NOTIFICATION
-# ===============================
-def send_auto_update():
-    try:
-        if AUTO_MODE in ("SIGNAL_UPDATE", "HYBRID"):
-            r = requests.post(f"{APP_URL.rstrip('/')}/signal", json={"pair": "BTCUSDT", "timeframe": "15m"}, timeout=60)
-            d = r.json()
-            msg = (
-                f"📡 <b>Auto Signal Update</b>\n"
-                f"📊 {d.get('pair')} ({d.get('timeframe')})\n"
-                f"💡 {d.get('signal_type')} | Conf: {d.get('confidence')}\n"
-                f"🎯 Entry: {d.get('entry')} | 🛑 SL: {d.get('sl')}\n"
-                f"🧠 {d.get('reasoning')}"
-            )
-            send_message(msg)
-
-        if AUTO_MODE in ("STATUS_UPDATE", "HYBRID"):
-            r = requests.get(f"{APP_URL.rstrip('/')}/ai_performance", timeout=20)
-            d = r.json()
-            msg = (
-                f"📈 <b>AI Performance Update</b>\n"
-                f"✅ Winrate: {d.get('winrate')}%\n"
-                f"💹 Profit Factor: {d.get('profit_factor')}\n"
-                f"📊 Total Signals: {d.get('total_signals')}"
-            )
-            send_message(msg)
-    except Exception as e:
-        print("[AUTO UPDATE ERROR]", e)
-
-def auto_scheduler():
-    send_message(f"🔔 Auto notification aktif (interval {AUTO_INTERVAL_MIN} menit, mode: {AUTO_MODE})")
-    while True:
-        send_auto_update()
-        time.sleep(AUTO_INTERVAL_MIN * 60)
-
-# ===============================
-# MAIN LOOP
-# ===============================
-def main():
-    offset = None
-    send_message("🤖 Pro Trader AI Hybrid aktif!\nKetik /start untuk daftar perintah.")
-    while True:
+        r = requests.get(url, params=params, timeout=timeout)
         try:
-            updates = get_updates(offset)
-            if "result" in updates:
-                for u in updates["result"]:
-                    offset = u["update_id"] + 1
-                    msg = u.get("message", {})
+            return r.json()
+        except Exception:
+            return {"error": f"invalid_json_response: {r.text}"}
+    except Exception as e:
+        return {"error": str(e)}
 
-                    if "text" in msg:
-                        reply = handle_command(msg["text"])
-                        send_message(reply)
+# ---------------- AUTO-SCAN ----------------
+def auto_check_and_send(app):
+    """
+    Iterate AUTO_PAIRS and AUTO_TIMEFRAMES; call /pro_signal; send to CHAT_ID if confidence >= threshold.
+    """
+    bot = app.bot
+    print(f"[AUTO] Auto-scan started at {datetime.utcnow().isoformat()} - pairs={len(AUTO_PAIRS)} timeframes={AUTO_TIMEFRAMES}")
+    # iterate pairs
+    for pair in AUTO_PAIRS:
+        for tf in AUTO_TIMEFRAMES:
+            try:
+                params = {"pair": pair, "tf_entry": tf}
+                res = send_request_get("pro_signal", params=params)
+                if not isinstance(res, dict):
+                    print(f"[AUTO WARN] non-dict response for {pair} {tf}: {res}")
+                    continue
+                if "error" in res:
+                    # ignore non-critical errors
+                    print(f"[AUTO] {pair} {tf} -> error: {res.get('error')}")
+                    continue
+                conf = float(res.get("confidence", 0) or 0)
+                if conf >= STRONG_SIGNAL_THRESHOLD and res.get("signal_type") and res.get("signal_type") != "WAIT":
+                    msg = format_signal(res)
+                    try:
+                        bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode="HTML")
+                        print(f"[AUTO] Sent strong signal {pair} {tf} (conf={conf})")
+                    except Exception as e:
+                        print(f"[AUTO ERROR] send_message failed for {pair} {tf}: {e}")
+                else:
+                    print(f"[AUTO] {pair} {tf} no strong signal (conf={conf})")
+                # small sleep to be gentle on API rate limits
+                time.sleep(0.8)
+            except Exception as e:
+                print(f"[AUTO EXC] {pair} {tf}: {e}")
+                time.sleep(0.5)
+    print(f"[AUTO] Auto-scan finished at {datetime.utcnow().isoformat()}")
 
-                    elif "photo" in msg:
-                        photo = msg["photo"][-1]
-                        file_data = download_file(photo["file_id"])
-                        if not file_data:
-                            send_message("⚠️ Gagal unduh gambar.")
-                            continue
-                        send_message("🖼️ Menganalisis chart...")
-                        files = {"file": ("chart.jpg", file_data, "image/jpeg")}
-                        r = requests.post(f"{APP_URL.rstrip('/')}/analyze_chart", files=files, timeout=60)
-                        d = r.json()
-                        send_message(
-                            f"📊 Chart Analysis\n"
-                            f"💡 {d.get('signal_type')}\n"
-                            f"🎯 Entry: {d.get('entry')}\n"
-                            f"🏁 TP1: {d.get('tp1')} | 🛑 SL: {d.get('sl')}\n"
-                            f"🧠 {d.get('reasoning')}"
-                        )
+# ---------------- TELEGRAM HANDLERS ----------------
+async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = (
+        "🤖 <b>AI Trader Auto Signal</b>\n\n"
+        "Saya akan memantau semua pair crypto & forex dan mengirim SINYAL KUAT (confidence ≥ 0.8) otomatis tiap 1 jam.\n\n"
+        "Perintah manual:\n"
+        "- <code>BTCUSDT 15m</code>\n"
+        "- <code>scalp BTCUSDT</code>\n"
+        "- <code>force BTCUSDT 15m</code> (tampilkan semua sinyal tanpa filter)\n"
+        "Kirim CSV atau gambar chart untuk analisis juga."
+    )
+    await update.message.reply_text(msg, parse_mode="HTML")
 
-                    elif "document" in msg:
-                        doc = msg["document"]
-                        fname = doc.get("file_name", "")
-                        file_data = download_file(doc["file_id"])
-                        if not file_data:
-                            send_message("⚠️ Gagal unduh file.")
-                            continue
-                        if not fname.lower().endswith(".csv"):
-                            send_message("⚠️ Hanya file CSV yang didukung.")
-                            continue
-                        send_message("📄 CSV diterima, sedang dianalisis...")
-                        files = {"file": (fname, file_data, "text/csv")}
-                        r = requests.post(f"{APP_URL.rstrip('/')}/analyze_csv", files=files, timeout=60)
-                        d = r.json()
-                        send_message(
-                            f"✅ CSV Analysis\n"
-                            f"📊 {d.get('pair')} ({d.get('timeframe')})\n"
-                            f"💡 {d.get('signal_type')}\n"
-                            f"🎯 Entry: {d.get('entry')}\n"
-                            f"🏁 TP1: {d.get('tp1')} | 🛑 SL: {d.get('sl')}\n"
-                            f"📊 Confidence: {d.get('confidence')}"
-                        )
-            time.sleep(1.5)
-        except Exception as e:
-            print("Loop error:", e)
-            time.sleep(5)
+async def manual_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip() if update.message.text else ""
+    if not text:
+        return
+    t_low = text.lower()
+    is_force = t_low.startswith("force")
+    if is_force:
+        text = text.replace("force", "", 1).strip()
 
-# ===============================
-# RUN BOT + AUTO UPDATER
-# ===============================
+    if t_low.startswith("scalp"):
+        pair, _ = parse_pair_tf(text)
+        if not pair:
+            await update.message.reply_text("❌ Tidak bisa mendeteksi pair.")
+            return
+        await update.message.reply_text(f"⚡ Scalp {pair} ...")
+        res = send_request_get("scalp_signal", params={"pair": pair, "tf": "3m"})
+        await update.message.reply_text(format_signal(res), parse_mode="HTML")
+        return
+
+    pair, tf = parse_pair_tf(text)
+    if not pair:
+        await update.message.reply_text("❌ Tidak bisa mendeteksi pair dari pesan itu.")
+        return
+
+    await update.message.reply_text(f"🔍 Menganalisis {pair} ({tf}) ...")
+    res = send_request_get("pro_signal", params={"pair": pair, "tf_entry": tf})
+    if "error" in res:
+        await update.message.reply_text(f"❌ Error: {res['error']}")
+        return
+
+    conf = float(res.get("confidence", 0) or 0)
+    # if not forced and below threshold, inform user (we chose option 2 previously)
+    if (not is_force) and conf < STRONG_SIGNAL_THRESHOLD:
+        await update.message.reply_text(
+            f"⚠️ Tidak ada sinyal kuat untuk {pair} ({tf}).\nConfidence saat ini: {conf}",
+            parse_mode="HTML"
+        )
+        return
+
+    # send formatted
+    await update.message.reply_text(format_signal(res), parse_mode="HTML")
+
+async def handle_csv(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    doc = update.message.document
+    if not doc:
+        return
+    await update.message.reply_text("📄 Menerima CSV, mengirim ke AI untuk analisis...")
+    file = await doc.get_file()
+    try:
+        content = requests.get(file.file_path, timeout=30).content
+        files = {"file": ("upload.csv", content)}
+        url = f"{APP_URL}/analyze_csv"
+        r = requests.post(url, files=files, timeout=60)
+        try:
+            d = r.json()
+        except Exception:
+            d = {"error": r.text}
+        await update.message.reply_text(format_signal(d), parse_mode="HTML")
+    except Exception as e:
+        await update.message.reply_text(f"⚠️ Gagal analisis CSV: {e}")
+
+async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # image chart
+    photo = update.message.photo[-1] if update.message.photo else None
+    if not photo:
+        await update.message.reply_text("⚠️ Tidak ada gambar.")
+        return
+    await update.message.reply_text("📷 Menganalisis chart (OCR + heuristics)...")
+    file = await photo.get_file()
+    try:
+        content = requests.get(file.file_path, timeout=60).content
+        files = {"file": ("chart.jpg", content)}
+        url = f"{APP_URL}/analyze_chart"
+        r = requests.post(url, files=files, timeout=60)
+        try:
+            d = r.json()
+        except Exception:
+            d = {"error": r.text}
+        await update.message.reply_text(format_signal(d), parse_mode="HTML")
+    except Exception as e:
+        await update.message.reply_text(f"⚠️ Gagal analisis gambar: {e}")
+
+# ---------------- MAIN RUN ----------------
+def main():
+    if not BOT_TOKEN:
+        print("❌ BOT_TOKEN belum diset di environment.")
+        return
+    if not CHAT_ID:
+        print("❌ CHAT_ID belum diset di environment. Auto signals akan gagal dikirim.")
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
+
+    # handlers
+    app.add_handler(CommandHandler("start", start_cmd))
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_csv))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_image))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, manual_message))
+
+    # scheduler for auto-scan
+    scheduler = BackgroundScheduler()
+    # schedule every AUTO_SCAN_HOURS hours
+    scheduler.add_job(lambda: auto_check_and_send(app), 'interval', hours=AUTO_SCAN_HOURS, next_run_time=None)
+    scheduler.start()
+    print(f"[STARTUP] Auto-scan scheduled every {AUTO_SCAN_HOURS} hour(s). Pairs monitored: {len(AUTO_PAIRS)} TF: {AUTO_TIMEFRAMES}")
+
+    # graceful stop signal
+    stop_event = Event()
+    try:
+        print("🤖 Telegram bot running (auto-signal mode). Press Ctrl+C to stop.")
+        app.run_polling()
+    finally:
+        stop_event.set()
+        scheduler.shutdown(wait=False)
+        print("[SHUTDOWN] Scheduler stopped.")
+
 if __name__ == "__main__":
-    t_bot = threading.Thread(target=main)
-    t_auto = threading.Thread(target=auto_scheduler)
-    t_bot.start()
-    t_auto.start()
+    main()

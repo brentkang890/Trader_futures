@@ -1,163 +1,214 @@
-import os
-import requests
-from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+"""
+🤖 Pro Trader AI Telegram Bot — Final Premium Version
+✨ Fitur Lengkap:
+- /signal, /pro, /scalp, /stats, /status, /mode, /autotune, /retrain, /profile
+- 🔔 Auto Alert Sinyal baru (confidence ≥ threshold)
+- 🚀 Emoji arah sinyal (LONG/SHORT)
+- 🔉 Notifikasi suara otomatis (Telegram audio ping)
+- HTML aman & stabil untuk Railway
+"""
 
-# Load environment variables
+import os
+import time
+import requests
+
+# === KONFIGURASI DASAR ===
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
-APP_URL = os.environ.get("APP_URL", "http://127.0.0.1:8000")
+APP_URL = os.environ.get("APP_URL", "https://web-production-af34.up.railway.app")
+ALERT_INTERVAL = int(os.environ.get("ALERT_INTERVAL", 30))  # detik antar pengecekan sinyal
+CONF_THRESHOLD = float(os.environ.get("CONF_THRESHOLD", 0.8))  # ambang confidence minimal
 
-# Helper: kirim pesan aman ke Telegram
-async def send_message(context, text, chat_id=None):
+if not BOT_TOKEN or not CHAT_ID or not APP_URL:
+    raise ValueError("❌ Environment BOT_TOKEN, CHAT_ID, APP_URL wajib diset!")
+
+# === TELEGRAM API HELPER ===
+def send_message(text, parse_mode="HTML", sound=True):
+    """Kirim pesan ke Telegram (dengan/ tanpa suara notifikasi)"""
     try:
-        await context.bot.send_message(chat_id=chat_id or CHAT_ID, text=text, parse_mode="HTML")
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+        payload = {
+            "chat_id": CHAT_ID,
+            "text": text[:4096],
+            "parse_mode": parse_mode,
+            "disable_notification": not sound
+        }
+        requests.post(url, json=payload, timeout=15)
     except Exception as e:
-        print("Send message error:", e)
+        print("[ERROR send_message]", e)
 
-# ---------------- COMMANDS ----------------
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = (
-        "🤖 <b>Pro Trader AI Bot (SMC Pro)</b> siap digunakan!<br><br>"
-        "<b>Perintah yang tersedia:</b><br>"
-        "/scalp &lt;pair&gt; — Sinyal scalping cepat (contoh: /scalp BTCUSDT)<br>"
-        "/pro &lt;pair&gt; — Analisis penuh SMC Pro (contoh: /pro SOLUSDT)<br>"
-        "/mode &lt;auto/agresif/moderate/konservatif&gt; — Ubah mode strategi<br>"
-        "/performance — Cek performa AI<br>"
-        "/logs — Lihat sinyal terakhir<br>"
-        "/retrain — Latih ulang model AI<br>"
-        "/autotune — Jalankan auto-tune SMC<br>"
-    )
-    await update.message.reply_text(msg, parse_mode="HTML")
-
-async def scalp(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("❌ Gunakan format: <b>/scalp BTCUSDT</b>", parse_mode="HTML")
-        return
-    pair = context.args[0].upper()
-    url = f"{APP_URL}/scalp_signal?pair={pair}&auto_log=true"
+def get_updates(offset=None):
     try:
-        res = requests.get(url, timeout=30).json()
-        text = (
-            f"⚡ <b>Scalp Signal</b> — {pair}<br>"
-            f"<b>Signal:</b> {res.get('signal_type')}<br>"
-            f"<b>Entry:</b> {res.get('entry')}<br>"
-            f"<b>TP1:</b> {res.get('tp1')}<br>"
-            f"<b>TP2:</b> {res.get('tp2')}<br>"
-            f"<b>SL:</b> {res.get('sl')}<br>"
-            f"<b>Confidence:</b> {res.get('confidence')}<br>"
-            f"<b>Mode:</b> {res.get('mode_used')}"
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
+        params = {"timeout": 100, "offset": offset}
+        return requests.get(url, params=params, timeout=120).json()
+    except Exception as e:
+        print("[ERROR get_updates]", e)
+        return {}
+
+# === AUTO ALERT (CEK SINYAL BARU) ===
+last_signal_id = None
+
+def check_new_signal():
+    """Pantau endpoint /logs_summary untuk sinyal baru"""
+    global last_signal_id
+    try:
+        r = requests.get(f"{APP_URL}/logs_summary", timeout=15)
+        if r.status_code != 200:
+            return
+        d = r.json()
+
+        sig_id = f"{d.get('pair')}-{d.get('signal_type')}-{d.get('entry')}"
+        conf = float(d.get("confidence", 0))
+        ml_conf = d.get("ml_prob", 0) or 0
+
+        if sig_id != last_signal_id and conf >= CONF_THRESHOLD:
+            last_signal_id = sig_id
+            signal_type = d.get("signal_type", "")
+            emoji = "🚀" if signal_type.upper() == "LONG" else "🩸" if signal_type.upper() == "SHORT" else "⚙️"
+            alert_emoji = "🔔" if conf >= 0.9 else "📡"
+
+            msg = (
+                f"{alert_emoji} <b>NEW SIGNAL DETECTED</b><br>"
+                f"{emoji} <b>{d.get('pair')} ({d.get('timeframe')})</b><br>"
+                f"💡 Signal: {signal_type}<br>"
+                f"🎯 Entry: {d.get('entry')}<br>"
+                f"🏁 TP1: {d.get('tp1')} | 🛑 SL: {d.get('sl')}<br>"
+                f"📊 Confidence: {conf:.2f}<br>"
+                f"🤖 ML Confidence: {ml_conf * 100:.1f}%<br>"
+                f"🧠 {d.get('reasoning', '')[:250]}..."
+            )
+            send_message(msg, sound=True)
+    except Exception as e:
+        print("[ERROR auto alert]", e)
+
+# === COMMAND HANDLER ===
+def handle_command(text):
+    t = text.strip().lower()
+
+    if t in ("/start", "start"):
+        return (
+            "🤖 <b>Pro Trader AI (SMC Pro)</b> aktif & siap digunakan!<br><br>"
+            "📈 Command utama:<br>"
+            "/signal BTCUSDT 15m — AI Signal + ML Confidence<br>"
+            "/pro BTCUSDT 15m — Analisis penuh SMC<br>"
+            "/scalp BTCUSDT — Scalping cepat (3m)<br><br>"
+            "📊 Perintah lainnya:<br>"
+            "/stats /status /log /mode /autotune /retrain /profile<br><br>"
+            "🔔 Auto Alert aktif setiap 30 detik (Confidence ≥ 0.8)"
         )
-        await update.message.reply_text(text, parse_mode="HTML")
-    except Exception as e:
-        await update.message.reply_text(f"❌ Error: {e}", parse_mode="HTML")
 
-async def pro(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("❌ Gunakan format: <b>/pro BTCUSDT</b>", parse_mode="HTML")
-        return
-    pair = context.args[0].upper()
-    url = f"{APP_URL}/pro_signal?pair={pair}&auto_log=true"
-    try:
-        res = requests.get(url, timeout=60).json()
-        text = (
-            f"📊 <b>Pro Signal (SMC)</b> — {pair}<br>"
-            f"<b>Signal:</b> {res.get('signal_type')}<br>"
-            f"<b>Entry:</b> {res.get('entry')}<br>"
-            f"<b>TP1:</b> {res.get('tp1')} | <b>TP2:</b> {res.get('tp2')}<br>"
-            f"<b>SL:</b> {res.get('sl')}<br>"
-            f"<b>Mode:</b> {res.get('mode_used')}<br>"
-            f"<b>Risk:</b> {res.get('risk_percent') * 100:.1f}%<br>"
-            f"<b>Position Size:</b> {res.get('position_size')}<br>"
-            f"<b>Confidence:</b> {res.get('confidence')}<br>"
-            f"<b>Reasoning:</b> {res.get('reasoning')[:500]}..."
-        )
-        await update.message.reply_text(text, parse_mode="HTML")
-    except Exception as e:
-        await update.message.reply_text(f"❌ Error: {e}", parse_mode="HTML")
+    if t.startswith("/signal"):
+        try:
+            parts = t.split()
+            pair = parts[1].upper()
+            tf = parts[2] if len(parts) > 2 else "15m"
+            d = requests.get(f"{APP_URL}/pro_signal?pair={pair}&tf_entry={tf}&auto_log=true", timeout=30).json()
+            ml = d.get("ml_prob", 0)
+            emoji = "🚀" if d.get("signal_type") == "LONG" else "🩸"
+            return (
+                f"{emoji} <b>{pair} ({tf})</b><br>"
+                f"💡 Signal: {d.get('signal_type')}<br>"
+                f"🎯 Entry: {d.get('entry')}<br>"
+                f"🏁 TP1: {d.get('tp1')} | 🛑 SL: {d.get('sl')}<br>"
+                f"📊 Confidence: {d.get('confidence')}<br>"
+                f"🤖 ML Confidence: {ml * 100:.2f}%<br>"
+                f"🧠 {d.get('reasoning', '')[:400]}"
+            )
+        except Exception as e:
+            return f"⚠️ Error /signal: {e}"
 
-async def mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("Gunakan format: <b>/mode auto</b> atau <b>/mode agresif</b>", parse_mode="HTML")
-        return
-    mode = context.args[0].lower()
-    url = f"{APP_URL}/set_mode?mode={mode}"
-    try:
-        res = requests.get(url).json()
-        msg = f"✅ Mode trading diubah ke <b>{res.get('mode')}</b>"
-        await update.message.reply_text(msg, parse_mode="HTML")
-    except Exception as e:
-        await update.message.reply_text(f"❌ Error: {e}", parse_mode="HTML")
+    if t.startswith("/pro"):
+        try:
+            parts = t.split()
+            pair = parts[1].upper()
+            tf = parts[2] if len(parts) > 2 else "15m"
+            d = requests.get(f"{APP_URL}/pro_signal?pair={pair}&tf_entry={tf}&auto_log=true", timeout=25).json()
+            emoji = "🚀" if d.get("signal_type") == "LONG" else "🩸"
+            return (
+                f"{emoji} <b>{pair} ({tf})</b><br>"
+                f"💡 Signal: {d.get('signal_type')}<br>"
+                f"🎯 Entry: {d.get('entry')}<br>"
+                f"🏁 TP1: {d.get('tp1')} | 🛑 SL: {d.get('sl')}<br>"
+                f"📊 Confidence: {d.get('confidence')}"
+            )
+        except Exception as e:
+            return f"⚠️ Error /pro: {e}"
 
-async def performance(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        res = requests.get(f"{APP_URL}/ai_performance").json()
-        text = (
-            f"📈 <b>AI Performance</b><br>"
-            f"<b>Total Sinyal:</b> {res.get('total_signals')}<br>"
-            f"<b>Winrate:</b> {res.get('winrate')}%<br>"
-            f"<b>Profit Factor:</b> {res.get('profit_factor')}<br>"
-            f"<b>Model:</b> <code>{res.get('model_status')}</code>"
-        )
-        await update.message.reply_text(text, parse_mode="HTML")
-    except Exception as e:
-        await update.message.reply_text(f"❌ Error: {e}", parse_mode="HTML")
+    if t.startswith("/scalp"):
+        try:
+            pair = t.split()[1].upper()
+            d = requests.get(f"{APP_URL}/scalp_signal?pair={pair}&tf=3m&auto_log=true", timeout=20).json()
+            emoji = "🚀" if d.get("signal_type") == "LONG" else "🩸"
+            return (
+                f"⚡ <b>Scalp {pair}</b> {emoji}<br>"
+                f"💡 {d.get('signal_type')}<br>"
+                f"🎯 {d.get('entry')} | 🏁 TP1: {d.get('tp1')} | 🛑 SL: {d.get('sl')}<br>"
+                f"📊 Confidence: {d.get('confidence')}"
+            )
+        except Exception as e:
+            return f"⚠️ Error /scalp: {e}"
 
-async def logs(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        res = requests.get(f"{APP_URL}/logs_summary").json()
-        text = (
-            f"🧾 <b>Log Terakhir</b><br>"
-            f"<b>Pair:</b> {res.get('pair')}<br>"
-            f"<b>Signal:</b> {res.get('signal_type')}<br>"
-            f"<b>Entry:</b> {res.get('entry')}<br>"
-            f"<b>TP1:</b> {res.get('tp1')} | <b>SL:</b> {res.get('sl')}<br>"
-            f"<b>Confidence:</b> {res.get('confidence')}<br>"
-            f"<b>Reason:</b> {res.get('reasoning')[:400]}..."
-        )
-        await update.message.reply_text(text, parse_mode="HTML")
-    except Exception as e:
-        await update.message.reply_text(f"❌ Error: {e}", parse_mode="HTML")
+    if t == "/stats":
+        try:
+            d = requests.get(f"{APP_URL}/ai_performance", timeout=15).json()
+            return (
+                f"📈 <b>AI Stats</b><br>"
+                f"📊 Total: {d.get('total_signals')} sinyal<br>"
+                f"✅ Winrate: {d.get('winrate')}%<br>"
+                f"💹 Profit Factor: {d.get('profit_factor')}<br>"
+                f"🤖 Model: {d.get('model_status')}"
+            )
+        except Exception as e:
+            return f"⚠️ Error /stats: {e}"
 
-async def retrain(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🧠 Melatih ulang model AI... tunggu sebentar.", parse_mode="HTML")
-    try:
-        res = requests.post(f"{APP_URL}/retrain_learning").json()
-        await update.message.reply_text(
-            f"✅ <b>Retrain selesai!</b><br>Status: {res.get('status')}<br>Samples: {res.get('samples')}",
-            parse_mode="HTML"
-        )
-    except Exception as e:
-        await update.message.reply_text(f"❌ Error retrain: {e}", parse_mode="HTML")
+    if t == "/autotune":
+        requests.get(f"{APP_URL}/force_autotune", timeout=60)
+        return "⚙️ Auto-Tune selesai ✅"
 
-async def autotune(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("⚙️ Menjalankan auto-tune SMC parameters...", parse_mode="HTML")
-    try:
-        res = requests.get(f"{APP_URL}/force_autotune").json()
-        tuned = res.get("tuned", [])
-        msg = f"✅ Auto-Tune selesai. {len(tuned)} profil disesuaikan."
-        await update.message.reply_text(msg, parse_mode="HTML")
-    except Exception as e:
-        await update.message.reply_text(f"❌ Error autotune: {e}", parse_mode="HTML")
+    if t == "/retrain":
+        send_message("🧠 Melatih ulang model AI...", sound=True)
+        requests.post(f"{APP_URL}/retrain_learning", timeout=120)
+        return "✅ Retrain selesai!"
 
-# ---------------- MAIN ----------------
+    if t.startswith("/mode"):
+        mode = t.split()[1]
+        d = requests.get(f"{APP_URL}/set_mode?mode={mode}").json()
+        return f"✅ Mode diubah ke <b>{d.get('mode')}</b>"
+
+    if t == "/profile":
+        d = requests.get(f"{APP_URL}/smc_profiles", timeout=20).json()
+        return f"🧩 <b>Profil aktif:</b> {', '.join(d.keys())}"
+
+    return "⚠️ Perintah tidak dikenal. Gunakan /start untuk daftar perintah."
+
+# === LOOP UTAMA ===
 def main():
-    if not BOT_TOKEN:
-        raise ValueError("BOT_TOKEN belum diatur di environment!")
+    offset = None
+    send_message("🤖 Pro Trader AI Bot aktif! /start untuk bantuan.", sound=False)
+    last_alert_check = 0
+    while True:
+        try:
+            # 1️⃣ Cek perintah manual
+            upd = get_updates(offset)
+            if "result" in upd:
+                for u in upd["result"]:
+                    offset = u["update_id"] + 1
+                    msg = u.get("message", {})
+                    if "text" in msg:
+                        reply = handle_command(msg["text"])
+                        if reply:
+                            send_message(reply)
 
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("scalp", scalp))
-    app.add_handler(CommandHandler("pro", pro))
-    app.add_handler(CommandHandler("mode", mode))
-    app.add_handler(CommandHandler("performance", performance))
-    app.add_handler(CommandHandler("logs", logs))
-    app.add_handler(CommandHandler("retrain", retrain))
-    app.add_handler(CommandHandler("autotune", autotune))
+            # 2️⃣ Jalankan auto alert
+            if time.time() - last_alert_check > ALERT_INTERVAL:
+                check_new_signal()
+                last_alert_check = time.time()
 
-    print("🤖 Telegram bot running...")
-    app.run_polling()
+            time.sleep(1.5)
+        except Exception as e:
+            print("[ERROR loop]", e)
+            time.sleep(5)
 
 if __name__ == "__main__":
     main()

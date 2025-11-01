@@ -9,3 +9,5 @@ requests
 Pillow
 python-multipart
 pytesseract
+python-telegram-bot
+aiofiles

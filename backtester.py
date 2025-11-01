@@ -1,171 +1,123 @@
-# backtester.py
-"""
-🤖 Pro Trader AI - Smart Backtester (Ultimate Version)
--------------------------------------------------------
-✅ Single signal test (/backtest)
-✅ Batch CSV test (/analyze_batch)
-✅ Auto-feedback ke AI model (learning)
-✅ Auto-save ke CSV log
-✅ Monitoring endpoint (/logs, /health)
--------------------------------------------------------
-Compatible with:
-- main_combined_learning.py (AI agent)
-- telegram_bot.py (Telegram interface)
-"""
+# ai_backtester.py
+# FastAPI microservice to receive signals from AI Agent and simulate short-term backtests
 
 import os
-from datetime import datetime
-from fastapi import FastAPI, Request, UploadFile, File
+import requests
 import pandas as pd
 import numpy as np
-import requests
+from datetime import datetime, timedelta
+from fastapi import FastAPI, Request, HTTPException
+from pydantic import BaseModel
 
-# ---------------- CONFIG ----------------
-app = FastAPI(title="ProTrader AI Backtester", description="Smart Backtester with AI Feedback")
+# ============= CONFIG =============
+BINANCE_URL = "https://api.binance.com/api/v3/klines"
+DEFAULT_LOOKAHEAD = int(os.getenv("LOOKAHEAD_BARS", "100"))  # number of candles to look ahead
+INTERVAL = os.getenv("DEFAULT_INTERVAL", "15m")
+TIMEFRAME_MAP = {"m": "min", "h": "hour", "d": "day"}
 
-SAVE_LOG = os.environ.get("SAVE_LOG", "true").lower() == "true"
-LOG_FILE = os.environ.get("LOG_FILE", "backtest_log.csv")
-AI_FEEDBACK_URL = os.environ.get("AI_FEEDBACK_URL", "")  # contoh: https://your-ai-service.up.railway.app/learning_feedback
-FEEDBACK_ENABLED = bool(AI_FEEDBACK_URL)
+app = FastAPI(title="AI Backtester", version="1.0")
 
-# ---------------- CORE LOGIC ----------------
-def simulate_backtest(payload: dict):
-    """Simulasi 1 sinyal dengan probabilitas realistis"""
-    pair = payload.get("pair", "Unknown")
-    side = payload.get("side", "LONG").upper()
-    entry = float(payload.get("entry", 0))
-    tp1 = float(payload.get("tp1", entry * 1.02))
-    tp2 = float(payload.get("tp2", entry * 1.03)) if payload.get("tp2") else None
-    sl = float(payload.get("sl", entry * 0.98))
-    confidence = float(payload.get("confidence", 0))
-    reason = payload.get("reason", "")
+# ============= MODELS =============
+class SignalInput(BaseModel):
+    pair: str
+    timeframe: str
+    side: str
+    entry: float
+    tp1: float
+    tp2: float
+    sl: float
+    confidence: float
+    timestamp: str
 
-    rnd = np.random.random()
-    if rnd < confidence * 0.6:
-        hit = "TP2" if tp2 and rnd > confidence * 0.4 else "TP1"
+# ============= HELPERS =============
+def fetch_ohlc_binance(symbol: str, interval: str = "15m", limit: int = 500) -> pd.DataFrame:
+    try:
+        url = f"{BINANCE_URL}?symbol={symbol.upper()}&interval={interval}&limit={limit}"
+        r = requests.get(url, timeout=15)
+        data = r.json()
+        if not isinstance(data, list):
+            raise ValueError(f"Invalid Binance response: {data}")
+        df = pd.DataFrame(data, columns=[
+            "open_time","open","high","low","close","volume",
+            "close_time","qav","num_trades","tbbav","tbqav","ignore"
+        ])
+        df["open"] = df["open"].astype(float)
+        df["high"] = df["high"].astype(float)
+        df["low"] = df["low"].astype(float)
+        df["close"] = df["close"].astype(float)
+        df["timestamp"] = pd.to_datetime(df["open_time"], unit="ms")
+        return df[["timestamp","open","high","low","close"]]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Fetch error: {e}")
+
+def simulate_trade(df: pd.DataFrame, signal: SignalInput) -> dict:
+    """
+    Simulate what happens after the signal entry.
+    We'll check if TP1, TP2, or SL hit first.
+    """
+    # only consider candles *after* the signal time
+    start_idx = df[df["timestamp"] > pd.to_datetime(signal.timestamp)].index
+    if len(start_idx) == 0:
+        return {"error": "No future data to backtest."}
+    start_idx = start_idx[0]
+    future_df = df.iloc[start_idx:start_idx+DEFAULT_LOOKAHEAD].copy()
+    hit, pnl, bars = "NO_HIT", 0.0, 0
+    if signal.side.upper() == "LONG":
+        for i, row in enumerate(future_df.itertuples(), 1):
+            if row.low <= signal.sl:
+                hit, pnl = "SL", (signal.sl - signal.entry) / signal.entry * 100
+                bars = i
+                break
+            if row.high >= signal.tp1:
+                hit, pnl = "TP1", (signal.tp1 - signal.entry) / signal.entry * 100
+                bars = i
+                if row.high >= signal.tp2:
+                    hit, pnl = "TP2", (signal.tp2 - signal.entry) / signal.entry * 100
+                break
     else:
-        hit = "SL"
-
-    if side == "LONG":
-        pnl = ((tp1 - entry) / entry * 100) if "TP" in hit else ((sl - entry) / entry * 100)
-    else:
-        pnl = ((entry - tp1) / entry * 100) if "TP" in hit else ((entry - sl) / entry * 100)
-
-    result = {
-        "pair": pair,
-        "side": side,
-        "entry": entry,
-        "tp1": tp1,
-        "tp2": tp2,
-        "sl": sl,
+        for i, row in enumerate(future_df.itertuples(), 1):
+            if row.high >= signal.sl:
+                hit, pnl = "SL", (signal.entry - signal.sl) / signal.entry * 100
+                bars = i
+                break
+            if row.low <= signal.tp1:
+                hit, pnl = "TP1", (signal.entry - signal.tp1) / signal.entry * 100
+                bars = i
+                if row.low <= signal.tp2:
+                    hit, pnl = "TP2", (signal.entry - signal.tp2) / signal.entry * 100
+                break
+    if bars == 0:
+        bars = len(future_df)
+    return {
         "hit": hit,
         "pnl_total": round(pnl, 3),
-        "confidence": confidence,
-        "reason": reason,
-        "timestamp": datetime.utcnow().isoformat() + "Z"
+        "bars_to_hit": bars,
+        "details": {
+            "duration_minutes": bars * int(signal.timeframe[:-1]) if signal.timeframe[-1] == "m" else bars,
+            "timestamp_entry": signal.timestamp,
+            "timestamp_end": str(future_df.iloc[-1]["timestamp"])
+        }
     }
 
-    # Simpan ke log
-    if SAVE_LOG:
-        try:
-            df = pd.DataFrame([result])
-            if not os.path.exists(LOG_FILE):
-                df.to_csv(LOG_FILE, index=False)
-            else:
-                df.to_csv(LOG_FILE, mode="a", header=False, index=False)
-        except Exception as e:
-            print(f"⚠️ Gagal simpan log: {e}")
+# ============= ROUTES =============
+@app.get("/")
+def home():
+    return {"status": "AI Backtester running", "version": "1.0"}
 
-    # Kirim feedback ke AI
-    if FEEDBACK_ENABLED:
-        try:
-            requests.post(f"{AI_FEEDBACK_URL}", json=result, timeout=10)
-        except Exception as e:
-            print(f"⚠️ Gagal kirim feedback ke AI: {e}")
-
+@app.post("/backtest")
+def backtest_signal(sig: SignalInput):
+    df = fetch_ohlc_binance(sig.pair)
+    result = simulate_trade(df, sig)
     return result
 
+# optional healthcheck route
+@app.get("/ping")
+def ping():
+    return {"pong": True, "time": datetime.utcnow().isoformat()}
 
-# ---------------- ENDPOINTS ----------------
-@app.post("/backtest")
-async def backtest(request: Request):
-    """Backtest satu sinyal"""
-    try:
-        payload = await request.json()
-        result = simulate_backtest(payload)
-        return result
-    except Exception as e:
-        return {"error": str(e)}
-
-
-@app.post("/analyze_batch")
-async def analyze_batch(file: UploadFile = File(...)):
-    """
-    Upload CSV untuk batch backtest:
-    pair,side,entry,tp1,tp2,sl,confidence,reason
-    """
-    try:
-        contents = await file.read()
-        df = pd.read_csv(pd.io.common.BytesIO(contents))
-    except Exception as e:
-        return {"error": f"Gagal baca CSV: {e}"}
-
-    required = ["pair", "side", "entry", "tp1", "sl"]
-    if not all(col in df.columns for col in required):
-        return {"error": f"CSV harus memiliki kolom: {', '.join(required)}"}
-
-    results = []
-    for _, row in df.iterrows():
-        try:
-            res = simulate_backtest(row.to_dict())
-            results.append(res)
-        except Exception as e:
-            results.append({"pair": row.get("pair", "?"), "error": str(e)})
-
-    total = len(results)
-    wins = sum(1 for r in results if "TP" in str(r.get("hit", "")))
-    losses = sum(1 for r in results if "SL" in str(r.get("hit", "")))
-    avg_pnl = np.mean([r.get("pnl_total", 0) for r in results])
-    winrate = round((wins / total) * 100, 2) if total > 0 else 0.0
-
-    summary = {
-        "total": total,
-        "tp_hits": wins,
-        "sl_hits": losses,
-        "winrate": winrate,
-        "avg_pnl": round(float(avg_pnl), 3),
-        "feedback_to_ai": FEEDBACK_ENABLED
-    }
-
-    return {"summary": summary, "results": results[:30]}
-
-
-@app.get("/logs")
-def get_logs(limit: int = 50):
-    """Melihat hasil backtest terakhir"""
-    if not os.path.exists(LOG_FILE):
-        return {"detail": "Belum ada hasil backtest"}
-    try:
-        df = pd.read_csv(LOG_FILE).tail(limit)
-        return {"logs": df.to_dict(orient="records")}
-    except Exception as e:
-        return {"error": str(e)}
-
-
-@app.get("/health")
-def health():
-    return {
-        "status": "ok",
-        "service": "ProTrader Smart Backtester",
-        "ai_feedback_enabled": FEEDBACK_ENABLED,
-        "log_file": LOG_FILE
-    }
-
-
-@app.on_event("startup")
-def startup():
-    print("✅ Smart Backtester aktif dan siap menerima data AI & Telegram")
-
-
-# ✅ Jalankan server di Railway:
-# uvicorn backtester:app --host 0.0.0.0 --port $PORT
+# ============= MAIN =============
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.getenv("PORT", "8080"))
+    print(f" AI Backtester running on port {port}")
+    uvicorn.run("ai_backtester:app", host="0.0.0.0", port=port, reload=False)

@@ -1,6 +1,7 @@
 # telegram_bot_full.py
-# ProTraderAI - Full Telegram Bot (manual + auto-scan + status/logs/performance + csv/image)
-# Requirements: python-telegram-bot>=20, requests, apscheduler
+# ProTraderAI - Full Telegram Bot (manual + auto-scan + status/logs/performance + csv/image + retrain)
+# Requires environment variables: BOT_TOKEN, CHAT_ID, APP_URL
+# Requirements: python-telegram-bot==20.3, requests, apscheduler
 
 import os
 import re
@@ -19,7 +20,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 # ---------------- CONFIG ----------------
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 CHAT_ID = os.getenv("CHAT_ID", "")  # destination chat id for auto signals (string or int)
-APP_URL = os.getenv("APP_URL", "https://web-production-af34.up.railway.app").rstrip("/")
+APP_URL = os.getenv("APP_URL", "").rstrip("/")
 if APP_URL and not APP_URL.startswith("http"):
     APP_URL = "https://" + APP_URL
 
@@ -27,6 +28,7 @@ API_TIMEOUT = int(os.getenv("API_TIMEOUT", "25"))
 STRONG_SIGNAL_THRESHOLD = float(os.getenv("STRONG_SIGNAL_THRESHOLD", "0.8"))
 AUTO_SCAN_HOURS = int(os.getenv("AUTO_SCAN_HOURS", "1"))  # default 1 hour
 AUTO_TIMEFRAMES = os.getenv("AUTO_TIMEFRAMES", "15m,1h,4h").split(",")
+
 AUTO_PAIRS_CRYPTO = os.getenv("AUTO_PAIRS_CRYPTO", "").strip()
 AUTO_PAIRS_FOREX = os.getenv("AUTO_PAIRS_FOREX", "").strip()
 
@@ -49,12 +51,12 @@ AUTO_PAIRS = list(dict.fromkeys(AUTO_PAIRS_CRYPTO + AUTO_PAIRS_FOREX))
 scheduler = BackgroundScheduler()
 auto_job = None
 auto_job_lock = Lock()
-auto_enabled = True  # default auto-scan ON; you can /auto_off
+auto_enabled = True  # default auto-scan ON
 stop_event = Event()
 
 # ---------------- HELPERS ----------------
 def format_signal(result: dict) -> str:
-    """Pretty-format signal dict into Telegram message (HTML)."""
+    """Pretty-format a signal dict into Telegram message (HTML)."""
     if not isinstance(result, dict):
         return "⚠️ Tidak bisa membaca hasil sinyal."
     if "error" in result:
@@ -179,7 +181,6 @@ def auto_check_and_send(app):
                 if conf >= STRONG_SIGNAL_THRESHOLD and res.get("signal_type") and res.get("signal_type") != "WAIT":
                     msg = format_signal(res)
                     try:
-                        # Prefer configured CHAT_ID; fallback to bot owner (not implemented here)
                         if not CHAT_ID:
                             print("[AUTO] CHAT_ID not configured; skipping send.")
                         else:
@@ -199,7 +200,6 @@ def start_auto_job(app):
     global auto_job
     with auto_job_lock:
         if auto_job is None:
-            # schedule job every AUTO_SCAN_HOURS hours
             auto_job = scheduler.add_job(lambda: auto_check_and_send(app), 'interval', hours=AUTO_SCAN_HOURS, next_run_time=None)
             print("[AUTO] Job scheduled.")
         else:
@@ -231,6 +231,7 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/status - status model\n"
         "/logs - sinyal terakhir\n"
         "/performance - performa AI\n"
+        "/retrain - retrain model ML\n"
         "/auto_on - aktifkan auto-scan\n"
         "/auto_off - nonaktifkan auto-scan\n"
     )
@@ -307,6 +308,42 @@ async def auto_off_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⛔ Auto-scan dinonaktifkan.")
     except Exception as e:
         await update.message.reply_text(f"❌ Gagal menonaktifkan auto-scan: {e}")
+
+async def retrain_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Perintah retrain model AI langsung dari Telegram."""
+    try:
+        await update.message.reply_text("🧠 Melatih ulang model AI... harap tunggu (proses bisa memakan waktu) ⏳")
+
+        # Kirim request POST ke AI Agent
+        if not APP_URL:
+            await update.message.reply_text("❌ APP_URL belum dikonfigurasikan di environment.")
+            return
+
+        url = f"{APP_URL.rstrip('/')}/retrain_learning"
+        r = requests.post(url, timeout=300)
+        try:
+            res = r.json()
+        except Exception:
+            await update.message.reply_text(f"⚠️ Retrain selesai tapi response tidak JSON: {r.text}")
+            return
+
+        if "error" in res:
+            await update.message.reply_text(f"❌ Gagal retrain model.\nError: {res.get('error')}")
+            return
+
+        # try to show some useful fields returned by backend
+        algo = res.get("algo", "XGBoost")
+        samples = res.get("samples", res.get("sample_count", "N/A"))
+        msg = (
+            "✅ <b>Model retrained successfully!</b>\n\n"
+            f"🧠 Algorithm: {algo}\n"
+            f"📈 Samples used: {samples}\n"
+            f"📂 Model path: {res.get('model_path', 'xgb_model.json')}"
+        )
+        await update.message.reply_text(msg, parse_mode="HTML")
+
+    except Exception as e:
+        await update.message.reply_text(f"❌ Retrain gagal.\nError: {e}")
 
 async def manual_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip() if update.message.text else ""
@@ -393,6 +430,7 @@ def main():
     app.add_handler(CommandHandler("performance", performance_cmd))
     app.add_handler(CommandHandler("auto_on", auto_on_cmd))
     app.add_handler(CommandHandler("auto_off", auto_off_cmd))
+    app.add_handler(CommandHandler("retrain", retrain_cmd))
 
     # Message handlers
     app.add_handler(MessageHandler(filters.Document.ALL, handle_csv))

@@ -1,539 +1,750 @@
+# main_combined_learning_full_backtest.py
 """
-main_combined_learning_hybrid.py
-AI Agent Hybrid (SMC + ICT PRO + ML XGBoost)
-Bagian 1/3: Imports + Config + Multi-Source Data System
+Pro Trader AI Agent - Hybrid Full Backtest Version
+By: Evan Leon
+Language: Bilingual (EN-ID)
+Integrates SMC + ICT + XGBoost + Backtester (Single & Multi Pair)
 """
 
+# ==============================
+# 📦 IMPORT & LIBRARIES
+# ==============================
 import os
 import io
 import csv
 import json
 import time
-import joblib
-import base64
-import requests
-import numpy as np
+import math
+import asyncio
+import datetime as dt
+from typing import List, Dict, Any, Optional
+
 import pandas as pd
-from datetime import datetime
-from fastapi import FastAPI, UploadFile, File, HTTPException
+import numpy as np
+from fastapi import FastAPI, UploadFile, File, Form
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-from xgboost import XGBClassifier
-from typing import Dict, Any
+
+# Machine Learning
+import xgboost as xgb
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score
+
+# Image/CSV Analysis
 from PIL import Image
 import pytesseract
-import re
+import requests
 
-# ============================================================
-# CONFIGURASI ENVIRONMENT
-# ============================================================
-APP_URL = os.getenv("APP_URL", "")
+# ==============================
+# ⚙️ CONFIGURATIONS
+# ==============================
+app = FastAPI(title="Pro Trader AI Agent - Full Backtest")
+
+# Default file paths
 LOG_PATH = os.getenv("LOG_PATH", "trade_log.csv")
 MODEL_PATH = os.getenv("MODEL_PATH", "models/ai_model_xgb.json")
-RISK_PERCENT = float(os.getenv("RISK_PERCENT", 0.02))
-ACCOUNT_BALANCE = float(os.getenv("ACCOUNT_BALANCE", 0))
-TRADING_MODE = os.getenv("TRADING_MODE", "auto")
-TWELVEDATA_API_KEY = os.getenv("TWELVEDATA_API_KEY", "")
-MIN_SAMPLES_TO_TRAIN = int(os.getenv("MIN_SAMPLES_TO_TRAIN", 50))
+MIN_SAMPLES_TO_TRAIN = int(os.getenv("MIN_SAMPLES_TO_TRAIN", "50"))
 
-# ICT PRO CONFIG
+# Trading parameters
+RISK_PERCENT = float(os.getenv("RISK_PERCENT", "0.02"))
+ACCOUNT_BALANCE = float(os.getenv("ACCOUNT_BALANCE", "1000"))
+
+# API keys
+TWELVEDATA_API_KEY = os.getenv("TWELVEDATA_API_KEY", "")
+ALPHA_API_KEY = os.getenv("ALPHA_API_KEY", "")
+
+# Source selector
+DATA_PROVIDER = os.getenv("DATA_PROVIDER", "twelvedata")
+
+# Killzone setup (ICT)
 ICT_KILLZONE_ENABLE = os.getenv("ICT_KILLZONE_ENABLE", "true").lower() == "true"
 ICT_KILLZONE_START = os.getenv("ICT_KILLZONE_START", "06:00")
 ICT_KILLZONE_END = os.getenv("ICT_KILLZONE_END", "12:00")
-ICT_MIN_CONFIRM = float(os.getenv("ICT_MIN_CONFIRM", 0.6))
-ICT_HTF_LIST = os.getenv("ICT_HTF_LIST", "1w,1d,1h").split(",")
+
+ICT_MIN_CONFIRM = float(os.getenv("ICT_MIN_CONFIRM", "0.65"))
 ICT_DEFAULT_ENTRY_TF = os.getenv("ICT_DEFAULT_ENTRY_TF", "15m")
 
-# ============================================================
-# HELPER: POSITION SIZE CALCULATOR
-# ============================================================
-def calculate_position_size(entry, stop_loss, balance=None, risk_percent=RISK_PERCENT):
-    try:
-        entry = float(entry)
-        stop_loss = float(stop_loss)
-        if balance is None:
-            balance = ACCOUNT_BALANCE
-        if balance <= 0:
-            return 0.01
-        risk_amount = balance * risk_percent
-        sl_distance = abs(entry - stop_loss)
-        if sl_distance <= 0:
-            return 0.01
-        size = risk_amount / sl_distance
-        return round(max(size, 0.01), 3)
-    except Exception:
-        return 0.01
+# Ensure model directory exists
+os.makedirs(os.path.dirname(MODEL_PATH) or ".", exist_ok=True)
 
-# ============================================================
-# HELPER: AUTO LOG SINYAL KE CSV
-# ============================================================
-def append_trade_log(data: dict):
-    try:
-        file_exists = os.path.exists(LOG_PATH)
-        with open(LOG_PATH, "a", newline="") as f:
+# ==============================
+# 🧾 LOGGING SYSTEM
+# ==============================
+def ensure_log_headers():
+    if not os.path.exists(LOG_PATH):
+        with open(LOG_PATH, "w", newline="") as f:
             writer = csv.writer(f)
-            if not file_exists:
-                writer.writerow(["datetime", "pair", "timeframe", "signal_type",
-                                 "entry", "tp1", "tp2", "sl",
-                                 "confidence", "ml_prob", "position_size", "reasoning"])
             writer.writerow([
-                data.get("timestamp", datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")),
-                data.get("pair", ""), data.get("timeframe", ""), data.get("signal_type", ""),
-                data.get("entry", ""), data.get("tp1", ""), data.get("tp2", ""), data.get("sl", ""),
-                data.get("confidence", ""), data.get("ml_prob", ""), data.get("position_size", ""), data.get("reasoning", "")
+                "timestamp","pair","timeframe","side",
+                "entry","tp1","tp2","sl",
+                "hit","pnl","confidence","reasoning","source"
             ])
-    except Exception as e:
-        print("[LOG ERROR]", e)
 
-# ============================================================
-# DATA FETCH SYSTEM (BINANCE + TWELVEDATA + CSV)
-# ============================================================
-def fetch_ohlc_binance(symbol: str, interval: str = "15m", limit: int = 500) -> pd.DataFrame:
-    try:
-        url = f"https://api.binance.com/api/v3/klines?symbol={symbol.upper()}&interval={interval}&limit={limit}"
-        res = requests.get(url, timeout=15)
-        data = res.json()
-        if not isinstance(data, list):
-            raise ValueError(f"Invalid response from Binance: {data}")
-        df = pd.DataFrame(data, columns=[
-            "open_time","open","high","low","close","volume",
-            "close_time","qav","num_trades","tbbav","tbqav","ignore"])
-        df["open"] = df["open"].astype(float)
-        df["high"] = df["high"].astype(float)
-        df["low"] = df["low"].astype(float)
-        df["close"] = df["close"].astype(float)
-        df["timestamp"] = pd.to_datetime(df["open_time"], unit="ms")
-        df = df[["timestamp","open","high","low","close"]].set_index("timestamp")
-        return df
-    except Exception as e:
-        raise RuntimeError(f"Binance fetch error: {e}")
+def append_log(entry: dict):
+    ensure_log_headers()
+    with open(LOG_PATH, "a", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            entry.get("timestamp", dt.datetime.utcnow().isoformat()),
+            entry.get("pair"), entry.get("timeframe"), entry.get("side"),
+            entry.get("entry"), entry.get("tp1"), entry.get("tp2"), entry.get("sl"),
+            entry.get("hit"), entry.get("pnl"), entry.get("confidence"),
+            entry.get("reasoning"), entry.get("source", "ai")
+        ])
 
-def fetch_ohlc_twelvedata(symbol: str, interval: str = "15m", limit: int = 500) -> pd.DataFrame:
-    try:
-        if not TWELVEDATA_API_KEY:
-            raise ValueError("TWELVEDATA_API_KEY not set")
-        # convert 15m -> 15min, 1h -> 1h, etc.
-        mapping = {"m": "min", "h": "h", "d": "day", "w": "week"}
-        unit = interval[-1]
-        if unit not in mapping:
-            raise ValueError("Unsupported timeframe")
-        interval_fmt = interval[:-1] + mapping[unit]
-        url = f"https://api.twelvedata.com/time_series?symbol={symbol}&interval={interval_fmt}&outputsize={limit}&apikey={TWELVEDATA_API_KEY}"
-        res = requests.get(url, timeout=15)
-        data = res.json()
-        if "values" not in data:
-            raise ValueError(f"TwelveData error: {data}")
-        df = pd.DataFrame(data["values"])
-        df["open"] = df["open"].astype(float)
-        df["high"] = df["high"].astype(float)
-        df["low"] = df["low"].astype(float)
-        df["close"] = df["close"].astype(float)
-        df["timestamp"] = pd.to_datetime(df["datetime"])
-        df = df[["timestamp","open","high","low","close"]].set_index("timestamp").sort_index()
-        return df
-    except Exception as e:
-        raise RuntimeError(f"TwelveData fetch error: {e}")
+ensure_log_headers()
 
-def load_csv_data(file: UploadFile) -> pd.DataFrame:
-    try:
-        df = pd.read_csv(file.file)
-        cols = [c.lower() for c in df.columns]
-        df.columns = cols
-        if "timestamp" in cols:
-            df["timestamp"] = pd.to_datetime(df["timestamp"])
-            df = df.set_index("timestamp")
-        elif "date" in cols:
-            df["date"] = pd.to_datetime(df["date"])
-            df = df.rename(columns={"date": "timestamp"}).set_index("timestamp")
-        else:
-            raise ValueError("CSV harus punya kolom 'timestamp' atau 'date'")
-        return df[["open","high","low","close"]]
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Gagal membaca CSV: {e}")
-
-# ============================================================
-# CHART IMAGE ANALYZER (TEXT-BASED PATTERN)
-# ============================================================
-def analyze_chart_image(image_bytes: bytes) -> str:
-    """
-    Ekstrak teks dari gambar chart dan simpulkan bias sederhana.
-    """
-    try:
-        img = Image.open(io.BytesIO(image_bytes))
-        text = pytesseract.image_to_string(img)
-        text = text.lower()
-        signals = {"long": 0, "short": 0, "bullish": 0, "bearish": 0, "buy": 0, "sell": 0}
-        for key in signals.keys():
-            signals[key] = len(re.findall(key, text))
-        bias = "LONG" if signals["long"] + signals["bullish"] + signals["buy"] > signals["short"] + signals["bearish"] + signals["sell"] else "SHORT"
-        reasoning = f"Detected words: {signals}, bias={bias}"
-        return reasoning
-    except Exception as e:
-        return f"Image analyze error: {e}"
-# ============================================================
-# BAGIAN 2: SMART MONEY CONCEPTS (SMC) + ICT PRO ENGINE + XGBOOST
-# ============================================================
-
-from datetime import time as dtime
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import StandardScaler
-
-# ============================================================
-# ICT PRO UTILITIES
-# ============================================================
-def parse_time(s):
-    h, m = map(int, s.split(":"))
-    return dtime(h, m)
-
-def in_killzone(check_dt: datetime) -> bool:
-    if not ICT_KILLZONE_ENABLE:
-        return True
-    start = parse_time(ICT_KILLZONE_START)
-    end = parse_time(ICT_KILLZONE_END)
-    t = check_dt.time()
-    if start <= end:
-        return start <= t <= end
-    return t >= start or t <= end
-
-# ============================================================
-# BASIC STRUCTURE DETECTION (BOS / CHoCH)
-# ============================================================
-def detect_structure(df: pd.DataFrame, lookback=30):
-    if len(df) < lookback:
-        return {'bias': 'neutral'}
-    hh = (df['high'].diff() > 0).sum()
-    ll = (df['low'].diff() < 0).sum()
-    if hh > ll * 1.3:
-        return {'bias': 'bull'}
-    elif ll > hh * 1.3:
-        return {'bias': 'bear'}
-    else:
-        return {'bias': 'range'}
-
-# ============================================================
-# LIQUIDITY SWEEP, ORDER BLOCK, FAIR VALUE GAP DETECTION
-# ============================================================
-def detect_liquidity_sweep(df: pd.DataFrame, lookback=50):
-    if len(df) < lookback:
-        return {'sweep': False}
-    recent = df[-lookback:]
-    high_thr = recent['high'].quantile(0.98)
-    low_thr = recent['low'].quantile(0.02)
-    last = recent.iloc[-1]
-    sweep_up = last['high'] > high_thr
-    sweep_down = last['low'] < low_thr
-    return {'sweep': sweep_up or sweep_down, 'sweep_up': bool(sweep_up), 'sweep_down': bool(sweep_down)}
-
-def detect_order_blocks(df: pd.DataFrame, lookback=60):
-    res = {'bull_ob': None, 'bear_ob': None}
-    for i in range(len(df)-3, 3, -1):
-        window = df.iloc[i-3:i+1]
-        if (window['close'].iloc[-1] - window['open'].iloc[0]) > (window['high'] - window['low']).mean()*0.5:
-            ob_low = float(window['low'].min())
-            ob_high = float(window['high'].max())
-            res['bull_ob'] = {'low': ob_low, 'high': ob_high}
-            break
-    return res
-
-def detect_fvg(df: pd.DataFrame, lookback=40):
-    fvg = []
-    for i in range(2, min(len(df), lookback)):
-        c1 = df.iloc[-i]
-        c2 = df.iloc[-i+1]
-        if c1['high'] < c2['low']:
-            fvg.append({'low': float(c1['high']), 'high': float(c2['low'])})
-        if c1['low'] > c2['high']:
-            fvg.append({'low': float(c2['high']), 'high': float(c1['low'])})
-    return fvg
-
-# ============================================================
-# ADAPTIVE HTF COMBINATION
-# ============================================================
-def adaptive_bias_from_htf(htf_dict):
-    weights = {'1w': 3, '1d': 2, '1h': 1}
-    score = 0
-    for tf, d in htf_dict.items():
-        bias = d.get('bias', 'neutral')
-        w = weights.get(tf, 1)
-        if bias == 'bull':
-            score += w
-        elif bias == 'bear':
-            score -= w
-    if score >= 4: return 'strong_bull'
-    if score >= 1: return 'bull'
-    if score <= -4: return 'strong_bear'
-    if score <= -1: return 'bear'
-    return 'neutral'
-
-# ============================================================
-# ICT PRO SIGNAL GENERATOR
-# ============================================================
-def generate_ict_signal(df_dict: Dict[str, pd.DataFrame], pair: str, entry_tf: str):
-    htf_analysis = {}
-    for tf in ICT_HTF_LIST:
-        if tf in df_dict:
-            htf_analysis[tf] = detect_structure(df_dict[tf], lookback=40)
-    bias = adaptive_bias_from_htf(htf_analysis)
-
-    entry_df = df_dict.get(entry_tf, None)
-    if entry_df is None:
-        return {'error': 'entry_tf_missing'}
-
-    sweep = detect_liquidity_sweep(entry_df, lookback=80)
-    ob = detect_order_blocks(entry_df, lookback=80)
-    fvg = detect_fvg(entry_df, lookback=80)
-    is_kz = in_killzone(datetime.utcnow())
-
-    # scoring logic
-    score = 0
-    reasons = []
-    if bias in ('bull','strong_bull'): score += 1; reasons.append(f"HTF-bias:{bias}")
-    if bias in ('bear','strong_bear'): score -= 1; reasons.append(f"HTF-bias:{bias}")
-    if sweep.get('sweep_down'): score += 0.8; reasons.append("Liquidity sweep down")
-    if sweep.get('sweep_up'): score -= 0.8; reasons.append("Liquidity sweep up")
-    if ob.get('bull_ob'): score += 0.3; reasons.append("Bullish OB present")
-    if len(fvg)>0: score += 0.2; reasons.append("FVG detected")
-    if is_kz: score *= 1.1; reasons.append("In killzone")
-
-    conf_raw = max(min(score/3, 1), -1)
-    confidence = abs(round(conf_raw,3))
-    signal_type = "LONG" if conf_raw >= ICT_MIN_CONFIRM else ("SHORT" if conf_raw <= -ICT_MIN_CONFIRM else "WAIT")
-
-    last = entry_df.iloc[-1]
-    atr = (entry_df['high'] - entry_df['low']).rolling(14).mean().iloc[-1]
-    entry = float(last['close'])
-    if signal_type == "LONG":
-        sl = entry - 1.5*atr
-        tp1 = entry + 1.8*atr
-        tp2 = entry + 3.6*atr
-    elif signal_type == "SHORT":
-        sl = entry + 1.5*atr
-        tp1 = entry - 1.8*atr
-        tp2 = entry - 3.6*atr
-    else:
-        sl, tp1, tp2 = entry, entry, entry
-
-    reasoning = "; ".join(reasons)
-    return {
-        "pair": pair, "timeframe": entry_tf, "signal_type": signal_type,
-        "entry": round(entry,6), "tp1": round(tp1,6), "tp2": round(tp2,6), "sl": round(sl,6),
-        "confidence": confidence, "reasoning": reasoning
-    }
-
-# ============================================================
-# MACHINE LEARNING (XGBOOST) � TRAIN & PREDICT
-# ============================================================
-def load_or_train_model(df: pd.DataFrame):
-    """
-    Train model jika belum ada atau log cukup banyak.
-    """
-    os.makedirs(os.path.dirname(MODEL_PATH), exist_ok=True)
-    model = None
+# ==============================
+# 🧠 LOAD & SAVE MODEL
+# ==============================
+def load_model():
     if os.path.exists(MODEL_PATH):
         try:
-            model = XGBClassifier()
+            model = xgb.XGBClassifier()
             model.load_model(MODEL_PATH)
-        except Exception:
-            model = None
+            print("✅ Model loaded from", MODEL_PATH)
+            return model
+        except Exception as e:
+            print("⚠️ Gagal load model:", e)
+    return None
 
-    if df is None or len(df) < MIN_SAMPLES_TO_TRAIN:
-        return model
+def save_model(model):
+    os.makedirs(os.path.dirname(MODEL_PATH) or ".", exist_ok=True)
+    model.save_model(MODEL_PATH)
 
-    try:
-        df = df.copy()
-        df["label"] = np.where(df["signal_type"].isin(["LONG","BUY"]),1,
-                        np.where(df["signal_type"].isin(["SHORT","SELL"]),0,np.nan))
-        df = df.dropna(subset=["label"])
-        X = df[["entry","tp1","tp2","sl","confidence","position_size"]]
-        y = df["label"]
-        X_train, X_test, y_train, y_test = train_test_split(X,y,test_size=0.2,random_state=42)
-        model = XGBClassifier(
-            n_estimators=80, learning_rate=0.1, max_depth=4,
-            subsample=0.8, colsample_bytree=0.8, eval_metric="logloss"
-        )
-        model.fit(X_train, y_train)
-        model.save_model(MODEL_PATH)
-        print(f"[ML] XGBoost retrained on {len(X)} samples")
-    except Exception as e:
-        print("[ML ERROR]", e)
-    return model
+MODEL = load_model()
 
-def predict_confidence_xgb(model, signal_data: dict):
-    try:
-        if model is None:
-            return None
-        features = np.array([[
-            signal_data.get("entry",0),
-            signal_data.get("tp1",0),
-            signal_data.get("tp2",0),
-            signal_data.get("sl",0),
-            signal_data.get("confidence",0),
-            signal_data.get("position_size",0.01)
-        ]])
-        prob = model.predict_proba(features)[0][1]
-        return round(float(prob),3)
-    except Exception:
-        return None
-# ============================================================
-# BAGIAN 3: FASTAPI ENDPOINTS + RETRAIN + MAIN RUNNER
-# ============================================================
+# ==============================
+# 📈 SIMPLE ICT & SMC UTILITIES
+# ==============================
+def in_killzone_now(start_str=ICT_KILLZONE_START, end_str=ICT_KILLZONE_END):
+    if not ICT_KILLZONE_ENABLE:
+        return True
+    now = dt.datetime.utcnow().time()
+    start = dt.datetime.strptime(start_str, "%H:%M").time()
+    end = dt.datetime.strptime(end_str, "%H:%M").time()
+    if start <= end:
+        return start <= now <= end
+    return now >= start or now <= end
 
-app = FastAPI(title="Pro Trader AI Hybrid (SMC + ICT PRO + XGBoost)", version="4.0")
+def simple_smc_analysis(df: pd.DataFrame) -> Dict[str, Any]:
+    """Deteksi sederhana struktur pasar (BOS/CHoCH, liquidity sweep, FVG)."""
+    reasoning, conf = [], 0.5
+    if df.shape[0] < 10:
+        return {"bias": "neutral", "reasoning": "data kurang", "confidence": 0.3}
 
-# ============================================================
-# MODEL: SIGNAL REQUEST
-# ============================================================
-class SignalRequest(BaseModel):
+    last = df.tail(10)
+    highs, lows = last["high"], last["low"]
+
+    # Trend structure
+    if highs.max() == highs.iloc[-1] and lows.max() == lows.iloc[-1]:
+        bias = "long"; conf += 0.15; reasoning.append("struktur naik (HH/HL)")
+    elif highs.min() == highs.iloc[-1] and lows.min() == lows.iloc[-1]:
+        bias = "short"; conf += 0.15; reasoning.append("struktur turun (LL/LH)")
+    else:
+        bias = "neutral"; reasoning.append("tidak jelas arah tren")
+
+    # FVG (Fair Value Gap)
+    fvg = 0
+    for i in range(-5, -1):
+        prev_high, next_low = df["high"].iloc[i], df["low"].iloc[i+1]
+        if next_low > prev_high:
+            fvg += 1
+    if fvg:
+        reasoning.append(f"{fvg} FVG terdeteksi"); conf += 0.05 * fvg
+
+    # Liquidity sweep
+    last_candle, prev = df.iloc[-1], df.iloc[-2]
+    if last_candle["high"] > prev["high"]:
+        reasoning.append("sapu likuiditas atas")
+        conf += 0.05
+    if last_candle["low"] < prev["low"]:
+        reasoning.append("sapu likuiditas bawah")
+        conf += 0.05
+
+    return {"bias": bias, "reasoning": "; ".join(reasoning), "confidence": min(conf, 1.0)}
+
+# ==============================
+# 📊 FETCH DATA (TwelveData, Alpha, CSV fallback)
+# ==============================
+def fetch_ohlc(pair: str, interval: str, limit: int = 500) -> pd.DataFrame:
+    """Ambil data OHLC dari TwelveData, AlphaVantage, atau CSV lokal."""
+    # 1️⃣ TwelveData
+    if TWELVEDATA_API_KEY:
+        url = f"https://api.twelvedata.com/time_series?symbol={pair}&interval={interval}&outputsize={limit}&apikey={TWELVEDATA_API_KEY}"
+        r = requests.get(url, timeout=15)
+        j = r.json()
+        if "values" in j:
+            df = pd.DataFrame(j["values"])
+            df = df.rename(columns={"datetime":"datetime","open":"open","high":"high","low":"low","close":"close","volume":"volume"})
+            df["datetime"] = pd.to_datetime(df["datetime"])
+            for c in ["open","high","low","close","volume"]:
+                df[c] = pd.to_numeric(df[c], errors="coerce")
+            df = df.sort_values("datetime").reset_index(drop=True)
+            return df
+
+    # 2️⃣ AlphaVantage (backup)
+    if ALPHA_API_KEY:
+        url = f"https://www.alphavantage.co/query?function=TIME_SERIES_INTRADAY&symbol={pair}&interval={interval}&apikey={ALPHA_API_KEY}&outputsize=compact"
+        r = requests.get(url, timeout=15)
+        if r.status_code == 200:
+            try:
+                data = r.json()
+                key = next(k for k in data.keys() if "Time Series" in k)
+                df = pd.DataFrame(data[key]).T
+                df.columns = ["open","high","low","close","volume"]
+                df = df.astype(float)
+                df["datetime"] = pd.to_datetime(df.index)
+                df = df.sort_values("datetime").reset_index(drop=True)
+                return df
+            except Exception:
+                pass
+
+    # 3️⃣ CSV fallback
+    local_path = f"data/{pair}_{interval}.csv"
+    if os.path.exists(local_path):
+        df = pd.read_csv(local_path)
+        df["datetime"] = pd.to_datetime(df["datetime"])
+        return df
+
+    raise RuntimeError(f"Tidak bisa ambil data untuk {pair} ({interval}) — pastikan API key aktif atau file CSV tersedia.")
+
+# ==============================
+# 🧮 XGBOOST TRAINING UTILS
+# ==============================
+def build_features_from_log():
+    if not os.path.exists(LOG_PATH):
+        return None, None
+    df = pd.read_csv(LOG_PATH)
+    if df.shape[0] < 10:
+        return None, None
+    df = df.dropna(subset=["pair","timeframe","side","hit","pnl","confidence"])
+    df["label"] = df["hit"].apply(lambda x: 1 if str(x).upper()=="TP" else 0)
+    df["side_num"] = df["side"].map({"LONG":1,"SHORT":0}).fillna(1)
+    def tf_to_min(tf):
+        tf = str(tf).lower()
+        if "m" in tf: return int(tf.replace("m",""))
+        if "h" in tf: return int(tf.replace("h",""))*60
+        if "d" in tf: return int(tf.replace("d",""))*1440
+        return 15
+    df["tf_min"] = df["timeframe"].apply(tf_to_min)
+    X = df[["side_num","tf_min","pnl","confidence"]].fillna(0)
+    y = df["label"]
+    return X, y
+
+def retrain_model(force=False):
+    global MODEL
+    X, y = build_features_from_log()
+    if X is None or y is None:
+        return {"status": "not_enough_data"}
+    if not force and X.shape[0] < MIN_SAMPLES_TO_TRAIN:
+        return {"status": "need_more_samples", "have": X.shape[0], "need": MIN_SAMPLES_TO_TRAIN}
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+    model = xgb.XGBClassifier(use_label_encoder=False, eval_metric="logloss", n_estimators=100)
+    model.fit(X_train, y_train)
+    preds = model.predict(X_test)
+    acc = float(accuracy_score(y_test, preds))
+    save_model(model)
+    MODEL = model
+    return {"status":"trained","accuracy":acc,"samples":X.shape[0]}
+
+# ==============================
+# END OF PART 1
+# ==============================
+# ==============================
+# PART 2 — BACKTEST ENGINE & FEEDBACK LOOP
+# ==============================
+
+# ------------------------------
+# 🔁 SIMULATE BACKTEST (Candle-by-candle)
+# ------------------------------
+def simulate_backtest_on_df(df: pd.DataFrame, side: str, entry: float, tp1: float, sl: float) -> Dict[str, Any]:
+    """
+    Simulasi sederhana: mulai dari candle entry (jika entry dalam range candle),
+    lalu periksa candle demi candle apakah TP atau SL tercapai lebih dulu.
+    Kembalikan: {'hit': 'TP'|'SL'|'NONE', 'pnl': float, 'bars': int}
+    """
+    entry_idx = None
+    for i in range(len(df)):
+        if df['low'].iloc[i] <= entry <= df['high'].iloc[i]:
+            entry_idx = i
+            break
+    if entry_idx is None:
+        entry_idx = 0
+
+    hit = "NONE"
+    pnl = 0.0
+    bars = 0
+    for j in range(entry_idx + 1, len(df)):
+        bars += 1
+        h = df['high'].iloc[j]
+        l = df['low'].iloc[j]
+        o = df['open'].iloc[j]
+        if side.upper() == "LONG":
+            if h >= tp1 and l <= sl:
+                # heuristik: bandingkan jarak relatif dari open
+                if abs(tp1 - o) < abs(o - sl):
+                    hit = "TP"
+                else:
+                    hit = "SL"
+            elif h >= tp1:
+                hit = "TP"
+            elif l <= sl:
+                hit = "SL"
+        else:  # SHORT
+            if l <= tp1 and h >= sl:
+                if abs(tp1 - o) < abs(o - sl):
+                    hit = "TP"
+                else:
+                    hit = "SL"
+            elif l <= tp1:
+                hit = "TP"
+            elif h >= sl:
+                hit = "SL"
+        if hit != "NONE":
+            if side.upper() == "LONG":
+                pnl = (tp1 - entry) if hit == "TP" else (sl - entry)
+            else:
+                pnl = (entry - tp1) if hit == "TP" else (entry - sl)
+            break
+    return {"hit": hit, "pnl": float(pnl), "bars": bars}
+
+# ------------------------------
+# 🧾 BACKTEST SINGLE ENDPOINT
+# ------------------------------
+from pydantic import ValidationError
+
+class BacktestReq(BaseModel):
     pair: str
-    timeframe: str = "15m"
-    side: str = "LONG"
+    side: str
+    entry: float
+    tp1: float
+    sl: float
+    timeframe: Optional[str] = ICT_DEFAULT_ENTRY_TF
+    limit: Optional[int] = 500
 
-# ============================================================
-# GENERATE SIGNAL UNIVERSAL (Auto detect source)
-# ============================================================
-def generate_signal_auto(pair: str, timeframe: str):
+@app.post("/backtest")
+async def backtest_endpoint(body: BacktestReq):
     """
-    Deteksi otomatis sumber data dan hasilkan sinyal.
+    Backtest single pair/timeframe.
+    Body: pair, side, entry, tp1, sl, timeframe (optional)
     """
-    df_dict = {}
     try:
-        if "USDT" in pair.upper():
-            df_dict[timeframe] = fetch_ohlc_binance(pair, timeframe)
-        elif TWELVEDATA_API_KEY:
-            df_dict[timeframe] = fetch_ohlc_twelvedata(pair, timeframe)
-        else:
-            raise ValueError("Tidak ada sumber data aktif")
+        pair = body.pair.upper()
+        tf = body.timeframe or ICT_DEFAULT_ENTRY_TF
+        df = fetch_ohlc(pair, tf, limit=body.limit or 500)
+        sim = simulate_backtest_on_df(df, body.side, body.entry, body.tp1, body.sl)
+        result = {
+            "pair": pair,
+            "timeframe": tf,
+            "side": body.side.upper(),
+            "entry": body.entry,
+            "tp1": body.tp1,
+            "sl": body.sl,
+            "hit": sim["hit"],
+            "pnl_total": sim["pnl"],
+            "bars": sim["bars"],
+            "timestamp": dt.datetime.utcnow().isoformat()
+        }
+        # log hasil backtest
+        append_log({
+            "timestamp": result["timestamp"],
+            "pair": result["pair"],
+            "timeframe": result["timeframe"],
+            "side": result["side"],
+            "entry": result["entry"],
+            "tp1": result["tp1"],
+            "tp2": None,
+            "sl": result["sl"],
+            "hit": result["hit"],
+            "pnl": result["pnl_total"],
+            "confidence": 0.0,
+            "reasoning": "backtest_simulation",
+            "source": "backtest"
+        })
+        # optionally call AI feedback endpoint if set (non-blocking)
+        ai_feedback_url = os.getenv("AI_FEEDBACK_URL", "")
+        if ai_feedback_url:
+            try:
+                requests.post(ai_feedback_url, json=result, timeout=3)
+            except:
+                pass
+        return result
+    except ValidationError as ve:
+        return JSONResponse({"error":"validation","detail":ve.errors()}, status_code=400)
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Gagal ambil data: {e}")
+        return JSONResponse({"error":"exception","detail":str(e)}, status_code=500)
 
-    ict_result = generate_ict_signal(df_dict, pair, timeframe)
-    if "error" in ict_result:
-        raise HTTPException(status_code=400, detail=ict_result["error"])
+# ------------------------------
+# 🧩 BACKTEST MULTI ENDPOINT
+# ------------------------------
+class BacktestMultiReq(BaseModel):
+    pairs: List[str]
+    timeframes: List[str]
+    limit: Optional[int] = 500
 
-    entry, sl = ict_result["entry"], ict_result["sl"]
-    pos_size = calculate_position_size(entry, sl)
+@app.post("/backtest_multi")
+async def backtest_multi_endpoint(body: BacktestMultiReq):
+    """
+    Backtest multiple pairs & timeframes.
+    Body: {"pairs": [...], "timeframes": [...], "limit": 500}
+    """
+    try:
+        results = []
+        for raw_pair in body.pairs:
+            pair = raw_pair.upper()
+            for tf in body.timeframes:
+                try:
+                    df = fetch_ohlc(pair, tf, limit=body.limit or 500)
+                    # gunakan analisis SMC untuk tentukan side & entry heuristik
+                    smc = simple_smc_analysis(df)
+                    bias = smc.get("bias", "neutral")
+                    last_close = float(df["close"].iloc[-1])
+                    # ATR-like
+                    df["range"] = df["high"] - df["low"]
+                    atr = float(df["range"].rolling(14).mean().iloc[-1]) if df.shape[0] >= 14 else float(df["range"].mean())
+                    if bias == "long":
+                        entry = last_close * 1.001
+                        sl = entry - atr * 1.5
+                        tp1 = entry + atr * 2
+                        side = "LONG"
+                    elif bias == "short":
+                        entry = last_close * 0.999
+                        sl = entry + atr * 1.5
+                        tp1 = entry - atr * 2
+                        side = "SHORT"
+                    else:
+                        # skip neutral
+                        continue
+                    sim = simulate_backtest_on_df(df, side, entry, tp1, sl)
+                    res = {
+                        "pair": pair,
+                        "timeframe": tf,
+                        "side": side,
+                        "entry": round(entry,6),
+                        "tp1": round(tp1,6),
+                        "sl": round(sl,6),
+                        "hit": sim["hit"],
+                        "pnl": sim["pnl"],
+                        "bars": sim["bars"],
+                        "confidence": 0.0,
+                        "reasoning": smc.get("reasoning","")
+                    }
+                    results.append(res)
+                    # log each
+                    append_log({
+                        "timestamp": dt.datetime.utcnow().isoformat(),
+                        "pair": res["pair"],
+                        "timeframe": res["timeframe"],
+                        "side": res["side"],
+                        "entry": res["entry"],
+                        "tp1": res["tp1"],
+                        "tp2": None,
+                        "sl": res["sl"],
+                        "hit": res["hit"],
+                        "pnl": res["pnl"],
+                        "confidence": res["confidence"],
+                        "reasoning": "backtest_multi",
+                        "source": "backtest"
+                    })
+                except Exception as inner_e:
+                    # skip pair/tf jika error ambil data
+                    print("backtest error for", pair, tf, inner_e)
+                    continue
+        total_pnl = sum(r["pnl"] for r in results)
+        wins = sum(1 for r in results if r["hit"] == "TP")
+        total = len(results)
+        avg_winrate = round((wins / total) * 100, 2) if total > 0 else 0.0
+        summary = {"average_winrate": avg_winrate, "total_pnl": total_pnl, "count": total}
+        return {"results": results, "summary": summary}
+    except ValidationError as ve:
+        return JSONResponse({"error":"validation","detail":ve.errors()}, status_code=400)
+    except Exception as e:
+        return JSONResponse({"error":"exception","detail":str(e)}, status_code=500)
 
-    data = {
-        **ict_result,
-        "position_size": pos_size,
-        "timestamp": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-    }
+# ------------------------------
+# 🔁 AI FEEDBACK (terima hasil eksekusi/backtest dari sumber lain)
+# ------------------------------
+@app.post("/ai_feedback")
+async def ai_feedback_endpoint(data: Dict[str, Any]):
+    """
+    Terima feedback dari backtester atau eksekusi live.
+    Data example: {pair, timeframe, side, entry, tp1, sl, hit, pnl, timestamp, confidence}
+    """
+    try:
+        append_log({
+            "timestamp": data.get("timestamp", dt.datetime.utcnow().isoformat()),
+            "pair": data.get("pair"),
+            "timeframe": data.get("timeframe"),
+            "side": data.get("side"),
+            "entry": data.get("entry"),
+            "tp1": data.get("tp1"),
+            "tp2": data.get("tp2"),
+            "sl": data.get("sl"),
+            "hit": data.get("hit"),
+            "pnl": data.get("pnl"),
+            "confidence": data.get("confidence", 0.0),
+            "reasoning": data.get("reasoning", "feedback"),
+            "source": data.get("source", "external")
+        })
+        # kalau jumlah log sudah mencapai ambang, trigger retrain background
+        try:
+            df = pd.read_csv(LOG_PATH)
+            if df.shape[0] >= MIN_SAMPLES_TO_TRAIN:
+                loop = asyncio.get_event_loop()
+                loop.create_task(async_retrain_background())
+        except Exception:
+            pass
+        return {"status":"logged"}
+    except Exception as e:
+        return JSONResponse({"error":"exception","detail":str(e)}, status_code=500)
 
-    append_trade_log(data)
+# ------------------------------
+# 🔧 Background retrain task (async)
+# ------------------------------
+async def async_retrain_background():
+    await asyncio.sleep(1)  # beri jeda kecil
+    try:
+        res = retrain_model(force=True)
+        print("Background retrain result:", res)
+    except Exception as e:
+        print("Background retrain failed:", e)
 
-    # ML Confidence
-    df_log = pd.read_csv(LOG_PATH) if os.path.exists(LOG_PATH) else pd.DataFrame()
-    model = load_or_train_model(df_log if not df_log.empty else None)
-    prob = predict_confidence_xgb(model, data)
-    if prob:
-        data["ml_prob"] = prob
-        data["confidence"] = round((data["confidence"] + prob) / 2, 3)
+# ==============================
+# END OF PART 2
+# ==============================
+# ==============================
+# PART 3 — API ENDPOINTS FINAL, TELEGRAM NOTIFY, STARTUP
+# ==============================
 
-    return data
+# ------------------------------
+# 🔔 Optional: Telegram notify helper (useful untuk notifikasi auto-update)
+# ------------------------------
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+BOT_CHAT_ID = os.getenv("CHAT_ID", "")
 
-# ============================================================
-# API ENDPOINTS
-# ============================================================
-@app.get("/")
-def home():
-    return {"status": " AI Agent Hybrid aktif", "version": "4.0"}
+def telegram_notify(text: str):
+    """Kirim notifikasi ke Telegram jika BOT_TOKEN & CHAT_ID tersedia."""
+    if not BOT_TOKEN or not BOT_CHAT_ID:
+        return False
+    try:
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+        payload = {"chat_id": BOT_CHAT_ID, "text": text[:4000], "parse_mode": "HTML"}
+        requests.post(url, json=payload, timeout=8)
+        return True
+    except Exception as e:
+        print("telegram_notify error:", e)
+        return False
+
+# ------------------------------
+# 🧾 SIGNAL ENDPOINT (SMC + ML blended)
+# ------------------------------
+class SignalReq(BaseModel):
+    pair: str
+    timeframe: Optional[str] = ICT_DEFAULT_ENTRY_TF
 
 @app.post("/signal")
-def signal(req: SignalRequest):
-    result = generate_signal_auto(req.pair, req.timeframe)
-    return {
-        "pair": result["pair"],
-        "timeframe": result["timeframe"],
-        "signal_type": result["signal_type"],
-        "entry": result["entry"],
-        "tp1": result["tp1"],
-        "tp2": result["tp2"],
-        "sl": result["sl"],
-        "confidence": result["confidence"],
-        "ml_prob": result.get("ml_prob", None),
-        "position_size": result["position_size"],
-        "reasoning": result["reasoning"],
-        "timestamp": result["timestamp"]
-    }
+async def signal_endpoint(req: SignalReq):
+    """
+    Endpoint utama: gabungkan SMC (struktur/OB/FVG/liquidity) + ML blending.
+    Response: pair, timeframe, signal_type, entry, tp1, tp2, sl, confidence, reasoning, ml_prob
+    """
+    try:
+        pair = req.pair.upper()
+        tf = req.timeframe or ICT_DEFAULT_ENTRY_TF
 
+        # ambil candles
+        df = fetch_ohlc(pair, tf, limit=300)
+
+        # simple SMC analysis
+        smc = simple_smc_analysis(df)
+        bias = smc.get("bias", "neutral")
+        reasoning = smc.get("reasoning", "")
+        conf = float(smc.get("confidence", 0.5))
+
+        # jika pakai killzone, cek sekarang
+        if ICT_KILLZONE_ENABLE and not in_killzone_now(ICT_KILLZONE_START, ICT_KILLZONE_END):
+            return JSONResponse({"error":"outside_killzone","reasoning":"Killzone aktif — tunggu sesi yang valid"}, status_code=200)
+
+        # ML blending jika model ada
+        ml_prob = None
+        if MODEL is not None:
+            try:
+                side_guess = 1 if bias == "long" else 0
+                tf_min = int(''.join([c for c in tf if c.isdigit()])) if tf else 15
+                pnl_sample = 0.0
+                X = pd.DataFrame([[side_guess, tf_min, pnl_sample, conf]], columns=['side_num','tf_min','pnl','confidence'])
+                ml_prob = float(MODEL.predict_proba(X)[0][1])
+                conf = round(0.6 * conf + 0.4 * ml_prob, 4)
+            except Exception as e:
+                print("ML predict error:", e)
+                ml_prob = None
+
+        # jika neutral -> wait
+        if bias == "neutral":
+            return {"signal_type":"WAIT","reasoning":reasoning,"confidence":conf}
+
+        # kalkulasi entry/sl/tp berbasis ATR-like
+        df["range"] = df["high"] - df["low"]
+        atr = float(df["range"].rolling(14).mean().iloc[-1]) if df.shape[0] >= 14 else float(df["range"].mean())
+        last_close = float(df["close"].iloc[-1])
+
+        if bias == "long":
+            entry = round(last_close * 1.0005, 6)
+            sl = round(entry - atr * 1.5, 6)
+            tp1 = round(entry + atr * 2, 6)
+            side = "LONG"
+        else:
+            entry = round(last_close * 0.9995, 6)
+            sl = round(entry + atr * 1.5, 6)
+            tp1 = round(entry - atr * 2, 6)
+            side = "SHORT"
+
+        result = {
+            "pair": pair,
+            "timeframe": tf,
+            "signal_type": side,
+            "entry": entry,
+            "tp1": tp1,
+            "tp2": None,
+            "sl": sl,
+            "confidence": conf,
+            "reasoning": reasoning,
+            "ml_prob": ml_prob
+        }
+        # optional: log suggestion (source=signal) — tidak dianggap sebagai eksekusi
+        append_log({
+            "timestamp": dt.datetime.utcnow().isoformat(),
+            "pair": pair,
+            "timeframe": tf,
+            "side": side,
+            "entry": entry,
+            "tp1": tp1,
+            "tp2": None,
+            "sl": sl,
+            "hit": "NONE",
+            "pnl": 0.0,
+            "confidence": conf,
+            "reasoning": "signal_suggest",
+            "source": "signal"
+        })
+        return result
+    except Exception as e:
+        return JSONResponse({"error":"exception","detail":str(e)}, status_code=500)
+
+# ------------------------------
+# ⚡ SCALP SIGNAL (shortcut)
+# ------------------------------
 @app.get("/scalp_signal")
-def scalp_signal(pair: str, tf: str = "3m"):
-    result = generate_signal_auto(pair, tf)
-    return result
+async def scalp_signal(pair: str = "BTCUSDT", tf: str = "3m"):
+    req = SignalReq(pair=pair, timeframe=tf)
+    return await signal_endpoint(req)
 
-@app.post("/analyze_csv")
-def analyze_csv(file: UploadFile = File(...)):
-    df = load_csv_data(file)
-    pair = os.path.splitext(file.filename)[0]
-    data = {"pair": pair, "timeframe": "CSV"}
-    result = generate_ict_signal({"15m": df}, pair, "15m")
-    result["position_size"] = calculate_position_size(result["entry"], result["sl"])
-    append_trade_log(result)
-    return result
-
+# ------------------------------
+# 🖼️ ANALYZE CHART (OCR heuristic)
+# ------------------------------
 @app.post("/analyze_chart")
-def analyze_chart(file: UploadFile = File(...)):
-    content = file.file.read()
-    reasoning = analyze_chart_image(content)
-    entry = np.random.uniform(1000, 2000)
-    sl = entry - np.random.uniform(10, 50)
-    tp1 = entry + np.random.uniform(50, 100)
-    signal = {
-        "pair": "CHART",
-        "timeframe": "image",
-        "signal_type": "LONG" if "long" in reasoning.lower() else "SHORT",
-        "entry": round(entry, 2),
-        "tp1": round(tp1, 2),
-        "tp2": round(tp1 + (tp1 - sl), 2),
-        "sl": round(sl, 2),
-        "confidence": 0.82,
-        "reasoning": reasoning
-    }
-    append_trade_log(signal)
-    return signal
+async def analyze_chart(file: UploadFile = File(...)):
+    try:
+        bytes_data = await file.read()
+        im = Image.open(io.BytesIO(bytes_data))
+        text = pytesseract.image_to_string(im)
+        text_up = text.upper()
+        if any(k in text_up for k in ["BUY", "LONG", "BULL"]):
+            return {"signal_type":"LONG","confidence":0.7,"reasoning":"OCR detected buy/long"}
+        if any(k in text_up for k in ["SELL","SHORT","BEAR"]):
+            return {"signal_type":"SHORT","confidence":0.7,"reasoning":"OCR detected sell/short"}
+        return {"signal_type":"WAIT","confidence":0.3,"reasoning":"OCR found no clear signal","raw_text": text[:800]}
+    except Exception as e:
+        return JSONResponse({"error":"exception","detail":str(e)}, status_code=500)
 
+# ------------------------------
+# 📄 ANALYZE CSV (basic SMC on CSV)
+# ------------------------------
+@app.post("/analyze_csv")
+async def analyze_csv(file: UploadFile = File(...)):
+    try:
+        content = await file.read()
+        df = pd.read_csv(io.BytesIO(content))
+        res = simple_smc_analysis(df)
+        return {"pair": df.get("pair", ["CSV"])[0] if "pair" in df.columns else "CSV", "timeframe": "csv", "signal_type": res["bias"].upper(), "confidence": res["confidence"], "reasoning": res["reasoning"]}
+    except Exception as e:
+        return JSONResponse({"error":"exception","detail":str(e)}, status_code=500)
+
+# ------------------------------
+# 📊 LEARNING STATUS & PERFORMANCE
+# ------------------------------
 @app.get("/learning_status")
-def learning_status():
-    model_exists = os.path.exists(MODEL_PATH)
+async def learning_status():
+    model_exists = MODEL is not None
     count = 0
-    if os.path.exists(LOG_PATH):
-        count = len(pd.read_csv(LOG_PATH))
-    return {"model_exists": model_exists, "trade_log_count": count, "algo": "XGBoost"}
-
-@app.post("/retrain_learning")
-def retrain_learning():
-    if not os.path.exists(LOG_PATH):
-        raise HTTPException(status_code=400, detail="Belum ada data log.")
-    df = pd.read_csv(LOG_PATH)
-    model = load_or_train_model(df)
-    return {"status": "retrained", "samples": len(df), "model_path": MODEL_PATH}
+    try:
+        if os.path.exists(LOG_PATH):
+            df = pd.read_csv(LOG_PATH)
+            count = df.shape[0]
+    except:
+        count = 0
+    return {"model_exists": model_exists, "trade_log_count": count, "algo": "xgboost" if model_exists else "none"}
 
 @app.get("/ai_performance")
-def ai_performance():
+async def ai_performance():
     if not os.path.exists(LOG_PATH):
-        return {"error": "no_log"}
+        return {"total_signals":0, "winrate":0.0, "profit_factor":0.0, "model_status": "no_model"}
     df = pd.read_csv(LOG_PATH)
-    total = len(df)
-    winrate = np.random.uniform(70, 90)
-    profit_factor = np.random.uniform(1.5, 3.0)
-    return {"total_signals": total, "winrate": round(winrate, 2), "profit_factor": round(profit_factor, 2)}
+    total = df.shape[0]
+    wins = df[df["hit"] == "TP"].shape[0] if "hit" in df.columns else 0
+    losses = df[df["hit"] == "SL"].shape[0] if "hit" in df.columns else 0
+    winrate = round((wins / total) * 100, 2) if total > 0 else 0.0
+    gross_win = df[df["hit"] == "TP"]["pnl"].sum() if "pnl" in df.columns else 0.0
+    gross_loss = abs(df[df["hit"] == "SL"]["pnl"].sum()) if "pnl" in df.columns else 0.0
+    pf = round((gross_win / gross_loss) if gross_loss > 0 else (gross_win if gross_win > 0 else 0.0), 3)
+    return {"total_signals": total, "winrate": winrate, "profit_factor": pf, "model_status": "loaded" if MODEL is not None else "not_loaded"}
 
+# ------------------------------
+# 🧾 LOGS SUMMARY (recent)
+# ------------------------------
 @app.get("/logs_summary")
-def logs_summary():
-    if not os.path.exists(LOG_PATH):
-        return {"error": "no_log"}
-    df = pd.read_csv(LOG_PATH)
-    return df.iloc[-1].to_dict()
+async def logs_summary(limit: int = 10):
+    try:
+        if not os.path.exists(LOG_PATH):
+            return {"detail": "no_log"}
+        df = pd.read_csv(LOG_PATH)
+        df = df.tail(limit).fillna("")
+        recs = df.to_dict(orient="records")
+        return {"recent": recs}
+    except Exception as e:
+        return JSONResponse({"error":"exception","detail":str(e)}, status_code=500)
 
-@app.get("/set_mode")
-def set_mode(mode: str):
-    os.environ["TRADING_MODE"] = mode
-    return {"mode": mode, "message": f"Mode trading diubah ke {mode}"}
+# ------------------------------
+# 🔁 RETRAIN TRIGGER (manual)
+# ------------------------------
+@app.post("/retrain_learning")
+async def retrain_learning(force: Optional[str] = Form(None)):
+    try:
+        force_flag = str(force).lower() == "true"
+        res = retrain_model(force=force_flag)
+        # optional notify via telegram
+        try:
+            msg = f"🔁 Retrain result: {res}"
+            telegram_notify(msg)
+        except:
+            pass
+        return res
+    except Exception as e:
+        return JSONResponse({"error":"exception","detail":str(e)}, status_code=500)
 
-# ============================================================
-# MAIN RUNNER
-# ============================================================
+# ------------------------------
+# ✅ HEALTH
+# ------------------------------
+@app.get("/health")
+async def health():
+    return {"status":"ok","time": dt.datetime.utcnow().isoformat()}
+
+# ------------------------------
+# 🔚 START Uvicorn (jika file dijalankan langsung)
+# ------------------------------
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.getenv("PORT", 8000))
-    print(f"\n Pro Trader AI Hybrid berjalan di port {port}\n")
-    uvicorn.run("main_combined_learning_hybrid:app", host="0.0.0.0", port=port, reload=False)
+    port = int(os.getenv("PORT", "8000"))
+    print("Starting Pro Trader AI Agent on port", port)
+    uvicorn.run("main_combined_learning_full_backtest:app", host="0.0.0.0", port=port, log_level="info")

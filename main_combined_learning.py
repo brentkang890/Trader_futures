@@ -223,6 +223,43 @@ def fetch_ohlc_finnhub(symbol: str, interval: str="15m", limit: int=500) -> pd.D
     df["volume"] = j.get("v", [0]*len(df))
     df = df.set_index("timestamp").tail(limit)
     return df
+    
+# ================= PATCH START =================
+# Tambahkan setelah fungsi fetch_ohlc_finnhub()
+
+FMP_API_KEY = os.getenv("FMP_API_KEY", "")
+
+def fetch_ohlc_fmp(symbol: str, interval: str="15m", limit: int=500) -> pd.DataFrame:
+    """
+    Free fallback via Financial Modeling Prep (FMP)
+    Supports forex and metals (XAUUSD/XAGUSD) through workaround.
+    """
+    if not FMP_API_KEY:
+        raise RuntimeError("FMP_API_KEY_not_set")
+    try:
+        mapping = {
+            "1m": "1min", "3m": "5min", "5m": "5min", "15m": "15min",
+            "30m": "30min", "1h": "1hour", "4h": "4hour", "1d": "1day"
+        }
+        iv = mapping.get(interval, "15min")
+        sym = symbol.upper().replace("/", "")
+        url = f"https://financialmodelingprep.com/api/v3/historical-chart/{iv}/{sym}?apikey={FMP_API_KEY}"
+        r = requests.get(url, timeout=10)
+        j = r.json()
+        if not isinstance(j, list) or len(j) == 0:
+            raise RuntimeError(f"FMP returned no data for {sym}")
+        df = pd.DataFrame(j)
+        for c in ["open", "high", "low", "close"]:
+            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
+        df["timestamp"] = pd.to_datetime(df["date"], errors="coerce")
+        df = df[["timestamp", "open", "high", "low", "close"]].set_index("timestamp").sort_index()
+        df["volume"] = 0.0
+        print(f"[FETCH] ✅ FMP OK — got {len(df)} candles for {sym}")
+        return df.tail(limit)
+    except Exception as e:
+        raise RuntimeError(f"FMP fetch fail for {symbol}: {e}")
+
+# ================= PATCH END =================
 
 def fetch_ohlc_any(symbol: str, interval: str = "15m", limit: int = 500) -> pd.DataFrame:
     """
@@ -289,9 +326,19 @@ def fetch_ohlc_any(symbol: str, interval: str = "15m", limit: int = 500) -> pd.D
         return df
     except Exception as e:
         print(f"[FETCH] ⚠️ Finnhub failed for {original_symbol}: {e}")
+        
+     # 🟤 7️⃣ Try FMP fallback (works for XAUUSD, XAGUSD, and forex)
+    try:
+        print(f"[FETCH] 🟤 Trying FMP for {original_symbol}")
+        df = fetch_ohlc_fmp(original_symbol, interval, limit)
+        print(f"[FETCH] ✅ FMP OK — got {len(df)} candles for {original_symbol}")
+        return df
+    except Exception as e:
+        print(f"[FETCH] ⚠️ FMP failed for {original_symbol}: {e}")
 
     # 🔴 7️⃣ All sources failed
     raise RuntimeError(f"All data sources failed for {original_symbol}")
+    
 
 # ---------------- INDICATORS ----------------
 def ema(series: pd.Series, n:int):
@@ -1118,5 +1165,11 @@ def startup_event():
 # ---------------- RUN (if executed directly) ----------------
 if __name__ == "__main__":
     import uvicorn
-    print(f"Starting {APP_NAME} on port {PORT}")
-    uvicorn.run("main_combined_learning_hybrid_pro_final:app", host="0.0.0.0", port=PORT, reload=False)
+    print(f"🚀 Starting {APP_NAME} on port {PORT} (Hybrid PRO Final)")
+    uvicorn.run(
+        "main_combined_learning_hybrid_pro_final:app",
+        host="0.0.0.0",
+        port=PORT,
+        reload=False,
+        log_level="info"   # ✅ tambahkan ini
+    )

@@ -299,6 +299,47 @@ def fetch_ohlc_freeforex(symbol: str, interval: str = "15m", limit: int = 200) -
         return df
     except Exception as e:
         raise RuntimeError(f"FreeForexAPI fail for {symbol}: {e}")
+        
+def fetch_ohlc_fmp_quote(symbol: str, interval: str = "3m", limit: int = 200) -> pd.DataFrame:
+    """
+    FMP quote fallback — ambil harga live XAUUSD lalu buat simulasi candle
+    agar AI tetap bisa jalan meski tanpa historical data.
+    """
+    try:
+        import requests, numpy as np, pandas as pd
+        from datetime import datetime, timedelta
+
+        url = f"https://financialmodelingprep.com/api/v3/quote/{symbol.upper()}?apikey={FMP_API_KEY}"
+        r = requests.get(url, timeout=10)
+        data = r.json()
+        if not data or not isinstance(data, list):
+            raise RuntimeError(f"Invalid FMP quote response: {data}")
+
+        live_price = data[0].get("price") or data[0].get("previousClose")
+        if not live_price:
+            raise RuntimeError("FMP quote did not return price")
+
+        now = datetime.utcnow()
+        # Buat 200 candle simulasi (interval 3m)
+        candles = []
+        for i in range(limit):
+            t = now - timedelta(minutes=i * 3)
+            noise = np.random.normal(0, 0.0008)
+            p = live_price * (1 + noise)
+            candles.append({
+                "timestamp": t,
+                "open": p * (1 + np.random.normal(0, 0.0003)),
+                "high": p * (1 + np.random.uniform(0.0002, 0.0008)),
+                "low": p * (1 - np.random.uniform(0.0002, 0.0008)),
+                "close": p,
+                "volume": np.random.randint(100, 1000)
+            })
+        df = pd.DataFrame(candles).sort_values("timestamp").set_index("timestamp")
+        print(f"[FETCH] ⚙️ FMP fallback — simulated {len(df)} candles from live quote for {symbol}")
+        return df
+
+    except Exception as e:
+        raise RuntimeError(f"FMP quote fallback failed for {symbol}: {e}")
 
 def fetch_ohlc_any(symbol: str, interval: str = "15m", limit: int = 500) -> pd.DataFrame:
     """
@@ -384,7 +425,16 @@ def fetch_ohlc_any(symbol: str, interval: str = "15m", limit: int = 500) -> pd.D
     except Exception as e:
         print(f"[FETCH] ⚠️ FreeForexAPI failed for {original_symbol}: {e}")
 
-    # 🔴 7️⃣ All sources failed
+# 🟣 8️⃣ Try FMP quote fallback (real-time price only)
+    try:
+        if original_symbol.upper() in ["XAUUSD", "XAGUSD", "GOLDUSD"]:
+            print(f"[FETCH] ⚙️ Trying FMP quote fallback for {original_symbol}")
+            df = fetch_ohlc_fmp_quote(original_symbol, interval, limit)
+            return df
+    except Exception as e:
+        print(f"[FETCH] ⚠️ FMP quote fallback failed for {original_symbol}: {e}")
+
+    # 🔴 9️⃣ All data sources failed
     raise RuntimeError(f"All data sources failed for {original_symbol}")
     
 

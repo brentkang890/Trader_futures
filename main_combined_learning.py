@@ -683,7 +683,7 @@ def context(pair: str = Query(...), tf: str = Query("15m")):
     return respond({"pair": p, "mode": m, "last_price": last_price})
 
 @app.get("/pro_signal")
-def pro_signal(pair: str = Query(...), tf_main: str = Query("1h"), tf_entry: str = Query("15m"), limit: int = Query(300), auto_log: bool = Query(False)):
+def pro_signal(pair: str = Query(...), tf_main: str = Query("1h"), tf_entry: str = Query("15m"), limit: int = Query(300), auto_log: bool = Query(True)):
     try:
         # collect multi timeframe data: entry tf + HTF list if possible
         df_dict = {}

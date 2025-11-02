@@ -300,31 +300,41 @@ def fetch_ohlc_freeforex(symbol: str, interval: str = "15m", limit: int = 200) -
     except Exception as e:
         raise RuntimeError(f"FreeForexAPI fail for {symbol}: {e}")
         
-def fetch_ohlc_fmp_quote(symbol: str, interval: str = "3m", limit: int = 200) -> pd.DataFrame:
+def fetch_ohlc_metalslive(symbol: str, interval: str = "3m", limit: int = 200) -> pd.DataFrame:
     """
-    FMP quote fallback — ambil harga live XAUUSD lalu buat simulasi candle
-    agar AI tetap bisa jalan meski tanpa historical data.
+    Metals.live real-time gold/silver spot API (no key, free forever)
+    Generates simulated candles from live price feed
     """
     try:
         import requests, numpy as np, pandas as pd
         from datetime import datetime, timedelta
 
-        url = f"https://financialmodelingprep.com/api/v3/quote/{symbol.upper()}?apikey={FMP_API_KEY}"
-        r = requests.get(url, timeout=10)
-        data = r.json()
-        if not data or not isinstance(data, list):
-            raise RuntimeError(f"Invalid FMP quote response: {data}")
+        sym = symbol.upper()
+        if sym not in ["XAUUSD", "XAGUSD", "GOLDUSD", "SILVERUSD"]:
+            raise RuntimeError("Symbol not supported by Metals.Live")
 
-        live_price = data[0].get("price") or data[0].get("previousClose")
+        url = "https://api.metals.live/v1/spot"
+        r = requests.get(url, timeout=10)
+        j = r.json()
+        if not isinstance(j, list):
+            raise RuntimeError(f"Invalid metals.live response: {j}")
+
+        # cari harga emas atau perak
+        live_price = None
+        for item in j:
+            if isinstance(item, dict):
+                if sym.startswith("XAU") and "gold" in item:
+                    live_price = float(item["gold"])
+                if sym.startswith("XAG") and "silver" in item:
+                    live_price = float(item["silver"])
         if not live_price:
-            raise RuntimeError("FMP quote did not return price")
+            raise RuntimeError("No live price found for metals")
 
         now = datetime.utcnow()
-        # Buat 200 candle simulasi (interval 3m)
         candles = []
         for i in range(limit):
             t = now - timedelta(minutes=i * 3)
-            noise = np.random.normal(0, 0.0008)
+            noise = np.random.normal(0, 0.001)
             p = live_price * (1 + noise)
             candles.append({
                 "timestamp": t,
@@ -335,11 +345,10 @@ def fetch_ohlc_fmp_quote(symbol: str, interval: str = "3m", limit: int = 200) ->
                 "volume": np.random.randint(100, 1000)
             })
         df = pd.DataFrame(candles).sort_values("timestamp").set_index("timestamp")
-        print(f"[FETCH] ⚙️ FMP fallback — simulated {len(df)} candles from live quote for {symbol}")
+        print(f"[FETCH] ✅ Metals.Live OK — simulated {len(df)} candles from live price for {symbol}")
         return df
-
     except Exception as e:
-        raise RuntimeError(f"FMP quote fallback failed for {symbol}: {e}")
+        raise RuntimeError(f"Metals.Live fetch failed for {symbol}: {e}")
 
 def fetch_ohlc_any(symbol: str, interval: str = "15m", limit: int = 500) -> pd.DataFrame:
     """
@@ -425,14 +434,14 @@ def fetch_ohlc_any(symbol: str, interval: str = "15m", limit: int = 500) -> pd.D
     except Exception as e:
         print(f"[FETCH] ⚠️ FreeForexAPI failed for {original_symbol}: {e}")
 
-# 🟣 8️⃣ Try FMP quote fallback (real-time price only)
+# 🟣 8️⃣ Try Metals.Live fallback (real-time gold/silver)
     try:
         if original_symbol.upper() in ["XAUUSD", "XAGUSD", "GOLDUSD"]:
-            print(f"[FETCH] ⚙️ Trying FMP quote fallback for {original_symbol}")
-            df = fetch_ohlc_fmp_quote(original_symbol, interval, limit)
+            print(f"[FETCH] ⚙️ Trying Metals.Live fallback for {original_symbol}")
+            df = fetch_ohlc_metalslive(original_symbol, interval, limit)
             return df
     except Exception as e:
-        print(f"[FETCH] ⚠️ FMP quote fallback failed for {original_symbol}: {e}")
+        print(f"[FETCH] ⚠️ Metals.Live fallback failed for {original_symbol}: {e}")
 
     # 🔴 9️⃣ All data sources failed
     raise RuntimeError(f"All data sources failed for {original_symbol}")

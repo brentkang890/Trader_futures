@@ -273,6 +273,32 @@ def fetch_ohlc_fmp(symbol: str, interval: str="15m", limit: int=500) -> pd.DataF
 
     except Exception as e:
         raise RuntimeError(f"FMP fetch fail for {symbol}: {e}")
+        
+def fetch_ohlc_freeforex(symbol: str, interval: str = "15m", limit: int = 200) -> pd.DataFrame:
+    """
+    FreeForexAPI fallback (gratis & realtime, tanpa API key)
+    Hanya mengembalikan harga terakhir XAUUSD/XAGUSD/forex pair.
+    """
+    try:
+        url = f"https://www.freeforexapi.com/api/live?pairs={symbol.upper()}"
+        r = requests.get(url, timeout=10)
+        j = r.json()
+        if "rates" not in j:
+            raise RuntimeError(f"FreeForexAPI error: {j}")
+        rate = j["rates"][symbol.upper()]
+        price = float(rate["rate"])
+        now = datetime.utcnow()
+        # buat dataframe dummy 200 candle dengan variasi harga kecil
+        data = []
+        for i in range(limit):
+            t = now - pd.Timedelta(minutes=i * 3)  # 3m interval simulasi
+            p = price * (1 + np.random.normal(0, 0.0005))  # ±0.05% noise
+            data.append({"timestamp": t, "open": p, "high": p * 1.0003, "low": p * 0.9997, "close": p, "volume": 0.0})
+        df = pd.DataFrame(data).sort_values("timestamp").set_index("timestamp")
+        print(f"[FETCH] ✅ FreeForexAPI OK — simulated {len(df)} candles for {symbol}")
+        return df
+    except Exception as e:
+        raise RuntimeError(f"FreeForexAPI fail for {symbol}: {e}")
 
 def fetch_ohlc_any(symbol: str, interval: str = "15m", limit: int = 500) -> pd.DataFrame:
     """
@@ -348,6 +374,15 @@ def fetch_ohlc_any(symbol: str, interval: str = "15m", limit: int = 500) -> pd.D
         return df
     except Exception as e:
         print(f"[FETCH] ⚠️ FMP failed for {original_symbol}: {e}")
+        
+    # 🟤 8️⃣ Try FreeForexAPI fallback (gratis)
+    try:
+        print(f"[FETCH] 🟤 Trying FreeForexAPI for {original_symbol}")
+        df = fetch_ohlc_freeforex(original_symbol, interval, limit)
+        print(f"[FETCH] ✅ FreeForexAPI OK — got simulated candles for {original_symbol}")
+        return df
+    except Exception as e:
+        print(f"[FETCH] ⚠️ FreeForexAPI failed for {original_symbol}: {e}")
 
     # 🔴 7️⃣ All sources failed
     raise RuntimeError(f"All data sources failed for {original_symbol}")

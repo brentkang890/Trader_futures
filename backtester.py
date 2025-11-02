@@ -1,123 +1,187 @@
-# ai_backtester.py
-# FastAPI microservice to receive signals from AI Agent and simulate short-term backtests
+# ======================================================
+#  AI Agent - ProTrader Hybrid ICT + ML
+#  Version: Final Integrated with Backtester & Hybrid Self-Learning
+# ======================================================
 
-import os
-import requests
-import pandas as pd
-import numpy as np
-from datetime import datetime, timedelta
-from fastapi import FastAPI, Request, HTTPException
-from pydantic import BaseModel
+import os, json, time, threading, requests, pandas as pd, numpy as np
+from datetime import datetime
+from fastapi import FastAPI, Query
+from typing import Optional
+from utils import (
+    generate_signal,
+    append_trade_log,
+    send_telegram_notification,
+    retrain_learning
+)
+import schedule
 
-# ============= CONFIG =============
-BINANCE_URL = "https://api.binance.com/api/v3/klines"
-DEFAULT_LOOKAHEAD = int(os.getenv("LOOKAHEAD_BARS", "100"))  # number of candles to look ahead
-INTERVAL = os.getenv("DEFAULT_INTERVAL", "15m")
-TIMEFRAME_MAP = {"m": "min", "h": "hour", "d": "day"}
+app = FastAPI(title="ProTraderAI", version="1.6")
 
-app = FastAPI(title="AI Backtester", version="1.0")
+# ======================================================
+#   SIGNAL GENERATOR (MAIN)
+# ======================================================
+@app.get("/pro_signal")
+def pro_signal(
+    pair: str = Query(...),
+    tf_main: str = Query("1h"),
+    tf_entry: str = Query("15m"),
+    auto_log: bool = Query(True)
+):
+    """
+    Generate AI-driven trading signal (ICT + Hybrid + ML)
+    Now automatically sends the result to Backtester.
+    """
+    print(f"[PRO_SIGNAL] Generating signal for {pair} ({tf_entry}) at {datetime.utcnow()}")
 
-# ============= MODELS =============
-class SignalInput(BaseModel):
-    pair: str
-    timeframe: str
-    side: str
-    entry: float
-    tp1: float
-    tp2: float
-    sl: float
-    confidence: float
-    timestamp: str
-
-# ============= HELPERS =============
-def fetch_ohlc_binance(symbol: str, interval: str = "15m", limit: int = 500) -> pd.DataFrame:
     try:
-        url = f"{BINANCE_URL}?symbol={symbol.upper()}&interval={interval}&limit={limit}"
-        r = requests.get(url, timeout=15)
-        data = r.json()
-        if not isinstance(data, list):
-            raise ValueError(f"Invalid Binance response: {data}")
-        df = pd.DataFrame(data, columns=[
-            "open_time","open","high","low","close","volume",
-            "close_time","qav","num_trades","tbbav","tbqav","ignore"
-        ])
-        df["open"] = df["open"].astype(float)
-        df["high"] = df["high"].astype(float)
-        df["low"] = df["low"].astype(float)
-        df["close"] = df["close"].astype(float)
-        df["timestamp"] = pd.to_datetime(df["open_time"], unit="ms")
-        return df[["timestamp","open","high","low","close"]]
+        # ======== 1️⃣ Jalankan Analisis ========
+        signal_result = generate_signal(pair, tf_main, tf_entry)
+        if not signal_result:
+            return {"error": "no signal generated"}
+
+        # Tambah metadata
+        signal_result["pair"] = pair.upper()
+        signal_result["tf_entry"] = tf_entry
+        signal_result["timestamp"] = datetime.utcnow().isoformat()
+
+        # ======== 2️⃣ Kirim ke Backtester ========
+        BACKTEST_URL = os.getenv("BACKTEST_URL", "")
+        if BACKTEST_URL:
+            try:
+                payload = signal_result.copy()
+                payload["timeframe"] = payload.pop("tf_entry", "15m")
+                payload["side"] = payload.pop("signal_type", "LONG")
+                print(f"[PRO_SIGNAL] Sending signal to Backtester: {BACKTEST_URL}")
+                resp = requests.post(BACKTEST_URL, json=payload, timeout=15)
+                bt_result = resp.json()
+                print(f"[PRO_SIGNAL] Backtest response: {bt_result}")
+                signal_result["backtest_result"] = bt_result
+
+                # Telegram Notif Backtest
+                if "hit" in bt_result:
+                    msg = (
+                        f"📋 <b>Backtest Result</b>\n"
+                        f"Pair: <code>{signal_result['pair']}</code>\n"
+                        f"TF: {signal_result.get('timeframe','15m')}\n"
+                        f"Result: <b>{bt_result.get('hit','-')}</b>\n"
+                        f"PnL: {bt_result.get('pnl_total',0)}%\n"
+                        f"Bars: {bt_result.get('bars_to_hit','-')}"
+                    )
+                    try:
+                        send_telegram_notification(msg)
+                    except Exception as e:
+                        print(f"[AI→TG] ⚠️ Telegram notify failed: {e}")
+
+            except Exception as e:
+                print(f"[AI→BT] ⚠️ Backtest error: {e}")
+        else:
+            print("[AI→BT] ⚠️ BACKTEST_URL not set")
+
+        # ======== 3️⃣ Simpan Log ========
+        try:
+            log_path = os.getenv("LOG_PATH", "trade_log.csv")
+            append_trade_log(signal_result, log_path)
+            print(f"[PRO_SIGNAL] ✅ Signal saved to {log_path}")
+        except Exception as e:
+            print(f"[PRO_SIGNAL] ⚠️ Log save error: {e}")
+
+        return signal_result
+
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Fetch error: {e}")
+        print(f"[PRO_SIGNAL] ❌ Error generating signal: {e}")
+        return {"error": str(e)}
 
-def simulate_trade(df: pd.DataFrame, signal: SignalInput) -> dict:
+# ======================================================
+#   HYBRID SELF-LEARNING SYSTEM (Auto Retrain)
+# ======================================================
+
+def evaluate_ai_performance():
     """
-    Simulate what happens after the signal entry.
-    We'll check if TP1, TP2, or SL hit first.
+    Evaluate last 100 backtested trades from trade_log.csv
+    and trigger auto retrain if accuracy drops.
     """
-    # only consider candles *after* the signal time
-    start_idx = df[df["timestamp"] > pd.to_datetime(signal.timestamp)].index
-    if len(start_idx) == 0:
-        return {"error": "No future data to backtest."}
-    start_idx = start_idx[0]
-    future_df = df.iloc[start_idx:start_idx+DEFAULT_LOOKAHEAD].copy()
-    hit, pnl, bars = "NO_HIT", 0.0, 0
-    if signal.side.upper() == "LONG":
-        for i, row in enumerate(future_df.itertuples(), 1):
-            if row.low <= signal.sl:
-                hit, pnl = "SL", (signal.sl - signal.entry) / signal.entry * 100
-                bars = i
-                break
-            if row.high >= signal.tp1:
-                hit, pnl = "TP1", (signal.tp1 - signal.entry) / signal.entry * 100
-                bars = i
-                if row.high >= signal.tp2:
-                    hit, pnl = "TP2", (signal.tp2 - signal.entry) / signal.entry * 100
-                break
-    else:
-        for i, row in enumerate(future_df.itertuples(), 1):
-            if row.high >= signal.sl:
-                hit, pnl = "SL", (signal.entry - signal.sl) / signal.entry * 100
-                bars = i
-                break
-            if row.low <= signal.tp1:
-                hit, pnl = "TP1", (signal.entry - signal.tp1) / signal.entry * 100
-                bars = i
-                if row.low <= signal.tp2:
-                    hit, pnl = "TP2", (signal.entry - signal.tp2) / signal.entry * 100
-                break
-    if bars == 0:
-        bars = len(future_df)
-    return {
-        "hit": hit,
-        "pnl_total": round(pnl, 3),
-        "bars_to_hit": bars,
-        "details": {
-            "duration_minutes": bars * int(signal.timeframe[:-1]) if signal.timeframe[-1] == "m" else bars,
-            "timestamp_entry": signal.timestamp,
-            "timestamp_end": str(future_df.iloc[-1]["timestamp"])
-        }
-    }
+    log_path = os.getenv("LOG_PATH", "trade_log.csv")
+    if not os.path.exists(log_path):
+        print("[AI] ⚠️ No trade_log.csv found for evaluation.")
+        return
 
-# ============= ROUTES =============
-@app.get("/")
-def home():
-    return {"status": "AI Backtester running", "version": "1.0"}
+    try:
+        df = pd.read_csv(log_path)
+        if len(df) < 20:
+            print("[AI] Not enough data for evaluation.")
+            return
 
-@app.post("/backtest")
-def backtest_signal(sig: SignalInput):
-    df = fetch_ohlc_binance(sig.pair)
-    result = simulate_trade(df, sig)
-    return result
+        df = df.tail(100)
+        df["result"] = df["backtest_result"].apply(
+            lambda x: "TP" if "TP" in str(x) else ("SL" if "SL" in str(x) else "NONE")
+        )
+        total = len(df)
+        wins = len(df[df["result"].str.contains("TP")])
+        winrate = round((wins / total) * 100, 2)
 
-# optional healthcheck route
+        def extract_pnl(val):
+            try:
+                if isinstance(val, str) and "pnl_total" in val:
+                    import re, json
+                    j = json.loads(val.replace("'", '"'))
+                    return j.get("pnl_total", 0)
+            except Exception:
+                return 0
+            return 0
+
+        df["pnl"] = df["backtest_result"].apply(extract_pnl)
+        avg_pnl = round(df["pnl"].mean(), 3)
+        profit_factor = round(abs(
+            df[df["pnl"] > 0]["pnl"].sum() / df[df["pnl"] < 0]["pnl"].sum()), 2
+        ) if len(df[df["pnl"] < 0]) > 0 else np.inf
+
+        report_msg = (
+            f"📈 <b>Weekly AI Performance</b>\n"
+            f"✅ Winrate: {winrate}%\n"
+            f"💰 Avg PnL: {avg_pnl}%\n"
+            f"⚙️ Profit Factor: {profit_factor}\n"
+        )
+
+        print(report_msg)
+        send_telegram_notification(report_msg)
+
+        # retrain jika performa turun
+        if winrate < 60:
+            retrain_msg = f"⚠️ Winrate dropped to {winrate}%. Retraining AI model..."
+            print(retrain_msg)
+            send_telegram_notification(retrain_msg)
+            try:
+                retrain_learning()
+                send_telegram_notification("✅ Retraining completed successfully.")
+            except Exception as e:
+                print("[AI Retrain Error]", e)
+                send_telegram_notification(f"❌ Retraining failed: {e}")
+
+    except Exception as e:
+        print("[AI Eval Error]", e)
+
+# Jadwal evaluasi setiap 7 hari
+def start_scheduler():
+    schedule.every(7).days.do(evaluate_ai_performance)
+    while True:
+        schedule.run_pending()
+        time.sleep(3600)  # cek setiap jam
+
+# Thread background agar jalan terus
+threading.Thread(target=start_scheduler, daemon=True).start()
+
+# ======================================================
+#   HEALTH CHECK
+# ======================================================
 @app.get("/ping")
 def ping():
     return {"pong": True, "time": datetime.utcnow().isoformat()}
 
-# ============= MAIN =============
+# ======================================================
+#   MAIN APP RUNNER
+# ======================================================
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.getenv("PORT", "8080"))
-    print(f" AI Backtester running on port {port}")
-    uvicorn.run("ai_backtester:app", host="0.0.0.0", port=port, reload=False)
+    port = int(os.getenv("PORT", 8080))
+    print(f"\n🔥 ProTraderAI Final Active - Port {port}\n")
+    uvicorn.run("main_combined_learning:app", host="0.0.0.0", port=port, reload=False)

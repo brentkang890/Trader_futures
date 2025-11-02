@@ -98,6 +98,7 @@ def append_trade_log(data: dict):
             ])
     except Exception as e:
         print("[LOG ERROR]", e)
+
 # ============================================================
 # 🧠 CONTINUOUS LEARNING + TELEGRAM NOTIFY
 # ============================================================
@@ -227,6 +228,7 @@ def fetch_ohlc_twelvedata(symbol: str, interval: str = "15m", limit: int = 500) 
         return df[["timestamp","open","high","low","close"]].set_index("timestamp").sort_index()
     except Exception as e:
         raise RuntimeError(f"TwelveData fetch error: {e}")
+
 # ============================================================
 # 🧭 SMART MONEY CONCEPTS (SMC) + ICT PRO ENGINE
 # ============================================================
@@ -494,6 +496,7 @@ def predict_confidence_xgb(model, signal_data: dict):
         return round(float(prob), 3)
     except Exception:
         return None
+
 # ============================================================
 # ⚡ FASTAPI MAIN APP — PROTRADERAI HYBRID ENGINE
 # ============================================================
@@ -641,6 +644,7 @@ def analyze_chart(file: UploadFile = File(...)):
     except Exception:
         pass
     return signal
+
 # ============================================================
 # 📊 LEARNING STATUS + RETRAIN + PERFORMANCE ENDPOINTS
 # ============================================================

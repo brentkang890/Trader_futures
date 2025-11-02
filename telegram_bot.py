@@ -1,7 +1,10 @@
-# telegram_bot_full.py
-# ProTraderAI - Full Telegram Bot (manual + auto-scan + status/logs/performance + csv/image + retrain)
-# Requires environment variables: BOT_TOKEN, CHAT_ID, APP_URL
-# Requirements: python-telegram-bot==20.3, requests, apscheduler
+# telegram_bot.py
+# ProTraderAI - Telegram Bot with Auto-scan & Backtest integration
+# Env required: BOT_TOKEN, CHAT_ID, APP_URL
+# Optional envs: API_TIMEOUT, STRONG_SIGNAL_THRESHOLD, AUTO_SCAN_HOURS, AUTO_TIMEFRAMES,
+#               ENABLE_BACKTEST, ENABLE_CHART_IMAGE, ENABLE_VOICE_ALERT, DELAY_BETWEEN_REQUESTS
+#
+# Dependencies: python-telegram-bot==20.3, requests, apscheduler
 
 import os
 import re
@@ -17,41 +20,38 @@ from telegram.ext import (
 
 from apscheduler.schedulers.background import BackgroundScheduler
 
-# ---------------- CONFIG ----------------
-BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-CHAT_ID = os.getenv("CHAT_ID", "")  # destination chat id for auto signals (string or int)
+# ---------------- CONFIG (from env) ----------------
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+CHAT_ID = os.getenv("CHAT_ID", "").strip()  # destination chat id for auto signals
 APP_URL = os.getenv("APP_URL", "").rstrip("/")
 if APP_URL and not APP_URL.startswith("http"):
     APP_URL = "https://" + APP_URL
 
 API_TIMEOUT = int(os.getenv("API_TIMEOUT", "25"))
-STRONG_SIGNAL_THRESHOLD = float(os.getenv("STRONG_SIGNAL_THRESHOLD", "0.8"))
-AUTO_SCAN_HOURS = int(os.getenv("AUTO_SCAN_HOURS", "1"))  # default 1 hour
-AUTO_TIMEFRAMES = os.getenv("AUTO_TIMEFRAMES", "15m,1h,4h").split(",")
+STRONG_SIGNAL_THRESHOLD = float(os.getenv("STRONG_SIGNAL_THRESHOLD", "0.75"))
+AUTO_SCAN_HOURS = int(os.getenv("AUTO_SCAN_HOURS", "1"))
+AUTO_TIMEFRAMES = os.getenv("AUTO_TIMEFRAMES", "3m,5m,15m,1h,4h,1d").split(",")
+DELAY_BETWEEN_REQUESTS = float(os.getenv("DELAY_BETWEEN_REQUESTS", "0.6"))
 
-AUTO_PAIRS_CRYPTO = os.getenv("AUTO_PAIRS_CRYPTO", "").strip()
-AUTO_PAIRS_FOREX = os.getenv("AUTO_PAIRS_FOREX", "").strip()
+ENABLE_BACKTEST = os.getenv("ENABLE_BACKTEST", "true").lower() in ("1", "true", "yes")
+ENABLE_CHART_IMAGE = os.getenv("ENABLE_CHART_IMAGE", "true").lower() in ("1", "true", "yes")
+ENABLE_VOICE_ALERT = os.getenv("ENABLE_VOICE_ALERT", "false").lower() in ("1", "true", "yes")
 
-if AUTO_PAIRS_CRYPTO:
-    AUTO_PAIRS_CRYPTO = [p.strip().upper() for p in AUTO_PAIRS_CRYPTO.split(",")]
+# Pairs: try to respect user's env or fallback to full list (crypto + forex)
+PAIR_LIST_ENV = os.getenv("PAIR_LIST", "").strip()
+if PAIR_LIST_ENV:
+    AUTO_PAIRS = [p.strip().upper() for p in PAIR_LIST_ENV.split(",") if p.strip()]
 else:
-    AUTO_PAIRS_CRYPTO = [
+    AUTO_PAIRS = [
         "BTCUSDT","ETHUSDT","SOLUSDT","BNBUSDT","XRPUSDT","ADAUSDT","LTCUSDT","DOGEUSDT",
-        "MATICUSDT","DOTUSDT","AVAXUSDT","LINKUSDT"
+        "MATICUSDT","DOTUSDT","AVAXUSDT","LINKUSDT",
+        "XAUUSD","EURUSD","GBPUSD","USDJPY","AUDUSD","NZDUSD","USDCAD","USDCHF"
     ]
-
-if AUTO_PAIRS_FOREX:
-    AUTO_PAIRS_FOREX = [p.strip().upper() for p in AUTO_PAIRS_FOREX.split(",")]
-else:
-    AUTO_PAIRS_FOREX = ["XAUUSD","EURUSD","GBPUSD","USDJPY","AUDUSD","NZDUSD","USDCAD","USDCHF"]
-
-AUTO_PAIRS = list(dict.fromkeys(AUTO_PAIRS_CRYPTO + AUTO_PAIRS_FOREX))
 
 # ---------------- STATE ----------------
 scheduler = BackgroundScheduler()
 auto_job = None
 auto_job_lock = Lock()
-auto_enabled = True  # default auto-scan ON
 stop_event = Event()
 
 # ---------------- HELPERS ----------------
@@ -106,7 +106,7 @@ def parse_pair_tf(text: str):
     tf_match = re.search(r"(\d+\s*[MHDW])", t)
     tf = tf_match.group(1).replace(" ", "").lower() if tf_match else "15m"
     # remove verbs
-    t_clean = re.sub(r"\b(ANALISA|ANALYZE|ANALYSE|CHECK|FORCE|SCALP|INFO)\b", " ", t, flags=re.IGNORECASE).strip()
+    t_clean = re.sub(r"\b(ANALISA|ANALYZE|ANALYSE|CHECK|FORCE|SCALP|INFO|BACKTEST)\b", " ", t, flags=re.IGNORECASE).strip()
     # aliases
     aliases = {
         "GOLD": "XAUUSD", "EMAS": "XAUUSD",
@@ -159,6 +159,38 @@ def send_request_post(endpoint: str, files: dict = None, data: dict = None, time
         return {"error": str(e)}
 
 # ---------------- AUTO-SCAN LOGIC ----------------
+def process_signal_and_send(bot, res):
+    """Helper to send message (and optionally chart/voice) for one result dict."""
+    if not isinstance(res, dict):
+        return
+    try:
+        msg = format_signal(res)
+        if not CHAT_ID:
+            print("[AUTO] CHAT_ID not configured; skipping send.")
+            return
+        # send main text
+        bot.send_message(chat_id=int(CHAT_ID), text=msg, parse_mode="HTML")
+        # optionally request & send chart image from backend (endpoint: /signal_chart?pair=...&tf_entry=...)
+        if ENABLE_CHART_IMAGE:
+            try:
+                chart = send_request_get("signal_chart", params={"pair": res.get("pair"), "tf_entry": res.get("timeframe")}, timeout=30)
+                # backend may return {'chart_url': '...'} or binary; we handle chart_url
+                if isinstance(chart, dict) and chart.get("chart_url"):
+                    bot.send_photo(chat_id=int(CHAT_ID), photo=chart.get("chart_url"))
+            except Exception as e:
+                print(f"[AUTO] chart send failed: {e}")
+        # optionally send voice alert (voice file url from backend /voice_alert?pair=...&type=buy/sell)
+        if ENABLE_VOICE_ALERT and res.get("signal_type"):
+            try:
+                vtype = "buy" if res.get("signal_type", "").upper() in ("LONG","BUY") else "sell"
+                voice = send_request_get("voice_alert", params={"pair": res.get("pair"), "type": vtype}, timeout=20)
+                if isinstance(voice, dict) and voice.get("voice_url"):
+                    bot.send_audio(chat_id=int(CHAT_ID), audio=voice.get("voice_url"))
+            except Exception as e:
+                print(f"[AUTO] voice send failed: {e}")
+    except Exception as e:
+        print(f"[AUTO] Error sending signal message: {e}")
+
 def auto_check_and_send(app):
     """
     Iterate AUTO_PAIRS and AUTO_TIMEFRAMES; call /pro_signal; send to CHAT_ID if strong.
@@ -178,19 +210,24 @@ def auto_check_and_send(app):
                     print(f"[AUTO] {pair} {tf} -> error: {res.get('error')}")
                     continue
                 conf = float(res.get("confidence", 0) or 0)
+                # send always if confidence >= threshold and not WAIT
                 if conf >= STRONG_SIGNAL_THRESHOLD and res.get("signal_type") and res.get("signal_type") != "WAIT":
-                    msg = format_signal(res)
-                    try:
-                        if not CHAT_ID:
-                            print("[AUTO] CHAT_ID not configured; skipping send.")
-                        else:
-                            bot.send_message(chat_id=int(CHAT_ID), text=msg, parse_mode="HTML")
-                            print(f"[AUTO] Sent strong signal {pair} {tf} (conf={conf})")
-                    except Exception as e:
-                        print(f"[AUTO ERROR] send_message failed for {pair} {tf}: {e}")
+                    process_signal_and_send(bot, res)
+                    print(f"[AUTO] Sent strong signal {pair} {tf} (conf={conf})")
                 else:
                     print(f"[AUTO] {pair} {tf} no strong signal (conf={conf})")
-                time.sleep(0.6)
+                # optionally call backtest for logging or attach result to the message
+                if ENABLE_BACKTEST:
+                    try:
+                        bt = send_request_post("backtest", data={"pair": pair, "tf_entry": tf}, timeout=60)
+                        # if backend returns backtest summary, we can send condensed info
+                        if isinstance(bt, dict) and bt.get("summary"):
+                            # attach small message with summary
+                            summary_text = f"📋 Backtest {pair} {tf} -> {bt.get('summary')}"
+                            bot.send_message(chat_id=int(CHAT_ID), text=summary_text)
+                    except Exception as e:
+                        print(f"[AUTO] backtest call failed for {pair} {tf}: {e}")
+                time.sleep(DELAY_BETWEEN_REQUESTS)
             except Exception as e:
                 print(f"[AUTO EXC] {pair} {tf}: {e}")
                 time.sleep(0.3)
@@ -200,6 +237,7 @@ def start_auto_job(app):
     global auto_job
     with auto_job_lock:
         if auto_job is None:
+            # schedule immediately first run
             auto_job = scheduler.add_job(lambda: auto_check_and_send(app), 'interval', hours=AUTO_SCAN_HOURS, next_run_time=None)
             print("[AUTO] Job scheduled.")
         else:
@@ -226,7 +264,6 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "- <code>BTCUSDT 15m</code> atau <code>analisa BTCUSDT 15m</code>\n"
         "- <code>force BTCUSDT 15m</code> (tampilkan semua sinyal)\n"
         "- <code>scalp BTCUSDT</code>\n\n"
-        "Upload CSV untuk analisis historis atau kirim gambar chart untuk OCR analysis.\n\n"
         "Command:\n"
         "/status - status model\n"
         "/logs - sinyal terakhir\n"
@@ -239,7 +276,7 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        res = send_request_get("learning_status", params=None)
+        res = send_request_get("learning_status")
         if "error" in res:
             await update.message.reply_text(f"⚠️ {res.get('error')}")
             return
@@ -255,7 +292,7 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def logs_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        res = send_request_get("logs_summary", params=None)
+        res = send_request_get("logs_summary")
         if "error" in res or res is None:
             await update.message.reply_text("⚠️ Belum ada log yang tersimpan.")
             return
@@ -276,7 +313,7 @@ async def logs_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def performance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        res = send_request_get("ai_performance", params=None)
+        res = send_request_get("ai_performance")
         if "error" in res:
             await update.message.reply_text("⚠️ Belum ada data performa AI.")
             return
@@ -291,8 +328,6 @@ async def performance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Gagal mengambil data performa.\nError: {e}")
 
 async def auto_on_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global auto_enabled
-    auto_enabled = True
     try:
         app = context.application
         start_auto_job(app)
@@ -301,8 +336,6 @@ async def auto_on_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Gagal mengaktifkan auto-scan: {e}")
 
 async def auto_off_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global auto_enabled
-    auto_enabled = False
     try:
         stop_auto_job()
         await update.message.reply_text("⛔ Auto-scan dinonaktifkan.")
@@ -314,7 +347,6 @@ async def retrain_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await update.message.reply_text("🧠 Melatih ulang model AI... harap tunggu (proses bisa memakan waktu) ⏳")
 
-        # Kirim request POST ke AI Agent
         if not APP_URL:
             await update.message.reply_text("❌ APP_URL belum dikonfigurasikan di environment.")
             return
@@ -331,7 +363,6 @@ async def retrain_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"❌ Gagal retrain model.\nError: {res.get('error')}")
             return
 
-        # try to show some useful fields returned by backend
         algo = res.get("algo", "XGBoost")
         samples = res.get("samples", res.get("sample_count", "N/A"))
         msg = (
@@ -376,6 +407,16 @@ async def manual_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Error: {res.get('error')}")
         return
 
+    # optionally request backtest for manual check
+    if ENABLE_BACKTEST:
+        try:
+            bt = send_request_post("backtest", data={"pair": pair, "tf_entry": tf}, timeout=60)
+            if isinstance(bt, dict):
+                # attach backtest result into response dict
+                res["backtest"] = bt
+        except Exception as e:
+            print(f"[MANUAL] backtest error: {e}")
+
     conf = float(res.get("confidence", 0) or 0)
     if (not is_force) and conf < STRONG_SIGNAL_THRESHOLD:
         await update.message.reply_text(
@@ -386,6 +427,7 @@ async def manual_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(format_signal(res), parse_mode="HTML")
 
+# ---------------- FILE / IMG / CSV handlers ----------------
 async def handle_csv(update: Update, context: ContextTypes.DEFAULT_TYPE):
     doc = update.message.document
     if not doc:

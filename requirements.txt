@@ -12,3 +12,4 @@ ta
 python-multipart
 python-telegram-bot==20.3
 apscheduler
+schedule

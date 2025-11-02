@@ -1,7 +1,7 @@
-# main_combined_learning.py
 """
-Pro Trader AI - Hybrid Final (Integrated with Backtester & Hybrid Self-Learning)
-Copy-paste this file to your AI Agent project on Railway and redeploy.
+main_combined_learning_hybrid_final.py
+Combined Hybrid: SMC/ICT PRO + Hybrid Technical Engine + XGBoost + RandomForest + Data Fallback
+Compatibility: Designed to work with telegram_bot (2).py as-is (endpoints /pro_signal, /scalp_signal, /analyze_chart, /analyze_csv, /learning_status, /retrain_learning, /ai_performance, /logs_summary, /mode, /context, /health)
 """
 
 import os
@@ -18,7 +18,7 @@ import pandas as pd
 from datetime import datetime
 from typing import Optional, Dict, Any
 from fastapi import FastAPI, Query, UploadFile, File, Form, HTTPException
-from fastapi.responses import JSONResponse, PlainTextResponse
+from fastapi.responses import JSONResponse, FileResponse, PlainTextResponse
 from fastapi.encoders import jsonable_encoder
 
 # technical libs
@@ -27,9 +27,10 @@ import ta
 # ML libs
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import train_test_split
+from sklearn.metrics import classification_report, roc_auc_score
 from xgboost import XGBClassifier
 
-# image libs optional (chart OCR)
+# image libs optional
 try:
     from PIL import Image
     import cv2
@@ -40,12 +41,12 @@ except Exception:
 
 # ---------------- CONFIG ----------------
 APP_NAME = "Pro Trader AI - Hybrid Final"
-PORT = int(os.getenv("PORT", "8000"))
+PORT = int(os.getenv("PORT", 8000))
 TRADE_LOG_FILE = os.getenv("TRADE_LOG_FILE", "trade_log.csv")
 MODEL_RF_FILE = os.getenv("MODEL_RF_FILE", "rf_model.pkl")
 MODEL_XGB_FILE = os.getenv("MODEL_XGB_FILE", "xgb_model.json")
-MIN_SAMPLES_TO_TRAIN = int(os.getenv("MIN_SAMPLES_TO_TRAIN", "50"))
-N_SIGNALS_TO_RETRAIN = int(os.getenv("N_SIGNALS_TO_RETRAIN", "50"))
+MIN_SAMPLES_TO_TRAIN = int(os.getenv("MIN_SAMPLES_TO_TRAIN", 50))
+N_SIGNALS_TO_RETRAIN = int(os.getenv("N_SIGNALS_TO_RETRAIN", 50))
 
 BINANCE_KLINES = "https://api.binance.com/api/v3/klines"
 TWELVEDATA_URL = "https://api.twelvedata.com/time_series"
@@ -53,18 +54,17 @@ TWELVEDATA_API_KEY = os.getenv("TWELVEDATA_API_KEY", "")
 ALPHA_API_KEY = os.getenv("ALPHA_API_KEY", "")
 
 BACKTEST_URL = os.getenv("BACKTEST_URL", "")
+# Risk / account
 RISK_PERCENT = float(os.getenv("RISK_PERCENT", 0.02))
 ACCOUNT_BALANCE = float(os.getenv("ACCOUNT_BALANCE", 0))
 
+# ICT PRO CONFIG
 ICT_KILLZONE_ENABLE = os.getenv("ICT_KILLZONE_ENABLE", "true").lower() == "true"
 ICT_KILLZONE_START = os.getenv("ICT_KILLZONE_START", "06:00")
 ICT_KILLZONE_END = os.getenv("ICT_KILLZONE_END", "12:00")
 ICT_MIN_CONFIRM = float(os.getenv("ICT_MIN_CONFIRM", 0.6))
 ICT_HTF_LIST = os.getenv("ICT_HTF_LIST", "1w,1d,1h").split(",")
 ICT_DEFAULT_ENTRY_TF = os.getenv("ICT_DEFAULT_ENTRY_TF", "15m")
-
-# ---------------- FASTAPI ----------------
-app = FastAPI(title=APP_NAME, version="1.6")
 
 # ---------------- UTIL: SAFE RESPOND ----------------
 def respond(obj: Any, status_code: int = 200):
@@ -130,17 +130,21 @@ def fetch_ohlc_binance(symbol: str, interval: str="15m", limit: int=500) -> pd.D
                 df = df[["timestamp","open","high","low","close","volume"]].set_index("timestamp")
                 return df
     except Exception as e:
+        # silence, fallback later
         pass
     raise RuntimeError(f"Binance fetch fail for {symbol}")
 
 def _format_twelvedata_symbol(s: str) -> str:
     s2 = s.upper().replace(" ", "").replace("_","")
+    # if crypto pair endswith USDT -> map to USD symbol for TwelveData e.g. BTCUSDT -> BTC/USD
     if s2.endswith("USDT"):
         return f"{s2[:-4]}/USD"
     if len(s2) == 6 and s2.endswith("USD"):
+        # e.g. XAUUSD -> XAU/USD
         return f"{s2[:3]}/{s2[3:]}"
     if "/" in s2:
         return s2
+    # default try s as-is
     return s2
 
 def fetch_ohlc_twelvedata(symbol: str, interval: str="15m", limit: int=500) -> pd.DataFrame:
@@ -158,6 +162,7 @@ def fetch_ohlc_twelvedata(symbol: str, interval: str="15m", limit: int=500) -> p
     if j.get("status") == "error" or "values" not in j:
         raise RuntimeError(f"TwelveData error: {j}")
     df = pd.DataFrame(j["values"])
+    # ensure numeric
     for c in ["open","high","low","close","volume"]:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
@@ -179,6 +184,7 @@ def fetch_ohlc_alpha_forex(symbol: str, interval:str="15m", limit:int=500) -> pd
     params = {"function":"FX_INTRADAY","from_symbol":from_sym,"to_symbol":to_sym,"interval":iv,"apikey":ALPHA_API_KEY,"outputsize":"compact"}
     r = requests.get("https://www.alphavantage.co/query", params=params, timeout=12)
     j = r.json()
+    # find timeseries key
     keys = [k for k in j.keys() if "Time Series" in k]
     if not keys:
         raise RuntimeError(f"AlphaVantage no data: {j}")
@@ -194,8 +200,11 @@ def fetch_ohlc_alpha_forex(symbol: str, interval:str="15m", limit:int=500) -> pd
     return df
 
 def fetch_ohlc_any(symbol: str, interval: str="15m", limit:int=500) -> pd.DataFrame:
+    """Try Binance, then TwelveData, then AlphaVantage (with detailed logging)"""
     symbol = symbol.upper().replace(" ", "").replace("/", "")
     print(f"[FETCH] 🔎 Requesting OHLC for {symbol} ({interval}) with limit={limit}")
+
+    # 1️⃣ Binance
     try:
         print(f"[FETCH] 🟢 Trying Binance for {symbol}")
         df = fetch_ohlc_binance(symbol, interval, limit)
@@ -203,6 +212,8 @@ def fetch_ohlc_any(symbol: str, interval: str="15m", limit:int=500) -> pd.DataFr
         return df
     except Exception as e:
         print(f"[FETCH] ⚠️ Binance failed for {symbol}: {e}")
+
+    # 2️⃣ TwelveData
     try:
         print(f"[FETCH] 🟡 Trying TwelveData for {symbol}")
         df = fetch_ohlc_twelvedata(symbol, interval, limit)
@@ -210,6 +221,8 @@ def fetch_ohlc_any(symbol: str, interval: str="15m", limit:int=500) -> pd.DataFr
         return df
     except Exception as e:
         print(f"[FETCH] ⚠️ TwelveData failed for {symbol}: {e}")
+
+    # 3️⃣ AlphaVantage
     try:
         print(f"[FETCH] 🔵 Trying AlphaVantage for {symbol}")
         df = fetch_ohlc_alpha_forex(symbol, interval, limit)
@@ -217,6 +230,7 @@ def fetch_ohlc_any(symbol: str, interval: str="15m", limit:int=500) -> pd.DataFr
         return df
     except Exception as e:
         print(f"[FETCH] ❌ AlphaVantage failed for {symbol}: {e}")
+
     raise RuntimeError(f"All data sources failed for {symbol}")
 
 # ---------------- INDICATORS ----------------
@@ -231,6 +245,7 @@ def atr(df: pd.DataFrame, n:int=14):
 
 # ---------------- SMC / ICT Utilities ----------------
 from datetime import time as dtime
+
 def parse_time(s):
     h, m = map(int, s.split(":"))
     return dtime(h, m)
@@ -337,7 +352,7 @@ def generate_ict_signal(df_dict: Dict[str, pd.DataFrame], pair: str, entry_tf: s
         "confidence": confidence, "reasoning": reasoning
     }
 
-# ---------------- HYBRID TECHNICAL ENGINE ----------------
+# ---------------- HYBRID TECHNICAL ENGINE (from combined v1) ----------------
 def hybrid_analyze(df: pd.DataFrame, pair:Optional[str]=None, timeframe:Optional[str]=None) -> dict:
     df = df.copy().dropna().reset_index(drop=True)
     if df.shape[0] < 12:
@@ -355,6 +370,7 @@ def hybrid_analyze(df: pd.DataFrame, pair:Optional[str]=None, timeframe:Optional
     fib_618 = swing_high - diff*0.618 if diff>0 else price
     reasons, conf = [], []
     trend = "bullish" if ema20 > ema50 else "bearish"
+    # Break of Structure detection
     prev = df['close'].iloc[-2]; last_close = df['close'].iloc[-1]
     bos = None
     if prev <= df['high'].rolling(20).max().iloc[-2] and last_close > df['high'].rolling(20).max().iloc[-2]:
@@ -399,7 +415,7 @@ def hybrid_analyze(df: pd.DataFrame, pair:Optional[str]=None, timeframe:Optional
         "reasoning": reasoning
     }
 
-# ---------------- ML helpers (same as original) ----------------
+# ---------------- ML: RandomForest (backtest) & XGBoost (realtime) ----------------
 _cached_rf = None
 _cached_xgb = None
 
@@ -486,6 +502,7 @@ def load_or_get_rf():
     return None
 
 def train_and_save_xgb(df_log: Optional[pd.DataFrame] = None):
+    # Build X from trade_log similar to earlier XGBoost approach if df_log provided
     if df_log is None or len(df_log) < MIN_SAMPLES_TO_TRAIN:
         return None
     df = df_log.copy()
@@ -544,7 +561,7 @@ def predict_confidence_xgb_from_model(signal_data: dict):
     except Exception:
         return None
 
-# ---------------- SENTIMENT & FUSION ----------------
+# ---------------- SENTIMENT & FUSION (lightweight) ----------------
 def get_crypto_sentiment():
     out = {"fng": None, "btc_dom": None}
     try:
@@ -593,6 +610,7 @@ def _postprocess_with_learning(signal: Dict[str,Any]):
         market = detect_market(signal.get("pair",""))
         crypto_sent = get_crypto_sentiment() if market=="crypto" else None
         model_prob = None
+        # try RF model first
         try:
             rf_mod = load_or_get_rf()
             if rf_mod:
@@ -601,6 +619,7 @@ def _postprocess_with_learning(signal: Dict[str,Any]):
                 signal["model_prob_rf"] = round(model_prob,3)
         except Exception as e:
             signal["model_rf_error"] = str(e)
+        # try XGBoost as additional
         try:
             xgb_prob = predict_confidence_xgb_from_model(signal)
             if xgb_prob is not None:
@@ -629,21 +648,17 @@ def post_to_backtester(payload: Dict[str,Any]) -> Dict[str,Any]:
     if not BACKTEST_URL:
         return {"error":"BACKTEST_URL_not_configured"}
     try:
-        # normalize fields for backtester compatibility
-        payload = payload.copy()
-        if "tf_entry" in payload and "timeframe" not in payload:
-            payload["timeframe"] = payload.pop("tf_entry")
-        if "signal_type" in payload and "side" not in payload:
-            payload["side"] = payload.get("signal_type")
         r = requests.post(BACKTEST_URL, json=payload, timeout=20)
         try:
             return r.json()
-        except Exception:
+        except:
             return {"status_code": r.status_code, "text": r.text}
     except Exception as e:
         return {"error":"backtester_unreachable", "detail": str(e)}
 
 # ---------------- ENDPOINTS ----------------
+app = FastAPI(title=APP_NAME, version="1.0")
+
 @app.get("/health")
 def health():
     return respond({"status":"ok", "service": APP_NAME})
@@ -670,20 +685,27 @@ def context(pair: str = Query(...), tf: str = Query("15m")):
 @app.get("/pro_signal")
 def pro_signal(pair: str = Query(...), tf_main: str = Query("1h"), tf_entry: str = Query("15m"), limit: int = Query(300), auto_log: bool = Query(True)):
     try:
+        # collect multi timeframe data: entry tf + HTF list if possible
         df_dict = {}
+        # entry timeframe
         df_entry = fetch_ohlc_any(pair, tf_entry, limit=limit)
         df_dict[tf_entry] = df_entry
+        # gather HTF samples (try to fetch if available)
         for tf in ICT_HTF_LIST:
             try:
                 df_htf = fetch_ohlc_any(pair, tf, limit=200)
                 df_dict[tf] = df_htf
             except:
                 continue
+        # generate ICT signal
         ict_res = generate_ict_signal(df_dict, pair, tf_entry)
         if "error" in ict_res:
             raise HTTPException(status_code=400, detail=ict_res.get("error"))
+        # Also run hybrid technical engine on entry TF for complementary signal
         hybrid_res = hybrid_analyze(df_entry, pair=pair, timeframe=tf_entry)
+        # prefer ICT signal_type unless it's WAIT then use hybrid
         final = ict_res if ict_res.get("signal_type") != "WAIT" else hybrid_res
+        # ensure pos size safe
         try:
             entry = float(final.get("entry",0)); sl = float(final.get("sl", entry))
             risk_amount = ACCOUNT_BALANCE * RISK_PERCENT if ACCOUNT_BALANCE > 0 else 0
@@ -692,24 +714,24 @@ def pro_signal(pair: str = Query(...), tf_main: str = Query("1h"), tf_entry: str
             pos_size = 0.01
         final["position_size"] = pos_size
         final["timestamp"] = datetime.utcnow().isoformat()
-        # save raw log (without backtest)
+        # append raw log before postprocess
         append_trade_log({
             "pair": final.get("pair"), "timeframe": final.get("timeframe"), "signal_type": final.get("signal_type"),
             "entry": final.get("entry"), "tp1": final.get("tp1"), "tp2": final.get("tp2"), "sl": final.get("sl"),
             "confidence": final.get("confidence"), "reasoning": final.get("reasoning"), "backtest_hit": None, "backtest_pnl": None
         })
+        # try ML models to refine confidence
         final = _postprocess_with_learning(final)
-        # auto backtest & store backtest result
+        # optional auto backtest
         if auto_log and BACKTEST_URL:
             bt = post_to_backtester({
-                "pair": final.get("pair"), "timeframe": final.get("timeframe") or final.get("tf_entry"),
-                "side": final.get("signal_type"), "entry": final.get("entry"),
-                "tp1": final.get("tp1"), "tp2": final.get("tp2"), "sl": final.get("sl"),
-                "timestamp": final.get("timestamp")
+                "pair": final.get("pair"), "timeframe": final.get("timeframe"), "side": final.get("signal_type"),
+                "entry": final.get("entry"), "tp1": final.get("tp1"), "tp2": final.get("tp2"), "sl": final.get("sl")
             })
             final["backtest_raw"] = bt
+            # update last log with backtest results (append new record)
             append_trade_log({
-                "pair": final.get("pair"), "timeframe": final.get("timeframe") or final.get("tf_entry"), "signal_type": final.get("signal_type"),
+                "pair": final.get("pair"), "timeframe": final.get("timeframe"), "signal_type": final.get("signal_type"),
                 "entry": final.get("entry"), "tp1": final.get("tp1"), "tp2": final.get("tp2"), "sl": final.get("sl"),
                 "confidence": final.get("confidence"), "reasoning": final.get("reasoning"),
                 "backtest_hit": bt.get("hit") if isinstance(bt, dict) else None, "backtest_pnl": bt.get("pnl_total") if isinstance(bt, dict) else None
@@ -786,13 +808,16 @@ def analyze_chart(file: UploadFile = File(...), pair: Optional[str] = Form(None)
         img_cv = cv2.cvtColor(np.array(pil), cv2.COLOR_RGB2BGR)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"invalid_image: {e}")
+    # Best-effort OCR + candle detection (reuse earlier helpers if available)
     try:
+        # Simple OCR for words (long/buy/sell)
         txt = pytesseract.image_to_string(Image.open(io.BytesIO(contents))).lower()
         signals = {"long":0,"short":0,"buy":0,"sell":0,"bullish":0,"bearish":0}
         for k in signals.keys():
             signals[k] = len(re.findall(k, txt))
         bias = "LONG" if signals["long"]+signals["bullish"]+signals["buy"] > signals["short"]+signals["bearish"]+signals["sell"] else "SHORT"
         reasoning = f"OCR words: {signals}, bias={bias}"
+        # fallback fake numeric guess
         entry = round(np.random.uniform(1000,2000),2)
         sl = round(entry - np.random.uniform(5,50),2)
         tp1 = round(entry + np.random.uniform(10,100),2)
@@ -820,6 +845,7 @@ def retrain_learning():
         rf_res = train_and_save_rf()
     except Exception as e:
         rf_res = {"error": str(e)}
+    # retrain xgb from CSV log if exists
     try:
         df = pd.read_csv(TRADE_LOG_FILE) if os.path.exists(TRADE_LOG_FILE) else None
         xgb_res = train_and_save_xgb(df)
@@ -887,87 +913,8 @@ def startup_event():
         except Exception as e:
             print("[startup] xgb load fail:", e)
 
-# ---------------- HYBRID SELF-LEARNING SCHEDULER ----------------
-import schedule
-def evaluate_ai_performance():
-    log_path = TRADE_LOG_FILE
-    if not os.path.exists(log_path):
-        print("[AI] ⚠️ No trade_log.csv found for evaluation.")
-        return
-    try:
-        df = pd.read_csv(log_path)
-        if len(df) < 20:
-            print("[AI] Not enough data for evaluation.")
-            return
-        df = df.tail(100)
-        df["result"] = df["backtest_hit"].apply(lambda x: "TP" if str(x).upper().startswith("TP") else ("SL" if str(x).upper().startswith("SL") else "NONE"))
-        total = len(df)
-        wins = len(df[df["result"]=="TP"])
-        winrate = round((wins/total)*100,2)
-        def extract_pnl(val):
-            try:
-                if pd.isna(val):
-                    return 0.0
-                return float(val)
-            except:
-                # try parse json-like
-                try:
-                    j = json.loads(str(val).replace("'", '"'))
-                    return float(j.get("pnl_total",0))
-                except:
-                    return 0.0
-        df["pnl"] = df["backtest_pnl"].apply(extract_pnl)
-        avg_pnl = round(df["pnl"].mean(),3)
-        profit_factor = None
-        if len(df[df["pnl"]<0])>0:
-            prof = df[df["pnl"]>0]["pnl"].sum(); loss = abs(df[df["pnl"]<0]["pnl"].sum())
-            profit_factor = round(prof/loss,2) if loss != 0 else None
-        report_msg = (
-            f"📈 <b>Weekly AI Performance</b>\n"
-            f"✅ Winrate: {winrate}%\n"
-            f"💰 Avg PnL: {avg_pnl}%\n"
-            f"⚙️ Profit Factor: {profit_factor}\n"
-        )
-        print(report_msg)
-        # send if function exists
-        try:
-            # try sending to telegram if helper exists
-            if 'send_telegram_notification' in globals():
-                send_telegram_notification(report_msg)
-        except Exception as e:
-            print("[AI Eval] Telegram notify failed:", e)
-        if winrate < 60:
-            retrain_msg = f"⚠️ Winrate dropped to {winrate}%. Retraining AI model..."
-            print(retrain_msg)
-            try:
-                if 'send_telegram_notification' in globals():
-                    send_telegram_notification(retrain_msg)
-            except:
-                pass
-            try:
-                retrain_learning()
-                if 'send_telegram_notification' in globals():
-                    send_telegram_notification("✅ Retraining completed successfully.")
-            except Exception as e:
-                print("[AI Retrain Error]", e)
-                try:
-                    if 'send_telegram_notification' in globals():
-                        send_telegram_notification(f"❌ Retraining failed: {e}")
-                except:
-                    pass
-    except Exception as e:
-        print("[AI Eval Error]", e)
-
-def start_scheduler():
-    schedule.every(7).days.do(evaluate_ai_performance)
-    while True:
-        schedule.run_pending()
-        time.sleep(3600)
-
-threading.Thread(target=start_scheduler, daemon=True).start()
-
 # ---------------- RUN (if executed directly) ----------------
 if __name__ == "__main__":
     import uvicorn
     print(f"Starting {APP_NAME} on port {PORT}")
-    uvicorn.run("main_combined_learning:app", host="0.0.0.0", port=PORT, reload=False)
+    uvicorn.run("main_combined_learning_hybrid_final:app", host="0.0.0.0", port=PORT, reload=False)

@@ -206,31 +206,92 @@ def fetch_ohlc_alpha_forex(symbol: str, interval:str="15m", limit:int=500) -> pd
     df = df[["timestamp","open","high","low","close","volume"]].set_index("timestamp")
     return df
 
-def fetch_ohlc_any(symbol: str, interval: str="15m", limit:int=500) -> pd.DataFrame:
-    symbol = symbol.upper().replace(" ", "").replace("/", "")
-    print(f"[FETCH] 🔎 Requesting OHLC for {symbol} ({interval}) with limit={limit}")
+FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY", "")
+
+def fetch_ohlc_finnhub(symbol: str, interval: str="15m", limit: int=500) -> pd.DataFrame:
+    if not FINNHUB_API_KEY:
+        raise RuntimeError("FINNHUB_API_KEY not set")
+    mapping = {"1m":1, "3m":3, "5m":5, "15m":15, "30m":30, "1h":60, "4h":240, "1d":"D", "1w":"W"}
+    res = mapping.get(interval, 15)
+    url = f"https://finnhub.io/api/v1/forex/candle?symbol=OANDA:{symbol.replace('/','_')}&resolution={res}&count={limit}&token={FINNHUB_API_KEY}"
+    r = requests.get(url, timeout=10)
+    j = r.json()
+    if j.get("s") != "ok":
+        raise RuntimeError(f"Finnhub error: {j}")
+    df = pd.DataFrame({"timestamp": pd.to_datetime(np.array(j["t"], dtype=float), unit='s'),
+                       "open": j["o"], "high": j["h"], "low": j["l"], "close": j["c"]})
+    df["volume"] = j.get("v", [0]*len(df))
+    df = df.set_index("timestamp").tail(limit)
+    return df
+
+def fetch_ohlc_any(symbol: str, interval: str = "15m", limit: int = 500) -> pd.DataFrame:
+    """
+    Universal data fetcher:
+    - Auto route between Binance, TwelveData, AlphaVantage, and Finnhub
+    - Auto convert metals (XAUUSD, XAGUSD, GOLD, SILVER → XAUSDT / XAGUSDT)
+    - Supports both crypto and forex pairs seamlessly
+    """
+    original_symbol = symbol.upper().replace(" ", "").replace("/", "")
+    print(f"[FETCH] 🔎 Requesting OHLC for {original_symbol} ({interval}) with limit={limit}")
+
+    # 🟡 1️⃣ Auto-convert for Gold & Silver
+    metal_aliases = {
+        "XAUUSD": "XAUSDT",
+        "XAU/USD": "XAUSDT",
+        "GOLD": "XAUSDT",
+        "GOLDUSD": "XAUSDT",
+        "XAGUSD": "XAGUSDT",
+        "SILVER": "XAGUSDT",
+        "SILVERUSD": "XAGUSDT"
+    }
+    symbol = metal_aliases.get(original_symbol, original_symbol)
+    if symbol != original_symbol:
+        print(f"[AUTO-CONVERT] 🟡 {original_symbol} → {symbol} (Binance-compatible)")
+
+    # 🧠 2️⃣ Detect if Forex (e.g., EURUSD, GBPJPY, USDJPY)
+    forex_pairs = ["USD", "EUR", "GBP", "JPY", "CHF", "AUD", "NZD", "CAD"]
+    is_forex = any(original_symbol.startswith(c) or original_symbol.endswith(c) for c in forex_pairs)
+    print(f"[FETCH] 🔎 Market detection → Forex={is_forex}")
+
+    # 🟢 3️⃣ Try Binance first (Crypto or Metals)
+    if not is_forex or symbol.endswith("USDT"):
+        try:
+            print(f"[FETCH] 🟢 Trying Binance for {symbol}")
+            df = fetch_ohlc_binance(symbol, interval, limit)
+            print(f"[FETCH] ✅ Binance OK — got {len(df)} candles for {symbol}")
+            return df
+        except Exception as e:
+            print(f"[FETCH] ⚠️ Binance failed for {symbol}: {e}")
+
+    # 🟡 4️⃣ Try TwelveData for Forex
     try:
-        print(f"[FETCH] 🟢 Trying Binance for {symbol}")
-        df = fetch_ohlc_binance(symbol, interval, limit)
-        print(f"[FETCH] ✅ Binance OK — got {len(df)} candles for {symbol}")
+        print(f"[FETCH] 🟡 Trying TwelveData for {original_symbol}")
+        df = fetch_ohlc_twelvedata(original_symbol, interval, limit)
+        print(f"[FETCH] ✅ TwelveData OK — got {len(df)} candles for {original_symbol}")
         return df
     except Exception as e:
-        print(f"[FETCH] ⚠️ Binance failed for {symbol}: {e}")
+        print(f"[FETCH] ⚠️ TwelveData failed for {original_symbol}: {e}")
+
+    # 🔵 5️⃣ Try AlphaVantage for Forex
     try:
-        print(f"[FETCH] 🟡 Trying TwelveData for {symbol}")
-        df = fetch_ohlc_twelvedata(symbol, interval, limit)
-        print(f"[FETCH] ✅ TwelveData OK — got {len(df)} candles for {symbol}")
+        print(f"[FETCH] 🔵 Trying AlphaVantage for {original_symbol}")
+        df = fetch_ohlc_alpha_forex(original_symbol, interval, limit)
+        print(f"[FETCH] ✅ AlphaVantage OK — got {len(df)} candles for {original_symbol}")
         return df
     except Exception as e:
-        print(f"[FETCH] ⚠️ TwelveData failed for {symbol}: {e}")
+        print(f"[FETCH] ❌ AlphaVantage failed for {original_symbol}: {e}")
+
+    # 🟣 6️⃣ Try Finnhub as ultimate fallback
     try:
-        print(f"[FETCH] 🔵 Trying AlphaVantage for {symbol}")
-        df = fetch_ohlc_alpha_forex(symbol, interval, limit)
-        print(f"[FETCH] ✅ AlphaVantage OK — got {len(df)} candles for {symbol}")
+        print(f"[FETCH] 🟣 Trying Finnhub for {original_symbol}")
+        df = fetch_ohlc_finnhub(original_symbol, interval, limit)
+        print(f"[FETCH] ✅ Finnhub OK — got {len(df)} candles for {original_symbol}")
         return df
     except Exception as e:
-        print(f"[FETCH] ❌ AlphaVantage failed for {symbol}: {e}")
-    raise RuntimeError(f"All data sources failed for {symbol}")
+        print(f"[FETCH] ⚠️ Finnhub failed for {original_symbol}: {e}")
+
+    # 🔴 7️⃣ All sources failed
+    raise RuntimeError(f"All data sources failed for {original_symbol}")
 
 # ---------------- INDICATORS ----------------
 def ema(series: pd.Series, n:int):

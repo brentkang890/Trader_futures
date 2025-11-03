@@ -300,55 +300,48 @@ def fetch_ohlc_freeforex(symbol: str, interval: str = "15m", limit: int = 200) -
     except Exception as e:
         raise RuntimeError(f"FreeForexAPI fail for {symbol}: {e}")
         
-def fetch_ohlc_metalslive(symbol: str, interval: str = "3m", limit: int = 200) -> pd.DataFrame:
+def fetch_ohlc_goldapi(symbol: str, interval: str = "3m", limit: int = 200) -> pd.DataFrame:
     """
-    Metals.live real-time gold/silver spot API (no key, free forever)
-    Generates simulated candles from live price feed
+    GoldAPI.io real-time metals feed (free plan available)
     """
     try:
         import requests, numpy as np, pandas as pd
         from datetime import datetime, timedelta
-
         sym = symbol.upper()
         if sym not in ["XAUUSD", "XAGUSD", "GOLDUSD", "SILVERUSD"]:
-            raise RuntimeError("Symbol not supported by Metals.Live")
+            raise RuntimeError("Unsupported symbol for GoldAPI")
 
-        url = "https://api.metals.live/v1/spot"
-        r = requests.get(url, timeout=10)
+        GOLDAPI_KEY = os.getenv("GOLDAPI_KEY", "")
+        if not GOLDAPI_KEY:
+            raise RuntimeError("GOLDAPI_KEY not set")
+
+        url = f"https://www.goldapi.io/api/{'XAU/USD' if 'XAU' in sym else 'XAG/USD'}"
+        headers = {"x-access-token": GOLDAPI_KEY}
+        r = requests.get(url, headers=headers, timeout=10)
         j = r.json()
-        if not isinstance(j, list):
-            raise RuntimeError(f"Invalid metals.live response: {j}")
-
-        # cari harga emas atau perak
-        live_price = None
-        for item in j:
-            if isinstance(item, dict):
-                if sym.startswith("XAU") and "gold" in item:
-                    live_price = float(item["gold"])
-                if sym.startswith("XAG") and "silver" in item:
-                    live_price = float(item["silver"])
+        live_price = j.get("price")
         if not live_price:
-            raise RuntimeError("No live price found for metals")
+            raise RuntimeError(f"Invalid GoldAPI response: {j}")
 
         now = datetime.utcnow()
         candles = []
         for i in range(limit):
             t = now - timedelta(minutes=i * 3)
-            noise = np.random.normal(0, 0.001)
+            noise = np.random.normal(0, 0.0009)
             p = live_price * (1 + noise)
             candles.append({
                 "timestamp": t,
                 "open": p * (1 + np.random.normal(0, 0.0003)),
-                "high": p * (1 + np.random.uniform(0.0002, 0.0008)),
-                "low": p * (1 - np.random.uniform(0.0002, 0.0008)),
+                "high": p * (1 + np.random.uniform(0.0001, 0.0008)),
+                "low": p * (1 - np.random.uniform(0.0001, 0.0008)),
                 "close": p,
                 "volume": np.random.randint(100, 1000)
             })
         df = pd.DataFrame(candles).sort_values("timestamp").set_index("timestamp")
-        print(f"[FETCH] ✅ Metals.Live OK — simulated {len(df)} candles from live price for {symbol}")
+        print(f"[FETCH] ✅ GoldAPI OK — simulated {len(df)} candles for {symbol}")
         return df
     except Exception as e:
-        raise RuntimeError(f"Metals.Live fetch failed for {symbol}: {e}")
+        raise RuntimeError(f"GoldAPI fetch failed for {symbol}: {e}")
 
 def fetch_ohlc_any(symbol: str, interval: str = "15m", limit: int = 500) -> pd.DataFrame:
     """
@@ -433,15 +426,15 @@ def fetch_ohlc_any(symbol: str, interval: str = "15m", limit: int = 500) -> pd.D
         return df
     except Exception as e:
         print(f"[FETCH] ⚠️ FreeForexAPI failed for {original_symbol}: {e}")
-
-# 🟣 8️⃣ Try Metals.Live fallback (real-time gold/silver)
+        
+    # 🟣 8️⃣ Try GoldAPI fallback (real-time metals)
     try:
         if original_symbol.upper() in ["XAUUSD", "XAGUSD", "GOLDUSD"]:
-            print(f"[FETCH] ⚙️ Trying Metals.Live fallback for {original_symbol}")
-            df = fetch_ohlc_metalslive(original_symbol, interval, limit)
+            print(f"[FETCH] ⚙️ Trying GoldAPI fallback for {original_symbol}")
+            df = fetch_ohlc_goldapi(original_symbol, interval, limit)
             return df
     except Exception as e:
-        print(f"[FETCH] ⚠️ Metals.Live fallback failed for {original_symbol}: {e}")
+        print(f"[FETCH] ⚠️ GoldAPI fallback failed for {original_symbol}: {e}")
 
     # 🔴 9️⃣ All data sources failed
     raise RuntimeError(f"All data sources failed for {original_symbol}")

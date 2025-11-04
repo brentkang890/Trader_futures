@@ -1222,6 +1222,7 @@ def analyze_csv(
                 df_learn["tp1"] = df_learn["close"] * (1.01)
                 df_learn["tp2"] = df_learn["close"] * (1.02)
                 df_learn["sl"] = df_learn["close"] * (0.99)
+                df_learn["confidence"] = np.clip(np.random.normal(0.7, 0.15, len(df_learn)), 0, 1)
                 train_and_save_xgb(df_learn)
 
                 learned[hash_val] = {

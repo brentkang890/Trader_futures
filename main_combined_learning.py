@@ -1116,25 +1116,70 @@ def scalp_signal(pair: str = Query(...), tf: str = Query("3m"), limit: int = Que
         return respond({"error": str(e)}, status_code=500)
 
 @app.post("/analyze_csv")
-def analyze_csv(file: UploadFile = File(...), pair: Optional[str] = Form(None), timeframe: Optional[str] = Form(None), auto_backtest: Optional[str] = Form("true"), auto_log: Optional[str] = Form("true")):
+def analyze_csv(
+    file: UploadFile = File(...),
+    pair: Optional[str] = Form(None),
+    timeframe: Optional[str] = Form(None),
+    auto_backtest: Optional[str] = Form("true"),
+    auto_log: Optional[str] = Form("true")
+):
+    """
+    Versi cerdas: bisa membaca semua format CSV umum (Binance, TradingView, MetaTrader)
+    - Auto deteksi delimiter (`,` atau `\t` atau `;`)
+    - Auto rename kolom umum ke ['timestamp','open','high','low','close','volume']
+    - Tetap bisa jalan walau kolom tambahan ada
+    """
     auto_bt = auto_backtest.lower() != "false"
     auto_lg = auto_log.lower() != "false"
+
     try:
         contents = file.file.read()
-        df = pd.read_csv(io.BytesIO(contents))
+
+        # 🔍 coba baca otomatis dengan deteksi delimiter
+        try:
+            df = pd.read_csv(io.BytesIO(contents), sep=None, engine="python")
+        except Exception:
+            df = pd.read_csv(io.BytesIO(contents), sep="\t")
+
+        # 🔁 jika gagal, fallback tanpa header
+        if df.shape[1] < 2:
+            df = pd.read_csv(io.BytesIO(contents), header=None, sep=None, engine="python")
+
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"invalid_csv: {e}")
-    df.columns = [c.strip().lower() for c in df.columns]
-    def find_col(k): return next((c for c in df.columns if k in c), None)
-    o,h,l,c = find_col('open'), find_col('high'), find_col('low'), find_col('close')
-    if not all([o,h,l,c]):
-        raise HTTPException(status_code=400, detail="kolom_tidak_lengkap (butuh open, high, low, close)")
-    df2 = df[[o,h,l,c]].rename(columns={o:'open', h:'high', l:'low', c:'close'})
-    for col in ['open','high','low','close']:
-        df2[col] = pd.to_numeric(df2[col], errors='coerce')
+
+    # 🧠 Auto rename kolom umum
+    rename_map = {
+        "date": "timestamp", "time": "timestamp",
+        "datetime": "timestamp",
+        "open": "open", "Open": "open",
+        "high": "high", "High": "high",
+        "low": "low", "Low": "low",
+        "close": "close", "Close": "close",
+        "volume": "volume", "Volume": "volume",
+        "tick_volume": "volume", "real_volume": "volume",
+    }
+    df.rename(columns=lambda x: rename_map.get(str(x).strip(), x), inplace=True)
+
+    # ⚙️ Validasi minimal kolom
+    valid_cols = [c for c in ["open","high","low","close"] if c in df.columns]
+    if len(valid_cols) < 4:
+        raise HTTPException(status_code=400, detail=f"Kolom open/high/low/close tidak ditemukan di CSV. Kolom tersedia: {list(df.columns)}")
+
+    # 📊 Ambil kolom utama (tambahkan volume kalau ada)
+    cols = [c for c in ["open","high","low","close","volume"] if c in df.columns]
+    df2 = df[cols].copy()
+
+    # Konversi numerik
+    for col in df2.columns:
+        df2[col] = pd.to_numeric(df2[col], errors="coerce")
     df2 = df2.dropna().reset_index(drop=True)
+
+    # 🔁 Jalankan analisis hybrid
     res = hybrid_analyze(df2, pair=pair or "CSV", timeframe=timeframe or "csv")
     res = _postprocess_with_learning(res)
+
+    # 🔁 Backtest otomatis (jika aktif)
     bt_res = {}
     if auto_bt and BACKTEST_URL and res.get("signal_type") != "WAIT":
         bt_res = post_to_backtester({
@@ -1142,14 +1187,24 @@ def analyze_csv(file: UploadFile = File(...), pair: Optional[str] = Form(None), 
             "entry": res["entry"], "tp1": res.get("tp1"), "tp2": res.get("tp2"), "sl": res["sl"]
         })
         res["backtest_raw"] = bt_res
+
+    # 🔁 Simpan ke log
     if auto_lg:
         append_trade_log({
             "pair": res["pair"], "timeframe": res["timeframe"], "signal_type": res["signal_type"],
             "entry": res["entry"], "tp1": res.get("tp1"), "tp2": res.get("tp2"), "sl": res["sl"],
             "confidence": res["confidence"], "reasoning": res["reasoning"],
-            "backtest_hit": bt_res.get("hit") if isinstance(bt_res, dict) else None, "backtest_pnl": bt_res.get("pnl_total") if isinstance(bt_res, dict) else None
+            "backtest_hit": bt_res.get("hit") if isinstance(bt_res, dict) else None,
+            "backtest_pnl": bt_res.get("pnl_total") if isinstance(bt_res, dict) else None
         })
-    return respond(res)
+
+    return respond({
+        "status": "✅ CSV processed automatically",
+        "rows_used": len(df2),
+        "pair": pair or "CSV",
+        "timeframe": timeframe or "csv",
+        "result": res
+    })
 
 @app.post("/analyze_chart")
 def analyze_chart(file: UploadFile = File(...), pair: Optional[str] = Form(None), timeframe: Optional[str] = Form(None)):
@@ -1272,4 +1327,4 @@ if __name__ == "__main__":
         port=PORT,
         reload=False,
         log_level="info"   # ✅ tambahkan ini
-    )
+                                                                    )

@@ -1116,7 +1116,6 @@ def scalp_signal(pair: str = Query(...), tf: str = Query("3m"), limit: int = Que
         return respond({"error": str(e)}, status_code=500)
 
 @app.post("/analyze_csv")
-@app.post("/analyze_csv")
 def analyze_csv(
     file: UploadFile = File(...),
     pair: Optional[str] = Form(None),
@@ -1202,7 +1201,7 @@ def analyze_csv(
             "backtest_pnl": bt_res.get("pnl_total") if isinstance(bt_res, dict) else None
         })
 
-    # 🧠 Auto-learning dari CSV (hanya jika file baru)
+# 🧠 Auto-learning dari CSV (hanya jika file baru)
     try:
         import hashlib
         hash_val = hashlib.md5(contents).hexdigest()
@@ -1224,6 +1223,7 @@ def analyze_csv(
                 df_learn["tp2"] = df_learn["close"] * (1.02)
                 df_learn["sl"] = df_learn["close"] * (0.99)
                 train_and_save_xgb(df_learn)
+
                 learned[hash_val] = {
                     "filename": file.filename,
                     "rows": len(df2),
@@ -1231,21 +1231,22 @@ def analyze_csv(
                 }
                 with open(learned_log, "w") as f:
                     json.dump(learned, f, indent=2)
+
                 print(f"[AUTO-LEARNING] ✅ Model diperbarui dari file {file.filename}")
 
-# 🔔 Auto kirim pesan Telegram jika AI berhasil retrain
-if TELEGRAM_AUTO_SEND and TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
-    try:
-        msg = (
-            f"📚 <b>AI Updated</b>\n"
-            f"Model retrained from <b>{file.filename}</b>\n"
-            f"Rows: <b>{len(df2)}</b>\n"
-            f"Time: <code>{datetime.utcnow().isoformat()}</code>\n"
-            f"Status: ✅ Success"
-        )
-        threading.Thread(target=send_telegram_message, args=(msg,)).start()
-    except Exception as e:
-        print(f"[TELEGRAM] ⚠️ Failed to send update: {e}")
+                # 🔔 Auto kirim pesan Telegram jika AI berhasil retrain
+                if TELEGRAM_AUTO_SEND and TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+                    try:
+                        msg = (
+                            f"📚 <b>AI Updated</b>\n"
+                            f"Model retrained from <b>{file.filename}</b>\n"
+                            f"Rows: <b>{len(df2)}</b>\n"
+                            f"Time: <code>{datetime.utcnow().isoformat()}</code>\n"
+                            f"Status: ✅ Success"
+                        )
+                        threading.Thread(target=send_telegram_message, args=(msg,)).start()
+                    except Exception as e:
+                        print(f"[TELEGRAM] ⚠️ Failed to send update: {e}")
             else:
                 print(f"[AUTO-LEARNING] ⚠️ Data terlalu sedikit (<1000 baris), lewati retrain.")
         else:

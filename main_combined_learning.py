@@ -1116,6 +1116,7 @@ def scalp_signal(pair: str = Query(...), tf: str = Query("3m"), limit: int = Que
         return respond({"error": str(e)}, status_code=500)
 
 @app.post("/analyze_csv")
+@app.post("/analyze_csv")
 def analyze_csv(
     file: UploadFile = File(...),
     pair: Optional[str] = Form(None),
@@ -1124,10 +1125,12 @@ def analyze_csv(
     auto_log: Optional[str] = Form("true")
 ):
     """
-    Versi cerdas: bisa membaca semua format CSV umum (Binance, TradingView, MetaTrader)
-    - Auto deteksi delimiter (`,` atau `\t` atau `;`)
-    - Auto rename kolom umum ke ['timestamp','open','high','low','close','volume']
-    - Tetap bisa jalan walau kolom tambahan ada
+    Versi Final:
+    ✅ Auto baca CSV (format bebas)
+    ✅ Analisis hybrid
+    ✅ Belajar otomatis dari CSV baru (XGBoost)
+    ✅ Skip retrain kalau file yang sama sudah pernah dipelajari
+    ✅ Logging & backtest otomatis
     """
     auto_bt = auto_backtest.lower() != "false"
     auto_lg = auto_log.lower() != "false"
@@ -1135,23 +1138,21 @@ def analyze_csv(
     try:
         contents = file.file.read()
 
-        # 🔍 coba baca otomatis dengan deteksi delimiter
+        # 🔍 Deteksi delimiter otomatis
         try:
             df = pd.read_csv(io.BytesIO(contents), sep=None, engine="python")
         except Exception:
             df = pd.read_csv(io.BytesIO(contents), sep="\t")
 
-        # 🔁 jika gagal, fallback tanpa header
         if df.shape[1] < 2:
             df = pd.read_csv(io.BytesIO(contents), header=None, sep=None, engine="python")
 
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"invalid_csv: {e}")
 
-    # 🧠 Auto rename kolom umum
+    # 🧠 Auto rename kolom
     rename_map = {
-        "date": "timestamp", "time": "timestamp",
-        "datetime": "timestamp",
+        "date": "timestamp", "time": "timestamp", "datetime": "timestamp",
         "open": "open", "Open": "open",
         "high": "high", "High": "high",
         "low": "low", "Low": "low",
@@ -1161,25 +1162,28 @@ def analyze_csv(
     }
     df.rename(columns=lambda x: rename_map.get(str(x).strip(), x), inplace=True)
 
-    # ⚙️ Validasi minimal kolom
+    # ⚙️ Validasi kolom wajib
     valid_cols = [c for c in ["open","high","low","close"] if c in df.columns]
     if len(valid_cols) < 4:
         raise HTTPException(status_code=400, detail=f"Kolom open/high/low/close tidak ditemukan di CSV. Kolom tersedia: {list(df.columns)}")
 
-    # 📊 Ambil kolom utama (tambahkan volume kalau ada)
+    # 📊 Ambil kolom utama
     cols = [c for c in ["open","high","low","close","volume"] if c in df.columns]
     df2 = df[cols].copy()
-
-    # Konversi numerik
     for col in df2.columns:
         df2[col] = pd.to_numeric(df2[col], errors="coerce")
     df2 = df2.dropna().reset_index(drop=True)
 
-    # 🔁 Jalankan analisis hybrid
+    # ⚡ Batasi data besar
+    if len(df2) > 50000:
+        df2 = df2.tail(5000)
+        print(f"[CSV] ⚙️ File besar, hanya gunakan 5000 baris terakhir.")
+
+    # 📈 Jalankan analisis utama
     res = hybrid_analyze(df2, pair=pair or "CSV", timeframe=timeframe or "csv")
     res = _postprocess_with_learning(res)
 
-    # 🔁 Backtest otomatis (jika aktif)
+    # 🔁 Auto backtest
     bt_res = {}
     if auto_bt and BACKTEST_URL and res.get("signal_type") != "WAIT":
         bt_res = post_to_backtester({
@@ -1188,7 +1192,7 @@ def analyze_csv(
         })
         res["backtest_raw"] = bt_res
 
-    # 🔁 Simpan ke log
+    # 🧾 Logging hasil sinyal
     if auto_lg:
         append_trade_log({
             "pair": res["pair"], "timeframe": res["timeframe"], "signal_type": res["signal_type"],
@@ -1198,8 +1202,60 @@ def analyze_csv(
             "backtest_pnl": bt_res.get("pnl_total") if isinstance(bt_res, dict) else None
         })
 
+    # 🧠 Auto-learning dari CSV (hanya jika file baru)
+    try:
+        import hashlib
+        hash_val = hashlib.md5(contents).hexdigest()
+        learned_log = "learned_files.json"
+
+        learned = {}
+        if os.path.exists(learned_log):
+            with open(learned_log, "r") as f:
+                learned = json.load(f)
+
+        # ⚙️ Cek apakah file ini sudah pernah dipelajari
+        if hash_val not in learned:
+            if len(df2) >= 1000:
+                print(f"[AUTO-LEARNING] 🔁 Retraining XGBoost dari CSV baru ({len(df2)} baris)...")
+                df_learn = df2.copy()
+                df_learn["signal_type"] = np.where(df_learn["close"].diff() > 0, "LONG", "SHORT")
+                df_learn["entry"] = df_learn["close"]
+                df_learn["tp1"] = df_learn["close"] * (1.01)
+                df_learn["tp2"] = df_learn["close"] * (1.02)
+                df_learn["sl"] = df_learn["close"] * (0.99)
+                train_and_save_xgb(df_learn)
+                learned[hash_val] = {
+                    "filename": file.filename,
+                    "rows": len(df2),
+                    "timestamp": datetime.utcnow().isoformat()
+                }
+                with open(learned_log, "w") as f:
+                    json.dump(learned, f, indent=2)
+                print(f"[AUTO-LEARNING] ✅ Model diperbarui dari file {file.filename}")
+
+# 🔔 Auto kirim pesan Telegram jika AI berhasil retrain
+if TELEGRAM_AUTO_SEND and TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+    try:
+        msg = (
+            f"📚 <b>AI Updated</b>\n"
+            f"Model retrained from <b>{file.filename}</b>\n"
+            f"Rows: <b>{len(df2)}</b>\n"
+            f"Time: <code>{datetime.utcnow().isoformat()}</code>\n"
+            f"Status: ✅ Success"
+        )
+        threading.Thread(target=send_telegram_message, args=(msg,)).start()
+    except Exception as e:
+        print(f"[TELEGRAM] ⚠️ Failed to send update: {e}")
+            else:
+                print(f"[AUTO-LEARNING] ⚠️ Data terlalu sedikit (<1000 baris), lewati retrain.")
+        else:
+            print(f"[AUTO-LEARNING] ⏭️ File {file.filename} sudah pernah dipelajari, skip retrain.")
+
+    except Exception as e:
+        print(f"[AUTO-LEARNING] ⚠️ Error retrain check: {e}")
+
     return respond({
-        "status": "✅ CSV processed automatically",
+        "status": "✅ CSV processed & auto-learning active",
         "rows_used": len(df2),
         "pair": pair or "CSV",
         "timeframe": timeframe or "csv",
@@ -1327,4 +1383,4 @@ if __name__ == "__main__":
         port=PORT,
         reload=False,
         log_level="info"   # ✅ tambahkan ini
-                                                                    )
+    )

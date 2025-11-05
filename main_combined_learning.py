@@ -1094,7 +1094,77 @@ def pro_signal(pair: str = Query(...), tf_main: str = Query("1h"), tf_entry: str
         return respond({"error": str(e.detail)}, status_code=400)
     except Exception as e:
         return respond({"error": f"internal_error: {e}"}, status_code=500)
+        
+# ---------------- AUTO CSV FORMATTER ----------------
+def auto_format_csv(file_bytes: bytes) -> pd.DataFrame:
+    """
+    Auto-format CSV agar sesuai standar AI:
+    - Deteksi delimiter otomatis
+    - Auto rename kolom (open, high, low, close, volume)
+    - Tambahkan kolom timestamp jika belum ada
+    - Tambahkan kolom volume sintetis jika hilang
+    - Hapus baris error & batasi maksimum 5000 baris
+    """
+    import io, pandas as pd, numpy as np
+    try:
+        # 🔍 Deteksi delimiter otomatis
+        try:
+            df = pd.read_csv(io.BytesIO(file_bytes), sep=None, engine="python")
+        except Exception:
+            df = pd.read_csv(io.BytesIO(file_bytes), sep="\t")
 
+        # Jika gagal baca, coba tanpa header
+        if df.shape[1] < 2:
+            df = pd.read_csv(io.BytesIO(file_bytes), header=None, sep=None, engine="python")
+
+        # 🧠 Rename kolom otomatis
+        rename_map = {
+            "date": "timestamp", "time": "timestamp", "datetime": "timestamp",
+            "open": "open", "Open": "open",
+            "high": "high", "High": "high",
+            "low": "low", "Low": "low",
+            "close": "close", "Close": "close",
+            "volume": "volume", "Volume": "volume",
+            "tick_volume": "volume", "real_volume": "volume"
+        }
+        df.rename(columns=lambda x: rename_map.get(str(x).strip(), x), inplace=True)
+
+        # 🕓 Tambahkan kolom timestamp jika belum ada
+        if "timestamp" not in df.columns:
+            df["timestamp"] = pd.date_range(
+                end=pd.Timestamp.now(),
+                periods=len(df),
+                freq="15min"
+            )
+
+        # 🎚️ Tambahkan volume sintetis jika belum ada
+        if "volume" not in df.columns:
+            df["volume"] = np.abs(df["close"].diff().fillna(0)) * 1000
+
+        # Pastikan semua kolom utama ada
+        for c in ["open", "high", "low", "close"]:
+            if c not in df.columns:
+                raise ValueError(f"Kolom '{c}' tidak ditemukan")
+
+        # Pastikan angka numerik
+        for c in ["open", "high", "low", "close", "volume"]:
+            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(method="ffill").fillna(method="bfill")
+
+        # Konversi timestamp
+        try:
+            df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+        except:
+            df["timestamp"] = pd.date_range(end=pd.Timestamp.now(), periods=len(df), freq="15min")
+
+        # Bersihkan & batasi data besar
+        df = df.dropna().reset_index(drop=True)
+        if len(df) > 5000:
+            df = df.tail(5000)
+
+        return df[["timestamp", "open", "high", "low", "close", "volume"]]
+    except Exception as e:
+        raise RuntimeError(f"auto_format_csv_error: {e}")
+        
 @app.get("/scalp_signal")
 def scalp_signal(pair: str = Query(...), tf: str = Query("3m"), limit: int = Query(300), auto_log: bool = Query(False)):
     try:
@@ -1137,14 +1207,11 @@ def analyze_csv(
     try:
         contents = file.file.read()
 
-        # 🔍 Deteksi delimiter otomatis
+        # 🧠 Gunakan auto-format universal (bisa semua format CSV)
         try:
-            df = pd.read_csv(io.BytesIO(contents), sep=None, engine="python")
-        except Exception:
-            df = pd.read_csv(io.BytesIO(contents), sep="\t")
-
-        if df.shape[1] < 2:
-            df = pd.read_csv(io.BytesIO(contents), header=None, sep=None, engine="python")
+            df2 = auto_format_csv(contents)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=str(e))
 
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"invalid_csv: {e}")

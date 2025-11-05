@@ -764,12 +764,12 @@ def generate_ict_signal_pro(entry_df: pd.DataFrame, pair: str = None, tf: str = 
     if 'atr' not in df.columns:
         df['atr'] = atr(df, 14)
 
-    # Detect main SMC structures
+    # --- Detect SMC components ---
     bos = detect_bos_pro(df, lookback=60)
     fvg = detect_fvg_pro(df, atr_mul=1.5)
     obs = detect_order_blocks_pro(df, lookback=60)
 
-    # Base SMC score: simplified additive scoring
+    # --- Base SMC confidence ---
     smc_score = 0.0
     bias = bos.get('bias', 'NEUTRAL')
     ob_strength = sum([o.get('strength', 0.0) for o in obs])
@@ -786,55 +786,36 @@ def generate_ict_signal_pro(entry_df: pd.DataFrame, pair: str = None, tf: str = 
         smc_score += 0.15
     smc_conf = float(np.clip(smc_score, 0.0, 1.0))
 
-    # Volume confidence
+    # --- Volume confidence ---
     vol_conf = compute_volume_confidence(df, idx=-1)
     ml_conf = float(ml_confidence) if ml_confidence is not None else 0.0
 
-    # Weighted fusion
+    # --- Weighted fusion ---
     final_conf = WEIGHT_SMC * smc_conf + WEIGHT_VOL * vol_conf + WEIGHT_ML * ml_conf
-
-    # Dynamic adjustments
-    if vol_conf > 0.75:
-        final_conf = min(1.0, final_conf + 0.05)
-    elif vol_conf < 0.3:
-        final_conf = max(0.0, final_conf - 0.05)
     final_conf = float(np.clip(final_conf, 0.0, 1.0))
 
-    # Liquidity & Orderflow add-ons
+    # --- Liquidity & orderflow add-ons ---
     try:
         liq_zones = map_liquidity_zones(df, lookback=200)
         of_heat = compute_orderflow_heatmap(df, lookback=200, bins=24)
-        # if orderflow supports bias then boost confidence
         if bias == 'LONG':
-            if any(v['imbalance'] > 0.25 for v in of_heat.values()) if of_heat else False:
+            if any(v['imbalance'] > 0.25 for v in of_heat.values()):
                 final_conf = min(1.0, final_conf + 0.05)
         elif bias == 'SHORT':
-            if any(v['imbalance'] < -0.25 for v in of_heat.values()) if of_heat else False:
+            if any(v['imbalance'] < -0.25 for v in of_heat.values()):
                 final_conf = min(1.0, final_conf + 0.05)
     except Exception:
         liq_zones = []
         of_heat = {}
 
-    # Package details
-    details = {
-        "smc_conf": smc_conf,
-        "vol_conf": vol_conf,
-        "ml_conf": ml_conf,
-        "bos": bos,
-        "fvg": fvg,
-        "order_blocks": obs,
-        "liquidity_zones": liq_zones,
-        "orderflow_heatmap_top": dict(list(of_heat.items())[:8])
-    }
-
-    # Decide signal label
+    # --- Decide signal type ---
     signal_type = "WAIT"
-    if final_conf >= STRONG_THRESHOLD and bias in ('LONG','SHORT'):
+    if final_conf >= STRONG_THRESHOLD and bias in ("LONG", "SHORT"):
         signal_type = bias
-    elif final_conf >= WEAK_THRESHOLD and bias in ('LONG','SHORT'):
+    elif final_conf >= WEAK_THRESHOLD and bias in ("LONG", "SHORT"):
         signal_type = bias + "_WEAK"
 
-    # Calculate entries/tps/sl anchored on last price and ATR
+    # --- Entry/TP/SL calculation ---
     last_close = float(df['close'].iat[-1])
     last_atr = float(df['atr'].iat[-1]) if not np.isnan(df['atr'].iat[-1]) else (last_close * 0.001)
     if signal_type.startswith("LONG"):
@@ -850,11 +831,43 @@ def generate_ict_signal_pro(entry_df: pd.DataFrame, pair: str = None, tf: str = 
     else:
         entry = tp1 = tp2 = sl = last_close
 
+    # --- Engine mode detection ---
+    try:
+        if bos.get("bias") in ["LONG", "SHORT"] or len(fvg) > 0 or len(obs) > 0:
+            engine_mode = "SMC"
+        elif smc_conf > 0.4 and vol_conf > 0.4:
+            engine_mode = "SMC"
+        elif smc_conf < 0.3 and vol_conf > 0.5:
+            engine_mode = "HYBRID"
+        else:
+            engine_mode = "TECHNICAL"
+    except Exception:
+        engine_mode = "HYBRID"
+
+    # --- Compose output ---
+    details = {
+        "smc_conf": smc_conf,
+        "vol_conf": vol_conf,
+        "ml_conf": ml_conf,
+        "bos": bos,
+        "fvg": fvg,
+        "order_blocks": obs,
+        "liquidity_zones": liq_zones,
+        "orderflow_heatmap_top": dict(list(of_heat.items())[:8])
+    }
+
     return {
-        "pair": pair, "timeframe": tf, "signal_type": signal_type,
-        "entry": round(entry,8), "tp1": round(tp1,8), "tp2": round(tp2,8), "sl": round(sl,8),
-        "confidence": round(final_conf,3), "reasoning": f"PRO SMC bias={bias}",
-        "details": details
+        "pair": pair or "",
+        "timeframe": tf or "",
+        "signal_type": signal_type,
+        "entry": round(entry, 8),
+        "tp1": round(tp1, 8),
+        "tp2": round(tp2, 8),
+        "sl": round(sl, 8),
+        "confidence": round(final_conf, 3),
+        "reasoning": f"PRO SMC bias={bias}",
+        "details": details,
+        "engine_mode": engine_mode
     }
 
 # ---------------- HYBRID TECHNICAL ENGINE (original) ----------------
@@ -1385,8 +1398,11 @@ def pro_signal(pair: str = Query(...), tf_main: str = Query("1h"), tf_entry: str
         hybrid_res = hybrid_analyze(df_entry, pair=pair, timeframe=tf_entry)
         if pro_res.get("signal_type") == "WAIT":
             final = hybrid_res
+            # pastikan ada engine_mode saat fallback
+            final.setdefault("engine_mode", "HYBRID")
         else:
             final = pro_res
+            final.setdefault("engine_mode", "SMC")
 
         # Optional reinforce by HTF & volatility
         try:

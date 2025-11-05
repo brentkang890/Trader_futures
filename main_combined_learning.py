@@ -1027,42 +1027,40 @@ def pro_signal(pair: str = Query(...), tf_main: str = Query("1h"), tf_entry: str
             try:
                 df_htf = fetch_ohlc_any(pair, tf, limit=200)
                 df_dict[tf] = df_htf
-            except:
+            except Exception:
                 continue
+
         # 1) Try PRO SMC (new)
         pro_res = generate_ict_signal_pro(df_entry, pair=pair, tf=tf_entry)
-        # if PRO says WAIT -> fallback to original multi-TF ICT
-        if pro_res.get("signal_type") == "WAIT":
-            try:
-                fallback = generate_ict_signal(df_dict, pair, tf_entry)
-            except Exception:
-                fallback = {"signal_type":"WAIT"}
-            if fallback.get("signal_type") != "WAIT":
-                final_raw = fallback
-            else:
-                final_raw = pro_res
-        else:
-            final_raw = pro_res
-        # hybrid analysis complementary
+
+        # if PRO says WAIT -> fallback ke hybrid analysis
         hybrid_res = hybrid_analyze(df_entry, pair=pair, timeframe=tf_entry)
-        # prefer ICT/PRO unless it's WAIT then use hybrid (already handled for PRO)
-        final = final_raw if final_raw.get("signal_type") != "WAIT" else hybrid_res
+        if pro_res.get("signal_type") == "WAIT":
+            final = hybrid_res
+        else:
+            final = pro_res
+
         # position sizing
         try:
-            entry = float(final.get("entry",0)); sl = float(final.get("sl", entry))
+            entry = float(final.get("entry", 0)); sl = float(final.get("sl", entry))
             risk_amount = ACCOUNT_BALANCE * RISK_PERCENT if ACCOUNT_BALANCE > 0 else 0
-            pos_size = round(max(0.01, (risk_amount / abs(entry - sl)) if risk_amount>0 and abs(entry-sl)>0 else 0.01), 3)
-        except:
+            pos_size = round(max(0.01, (risk_amount / abs(entry - sl)) if risk_amount > 0 and abs(entry - sl) > 0 else 0.01), 3)
+        except Exception:
             pos_size = 0.01
         final["position_size"] = pos_size
         final["timestamp"] = datetime.utcnow().isoformat()
+
+        # log basic signal (first log before postprocessing/backtest to keep record)
         append_trade_log({
             "pair": final.get("pair"), "timeframe": final.get("timeframe"), "signal_type": final.get("signal_type"),
             "entry": final.get("entry"), "tp1": final.get("tp1"), "tp2": final.get("tp2"), "sl": final.get("sl"),
             "confidence": final.get("confidence"), "reasoning": final.get("reasoning"), "backtest_hit": None, "backtest_pnl": None
         })
+
+        # postprocess with learning/models
         final = _postprocess_with_learning(final)
-        # optional auto backtest
+
+        # optional auto backtest + append backtest result to log
         if auto_log and BACKTEST_URL:
             bt = post_to_backtester({
                 "pair": final.get("pair"), "timeframe": final.get("timeframe"), "side": final.get("signal_type"),
@@ -1075,49 +1073,39 @@ def pro_signal(pair: str = Query(...), tf_main: str = Query("1h"), tf_entry: str
                 "confidence": final.get("confidence"), "reasoning": final.get("reasoning"),
                 "backtest_hit": bt.get("hit") if isinstance(bt, dict) else None, "backtest_pnl": bt.get("pnl_total") if isinstance(bt, dict) else None
             })
+
         # Auto-send to Telegram if configured and signal strong
         try:
             if TELEGRAM_AUTO_SEND and TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
-                # decide threshold for send: send when confidence >= 0.75 and not WAIT
                 conf = float(final.get("confidence", 0))
-                sig_type = final.get("signal_type","WAIT")
+                sig_type = final.get("signal_type", "WAIT")
                 if sig_type != "WAIT" and conf >= 0.75 and not final.get("vetoed_by_model", False):
                     text = (f"<b>Signal</b>: {final.get('pair')} {final.get('timeframe')}\\n"
                             f"Type: {final.get('signal_type')} (conf {final.get('confidence')})\\n"
                             f"Entry: {final.get('entry')}  TP1: {final.get('tp1')}  SL: {final.get('sl')}\\n"
                             f"Reason: {final.get('reasoning')}")
-                    threading.Thread(target=send_telegram_message, args=(text,)).start()
+                    # Use daemon=True so thread won't block process exit
+                    threading.Thread(target=send_telegram_message, args=(text,), daemon=True).start()
         except Exception:
             pass
+
         return respond(final)
     except HTTPException as e:
         return respond({"error": str(e.detail)}, status_code=400)
     except Exception as e:
         return respond({"error": f"internal_error: {e}"}, status_code=500)
-        
-# ---------------- AUTO CSV FORMATTER ----------------
+
 def auto_format_csv(file_bytes: bytes) -> pd.DataFrame:
-    """
-    Auto-format CSV agar sesuai standar AI:
-    - Deteksi delimiter otomatis
-    - Auto rename kolom (open, high, low, close, volume)
-    - Tambahkan kolom timestamp jika belum ada
-    - Tambahkan kolom volume sintetis jika hilang
-    - Hapus baris error & batasi maksimum 5000 baris
-    """
     import io, pandas as pd, numpy as np
     try:
-        # 🔍 Deteksi delimiter otomatis
         try:
             df = pd.read_csv(io.BytesIO(file_bytes), sep=None, engine="python")
         except Exception:
             df = pd.read_csv(io.BytesIO(file_bytes), sep="\t")
 
-        # Jika gagal baca, coba tanpa header
         if df.shape[1] < 2:
             df = pd.read_csv(io.BytesIO(file_bytes), header=None, sep=None, engine="python")
 
-        # 🧠 Rename kolom otomatis
         rename_map = {
             "date": "timestamp", "time": "timestamp", "datetime": "timestamp",
             "open": "open", "Open": "open",
@@ -1129,34 +1117,29 @@ def auto_format_csv(file_bytes: bytes) -> pd.DataFrame:
         }
         df.rename(columns=lambda x: rename_map.get(str(x).strip(), x), inplace=True)
 
-        # 🕓 Tambahkan kolom timestamp jika belum ada
         if "timestamp" not in df.columns:
-            df["timestamp"] = pd.date_range(
-                end=pd.Timestamp.now(),
-                periods=len(df),
-                freq="15min"
-            )
+            df["timestamp"] = pd.date_range(end=pd.Timestamp.now(), periods=len(df), freq="15min")
 
-        # 🎚️ Tambahkan volume sintetis jika belum ada
         if "volume" not in df.columns:
-            df["volume"] = np.abs(df["close"].diff().fillna(0)) * 1000
+            if "close" in df.columns:
+                df["volume"] = np.abs(df["close"].diff().fillna(0)) * 1000
+            else:
+                df["volume"] = 0.0
 
-        # Pastikan semua kolom utama ada
         for c in ["open", "high", "low", "close"]:
             if c not in df.columns:
                 raise ValueError(f"Kolom '{c}' tidak ditemukan")
 
-        # Pastikan angka numerik
+        # ganti fillna(method=...) deprecated dengan ffill/bfill
         for c in ["open", "high", "low", "close", "volume"]:
-            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(method="ffill").fillna(method="bfill")
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+            df[c] = df[c].ffill().bfill()
 
-        # Konversi timestamp
         try:
             df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
         except:
             df["timestamp"] = pd.date_range(end=pd.Timestamp.now(), periods=len(df), freq="15min")
 
-        # Bersihkan & batasi data besar
         df = df.dropna().reset_index(drop=True)
         if len(df) > 5000:
             df = df.tail(5000)
@@ -1165,26 +1148,6 @@ def auto_format_csv(file_bytes: bytes) -> pd.DataFrame:
     except Exception as e:
         raise RuntimeError(f"auto_format_csv_error: {e}")
         
-@app.get("/scalp_signal")
-def scalp_signal(pair: str = Query(...), tf: str = Query("3m"), limit: int = Query(300), auto_log: bool = Query(False)):
-    try:
-        df = fetch_ohlc_any(pair, tf, limit=limit)
-        res = None
-        try:
-            res = hybrid_analyze(df, pair=pair, timeframe=tf)
-            res = _postprocess_with_learning(res)
-        except Exception:
-            res = {"error":"scalp_failed"}
-        if auto_log:
-            append_trade_log({
-                "pair": res.get("pair"), "timeframe": res.get("timeframe"), "signal_type": res.get("signal_type"),
-                "entry": res.get("entry"), "tp1": res.get("tp1"), "tp2": res.get("tp2"), "sl": res.get("sl"),
-                "confidence": res.get("confidence"), "reasoning": res.get("reasoning"), "backtest_hit": None, "backtest_pnl": None
-            })
-        return respond(res)
-    except Exception as e:
-        return respond({"error": str(e)}, status_code=500)
-
 @app.post("/analyze_csv")
 def analyze_csv(
     file: UploadFile = File(...),
@@ -1193,139 +1156,136 @@ def analyze_csv(
     auto_backtest: Optional[str] = Form("true"),
     auto_log: Optional[str] = Form("true")
 ):
-    """
-    Versi Final:
-    ✅ Auto baca CSV (format bebas)
-    ✅ Analisis hybrid
-    ✅ Belajar otomatis dari CSV baru (XGBoost)
-    ✅ Skip retrain kalau file yang sama sudah pernah dipelajari
-    ✅ Logging & backtest otomatis
-    """
     auto_bt = auto_backtest.lower() != "false"
     auto_lg = auto_log.lower() != "false"
 
+    # baca file CSV
     try:
         contents = file.file.read()
-
-        # 🧠 Gunakan auto-format universal (bisa semua format CSV)
-        try:
-            df2 = auto_format_csv(contents)
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=str(e))
-
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"invalid_csv: {e}")
+        raise HTTPException(status_code=400, detail=f"invalid_csv_read: {e}")
 
-    # 🧠 Auto rename kolom
-    rename_map = {
-        "date": "timestamp", "time": "timestamp", "datetime": "timestamp",
-        "open": "open", "Open": "open",
-        "high": "high", "High": "high",
-        "low": "low", "Low": "low",
-        "close": "close", "Close": "close",
-        "volume": "volume", "Volume": "volume",
-        "tick_volume": "volume", "real_volume": "volume",
-    }
-    df.rename(columns=lambda x: rename_map.get(str(x).strip(), x), inplace=True)
+    if len(contents) > 7_000_000:  # ~7MB
+        raise HTTPException(status_code=400, detail="File terlalu besar (>7MB), kurangi data CSV.")
 
-    # ⚙️ Validasi kolom wajib
-    valid_cols = [c for c in ["open","high","low","close"] if c in df.columns]
-    if len(valid_cols) < 4:
-        raise HTTPException(status_code=400, detail=f"Kolom open/high/low/close tidak ditemukan di CSV. Kolom tersedia: {list(df.columns)}")
+    # gunakan auto_format_csv (jika error -> 400)
+    try:
+        df = auto_format_csv(contents)  # df sudah berisi timestamp/open/high/low/close/volume
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
-    # 📊 Ambil kolom utama
-    cols = [c for c in ["open","high","low","close","volume"] if c in df.columns]
-    df2 = df[cols].copy()
-    for col in df2.columns:
-        df2[col] = pd.to_numeric(df2[col], errors="coerce")
-    df2 = df2.dropna().reset_index(drop=True)
+    # validasi lagi safety
+    required = ["open", "high", "low", "close"]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise HTTPException(status_code=400, detail=f"CSV tidak valid, kolom hilang: {missing}")
 
-    # ⚡ Batasi data besar
-    if len(df2) > 50000:
-        df2 = df2.tail(5000)
+    # jaga ukuran file (safety)
+    if len(df) > 50000:
+        df = df.tail(5000)
         print(f"[CSV] ⚙️ File besar, hanya gunakan 5000 baris terakhir.")
 
-    # 📈 Jalankan analisis utama
-    res = hybrid_analyze(df2, pair=pair or "CSV", timeframe=timeframe or "csv")
-    res = _postprocess_with_learning(res)
+    # pastikan numeric & bersih
+    for col in ["open","high","low","close","volume"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce").ffill().bfill()
+    df = df.dropna().reset_index(drop=True)
+    if df.shape[0] < 12:
+        raise HTTPException(status_code=400, detail="CSV terlalu sedikit data (minimal 12 candle).")
 
-    # 🔁 Auto backtest
+    # jalankan analisis
+    try:
+        res = hybrid_analyze(df, pair=pair or "CSV", timeframe=timeframe or "csv")
+    except Exception as e:
+        # tangani error analisis agar tidak menimbulkan 500 tanpa pesan
+        raise HTTPException(status_code=500, detail=f"analisis_gagal: {e}")
+
+    # postprocess learning safe
+    try:
+        res = _postprocess_with_learning(res)
+    except Exception as e:
+        res = {"error": "postprocess_failed", "detail": str(e)}
+
+    # optional backtest dan logging (bungkus try/except supaya tidak crash)
     bt_res = {}
-    if auto_bt and BACKTEST_URL and res.get("signal_type") != "WAIT":
-        bt_res = post_to_backtester({
-            "pair": res["pair"], "timeframe": res["timeframe"], "side": res["signal_type"],
-            "entry": res["entry"], "tp1": res.get("tp1"), "tp2": res.get("tp2"), "sl": res["sl"]
-        })
-        res["backtest_raw"] = bt_res
+    try:
+        if auto_bt and BACKTEST_URL and res.get("signal_type") != "WAIT":
+            bt_res = post_to_backtester({
+                "pair": res["pair"], "timeframe": res["timeframe"], "side": res["signal_type"],
+                "entry": res["entry"], "tp1": res.get("tp1"), "tp2": res.get("tp2"), "sl": res["sl"]
+            })
+            res["backtest_raw"] = bt_res
+    except Exception as e:
+        print(f"[CSV BACKTEST] error: {e}")
 
-    # 🧾 Logging hasil sinyal
     if auto_lg:
-        append_trade_log({
-            "pair": res["pair"], "timeframe": res["timeframe"], "signal_type": res["signal_type"],
-            "entry": res["entry"], "tp1": res.get("tp1"), "tp2": res.get("tp2"), "sl": res["sl"],
-            "confidence": res["confidence"], "reasoning": res["reasoning"],
-            "backtest_hit": bt_res.get("hit") if isinstance(bt_res, dict) else None,
-            "backtest_pnl": bt_res.get("pnl_total") if isinstance(bt_res, dict) else None
-        })
+        try:
+            append_trade_log({
+                "pair": res.get("pair"), "timeframe": res.get("timeframe"), "signal_type": res.get("signal_type"),
+                "entry": res.get("entry"), "tp1": res.get("tp1"), "tp2": res.get("tp2"), "sl": res.get("sl"),
+                "confidence": res.get("confidence"), "reasoning": res.get("reasoning"),
+                "backtest_hit": bt_res.get("hit") if isinstance(bt_res, dict) else None,
+                "backtest_pnl": bt_res.get("pnl_total") if isinstance(bt_res, dict) else None
+            })
+        except Exception as e:
+            print(f"[CSV LOGGING] error: {e}")
 
-# 🧠 Auto-learning dari CSV (hanya jika file baru)
+    # auto-learning (sama logic, tapi bungkus aman)
     try:
         import hashlib
         hash_val = hashlib.md5(contents).hexdigest()
         learned_log = "learned_files.json"
-
         learned = {}
         if os.path.exists(learned_log):
             with open(learned_log, "r") as f:
                 learned = json.load(f)
-
-        # ⚙️ Cek apakah file ini sudah pernah dipelajari
         if hash_val not in learned:
-            if len(df2) >= 1000:
-                print(f"[AUTO-LEARNING] 🔁 Retraining XGBoost dari CSV baru ({len(df2)} baris)...")
-                df_learn = df2.copy()
+            if len(df) >= 1000:
+                print(f"[AUTO-LEARNING] 🔁 Retraining XGBoost dari CSV baru ({len(df)} baris)...")
+                df_learn = df.copy()
                 df_learn["signal_type"] = np.where(df_learn["close"].diff() > 0, "LONG", "SHORT")
                 df_learn["entry"] = df_learn["close"]
                 df_learn["tp1"] = df_learn["close"] * (1.01)
                 df_learn["tp2"] = df_learn["close"] * (1.02)
                 df_learn["sl"] = df_learn["close"] * (0.99)
                 df_learn["confidence"] = np.clip(np.random.normal(0.7, 0.15, len(df_learn)), 0, 1)
-                train_and_save_xgb(df_learn)
-
-                learned[hash_val] = {
-                    "filename": file.filename,
-                    "rows": len(df2),
-                    "timestamp": datetime.utcnow().isoformat()
-                }
-                with open(learned_log, "w") as f:
-                    json.dump(learned, f, indent=2)
-
-                print(f"[AUTO-LEARNING] ✅ Model diperbarui dari file {file.filename}")
-
-                # 🔔 Auto kirim pesan Telegram jika AI berhasil retrain
-                if TELEGRAM_AUTO_SEND and TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
-                    try:
-                        msg = (
-                            f"📚 <b>AI Updated</b>\n"
-                            f"Model retrained from <b>{file.filename}</b>\n"
-                            f"Rows: <b>{len(df2)}</b>\n"
-                            f"Time: <code>{datetime.utcnow().isoformat()}</code>\n"
-                            f"Status: ✅ Success"
-                        )
-                        threading.Thread(target=send_telegram_message, args=(msg,)).start()
-                    except Exception as e:
-                        print(f"[TELEGRAM] ⚠️ Failed to send update: {e}")
+                try:
+                    train_and_save_xgb(df_learn)
+                    learned[hash_val] = {
+                        "filename": file.filename,
+                        "rows": len(df),
+                        "timestamp": datetime.utcnow().isoformat()
+                    }
+                    with open(learned_log, "w") as f:
+                        json.dump(learned, f, indent=2)
+                except Exception as e:
+                    print(f"[AUTO-LEARNING] retrain error: {e}", flush=True)
             else:
                 print(f"[AUTO-LEARNING] ⚠️ Data terlalu sedikit (<1000 baris), lewati retrain.")
         else:
             print(f"[AUTO-LEARNING] ⏭️ File {file.filename} sudah pernah dipelajari, skip retrain.")
-
     except Exception as e:
         print(f"[AUTO-LEARNING] ⚠️ Error retrain check: {e}")
 
+    # optional: kirim ringkasan ke Telegram (lakukan sebelum return)
+    try:
+        if TELEGRAM_AUTO_SEND and TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+            conf = float(res.get("confidence", 0))
+            sig_type = res.get("signal_type", "WAIT")
+            if sig_type != "WAIT" and conf >= 0.75:
+                text = (
+                    f"<b>📊 CSV Analysis</b>\n"
+                    f"Pair: {pair or 'CSV'} | TF: {timeframe or '15m'}\n"
+                    f"Type: {sig_type} (conf {conf})\n"
+                    f"Entry: {res.get('entry')} | TP1: {res.get('tp1')} | SL: {res.get('sl')}\n"
+                    f"Source: CSV upload"
+                )
+                threading.Thread(target=send_telegram_message, args=(text,)).start()
+    except Exception as e:
+        print(f"[TELEGRAM CSV] send failed: {e}")
+
     return respond({
         "status": "✅ CSV processed & auto-learning active",
-        "rows_used": len(df2),
+        "rows_used": len(df),
         "pair": pair or "CSV",
         "timeframe": timeframe or "csv",
         "result": res

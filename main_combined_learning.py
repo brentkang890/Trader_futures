@@ -1,8 +1,9 @@
 """
-main_combined_learning_hybrid_pro_final.py
+main_combined_learning_hybrid_pro_final_v2.py
 Combined Hybrid PRO: SMC/ICT PRO + Hybrid Technical Engine + XGBoost + RandomForest + Data Fallback
-Compatibility: Designed to work with telegram_bot (2).py as-is (endpoints /pro_signal, /scalp_signal, /analyze_chart, /analyze_csv, /learning_status, /retrain_learning, /ai_performance, /logs_summary, /mode, /context, /health)
-This file is the merged final ready-to-use version you asked for.
+
+Versi: detailed-explained
+Catatan: file ini sengaja berisi komentar penjelasan di setiap blok fungsi utama.
 """
 
 import os
@@ -19,19 +20,18 @@ import pandas as pd
 from datetime import datetime
 from typing import Optional, Dict, Any
 from fastapi import FastAPI, Query, UploadFile, File, Form, HTTPException
-from fastapi.responses import JSONResponse, FileResponse, PlainTextResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
 from fastapi.encoders import jsonable_encoder
 
-# technical libs
+# Technical indicators library (ta)
 import ta
 
 # ML libs
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import classification_report, roc_auc_score
 from xgboost import XGBClassifier
 
-# image libs optional
+# Optional image OCR libs (wrapped in try/except)
 try:
     from PIL import Image
     import cv2
@@ -41,7 +41,7 @@ except Exception:
     _HAS_TESSERACT = False
 
 # ---------------- CONFIG ----------------
-APP_NAME = "Pro Trader AI - Hybrid PRO Final"
+APP_NAME = "Pro Trader AI - Hybrid PRO Final (v2 - detailed)"
 PORT = int(os.getenv("PORT", 8000))
 TRADE_LOG_FILE = os.getenv("TRADE_LOG_FILE", "trade_log.csv")
 MODEL_RF_FILE = os.getenv("MODEL_RF_FILE", "rf_model.pkl")
@@ -53,13 +53,17 @@ BINANCE_KLINES = "https://api.binance.com/api/v3/klines"
 TWELVEDATA_URL = "https://api.twelvedata.com/time_series"
 TWELVEDATA_API_KEY = os.getenv("TWELVEDATA_API_KEY", "")
 ALPHA_API_KEY = os.getenv("ALPHA_API_KEY", "")
+FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY", "")
+FMP_API_KEY = os.getenv("FMP_API_KEY", "")
+GOLDAPI_KEY = os.getenv("GOLDAPI_KEY", "")
 
 BACKTEST_URL = os.getenv("BACKTEST_URL", "")
+
 # Risk / account
 RISK_PERCENT = float(os.getenv("RISK_PERCENT", 0.02))
 ACCOUNT_BALANCE = float(os.getenv("ACCOUNT_BALANCE", 0))
 
-# ICT PRO CONFIG
+# ICT PRO CONFIG (killzone, HTF list)
 ICT_KILLZONE_ENABLE = os.getenv("ICT_KILLZONE_ENABLE", "true").lower() == "true"
 ICT_KILLZONE_START = os.getenv("ICT_KILLZONE_START", "06:00")
 ICT_KILLZONE_END = os.getenv("ICT_KILLZONE_END", "12:00")
@@ -70,7 +74,7 @@ ICT_DEFAULT_ENTRY_TF = os.getenv("ICT_DEFAULT_ENTRY_TF", "15m")
 # Fusion / weights for PRO
 WEIGHT_SMC = float(os.getenv("WEIGHT_SMC", 0.5))
 WEIGHT_VOL = float(os.getenv("WEIGHT_VOL", 0.3))
-WEIGHT_ML  = float(os.getenv("WEIGHT_ML", 0.2))
+WEIGHT_ML = float(os.getenv("WEIGHT_ML", 0.2))
 STRONG_THRESHOLD = float(os.getenv("STRONG_SIGNAL_THRESHOLD", 0.8))
 WEAK_THRESHOLD = float(os.getenv("WEAK_SIGNAL_THRESHOLD", 0.55))
 
@@ -81,6 +85,11 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
 # ---------------- UTIL: SAFE RESPOND ----------------
 def respond(obj: Any, status_code: int = 200):
+    """
+    Convert objects to JSONResponse safely:
+    - convert numpy types to python scalars
+    - replace NaN/Inf floats with 0.0
+    """
     def clean_value(v):
         if isinstance(v, float):
             if np.isnan(v) or np.isinf(v):
@@ -98,7 +107,7 @@ def respond(obj: Any, status_code: int = 200):
         encoded = jsonable_encoder(obj)
         cleaned = clean_value(encoded)
         return JSONResponse(content=cleaned, status_code=status_code)
-    except Exception as e:
+    except Exception:
         try:
             return JSONResponse(content={"fallback": str(obj)}, status_code=status_code)
         except:
@@ -106,6 +115,9 @@ def respond(obj: Any, status_code: int = 200):
 
 # ---------------- LOG HELPERS ----------------
 def ensure_trade_log():
+    """
+    Ensure the trade log CSV exists and has header. Called on startup and prior to append.
+    """
     if not os.path.exists(TRADE_LOG_FILE):
         with open(TRADE_LOG_FILE, "w", newline="") as f:
             writer = csv.writer(f)
@@ -115,6 +127,9 @@ def ensure_trade_log():
             ])
 
 def append_trade_log(rec: Dict[str, Any]):
+    """
+    Append a signal/log to the CSV. Always call ensure_trade_log() first (function does that).
+    """
     ensure_trade_log()
     with open(TRADE_LOG_FILE, "a", newline="") as f:
         writer = csv.writer(f)
@@ -125,8 +140,15 @@ def append_trade_log(rec: Dict[str, Any]):
             rec.get("confidence"), rec.get("reasoning"), rec.get("backtest_hit"), rec.get("backtest_pnl")
         ])
 
-# ---------------- DATA FETCH (Binance / TwelveData / Alpha) ----------------
+# ---------------- DATA FETCH (Binance / TwelveData / Alpha / Fallbacks) ----------------
+# Each fetch function aims to return a DataFrame indexed by timestamp with columns:
+# ["open","high","low","close","volume"]. If fetch fails, it should raise a RuntimeError.
+
 def fetch_ohlc_binance(symbol: str, interval: str="15m", limit: int=500) -> pd.DataFrame:
+    """
+    Fetch klines from Binance.
+    Symbol must be Binance-friendly, e.g., 'BTCUSDT' or 'ETHUSDT' or 'XAUSDT' for some metal tickers.
+    """
     symbol = symbol.upper().replace(" ", "").replace("/", "")
     params = {"symbol": symbol, "interval": interval, "limit": limit}
     try:
@@ -142,11 +164,14 @@ def fetch_ohlc_binance(symbol: str, interval: str="15m", limit: int=500) -> pd.D
                 df["timestamp"] = pd.to_datetime(df["open_time"], unit="ms", errors="coerce")
                 df = df[["timestamp","open","high","low","close","volume"]].set_index("timestamp")
                 return df
-    except Exception as e:
+    except Exception:
         pass
     raise RuntimeError(f"Binance fetch fail for {symbol}")
 
 def _format_twelvedata_symbol(s: str) -> str:
+    """
+    Format symbol for TwelveData (e.g., 'EURUSD' -> 'EUR/USD' expected by TwelveData)
+    """
     s2 = s.upper().replace(" ", "").replace("_","")
     if s2.endswith("USDT"):
         return f"{s2[:-4]}/USD"
@@ -157,6 +182,10 @@ def _format_twelvedata_symbol(s: str) -> str:
     return s2
 
 def fetch_ohlc_twelvedata(symbol: str, interval: str="15m", limit: int=500) -> pd.DataFrame:
+    """
+    Fetch from TwelveData. Interval formatting adapted from '15m' to TwelveData style.
+    Requires TWELVEDATA_API_KEY environment variable.
+    """
     if not TWELVEDATA_API_KEY:
         raise RuntimeError("TWELVEDATA_API_KEY_not_set")
     mapping = {"m":"min","h":"h","d":"day","w":"week"}
@@ -176,11 +205,16 @@ def fetch_ohlc_twelvedata(symbol: str, interval: str="15m", limit: int=500) -> p
             df[c] = pd.to_numeric(df[c], errors='coerce').fillna(0.0)
         else:
             df[c] = 0.0
+    # TwelveData returns datetime field named "datetime"
     df["timestamp"] = pd.to_datetime(df.get("datetime", pd.Series(np.arange(len(df)))), errors='coerce')
     df = df[["timestamp","open","high","low","close","volume"]].set_index("timestamp").sort_index()
     return df.tail(limit)
 
 def fetch_ohlc_alpha_forex(symbol: str, interval:str="15m", limit:int=500) -> pd.DataFrame:
+    """
+    Use AlphaVantage FX_INTRADAY endpoint for forex intraday. Requires ALPHA_API_KEY.
+    Note: free tier of AlphaVantage has rate limits.
+    """
     if not ALPHA_API_KEY:
         raise RuntimeError("ALPHA_API_KEY_not_set")
     s = symbol.upper().replace("/","")
@@ -206,9 +240,10 @@ def fetch_ohlc_alpha_forex(symbol: str, interval:str="15m", limit:int=500) -> pd
     df = df[["timestamp","open","high","low","close","volume"]].set_index("timestamp")
     return df
 
-FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY", "")
-
 def fetch_ohlc_finnhub(symbol: str, interval: str="15m", limit: int=500) -> pd.DataFrame:
+    """
+    Use Finnhub candle API. Requires FINNHUB_API_KEY.
+    """
     if not FINNHUB_API_KEY:
         raise RuntimeError("FINNHUB_API_KEY not set")
     mapping = {"1m":1, "3m":3, "5m":5, "15m":15, "30m":30, "1h":60, "4h":240, "1d":"D", "1w":"W"}
@@ -223,61 +258,51 @@ def fetch_ohlc_finnhub(symbol: str, interval: str="15m", limit: int=500) -> pd.D
     df["volume"] = j.get("v", [0]*len(df))
     df = df.set_index("timestamp").tail(limit)
     return df
-    
-# ================= PATCH START =================
-# Tambahkan setelah fungsi fetch_ohlc_finnhub()
-
-FMP_API_KEY = os.getenv("FMP_API_KEY", "")
 
 def fetch_ohlc_fmp(symbol: str, interval: str="15m", limit: int=500) -> pd.DataFrame:
     """
-    FMP fallback (supports forex + metals like XAUUSD, XAGUSD)
+    FinancialModelingPrep fallback (supports forex + some metals).
+    Attempts multiple aliases for metal tickers.
     """
     if not FMP_API_KEY:
         raise RuntimeError("FMP_API_KEY_not_set")
 
-    try:
-        mapping = {
-            "1m": "1min", "3m": "5min", "5m": "5min", "15m": "15min",
-            "30m": "30min", "1h": "1hour", "4h": "4hour", "1d": "1day"
-        }
-        iv = mapping.get(interval, "15min")
+    mapping = {
+        "1m": "1min", "3m": "5min", "5m": "5min", "15m": "15min",
+        "30m": "30min", "1h": "1hour", "4h": "4hour", "1d": "1day"
+    }
+    iv = mapping.get(interval, "15min")
 
-        # 🔁 Try symbol variants if needed
-        sym = symbol.upper().replace("/", "")
-        aliases = [sym]
-        if sym == "XAUUSD":  # gold
-            aliases += ["GCUSD", "GOLD", "XAU/USD"]
-        elif sym == "XAGUSD":  # silver
-            aliases += ["SIUSD", "SILVER", "XAG/USD"]
+    sym = symbol.upper().replace("/", "")
+    aliases = [sym]
+    if sym in ["XAUUSD", "GOLD", "GOLDUSD"]:
+        aliases += ["GCUSD", "XAU/USD"]
+    if sym in ["XAGUSD", "SILVER", "SILVERUSD"]:
+        aliases += ["SIUSD", "XAG/USD"]
 
-        for s in aliases:
-            url = f"https://financialmodelingprep.com/api/v3/historical-chart/{iv}/{s}?apikey={FMP_API_KEY}"
+    for s in aliases:
+        url = f"https://financialmodelingprep.com/api/v3/historical-chart/{iv}/{s}?apikey={FMP_API_KEY}"
+        try:
             r = requests.get(url, timeout=10)
-            if r.status_code != 200:
-                continue
-            j = r.json()
-            if isinstance(j, list) and len(j) > 0:
-                df = pd.DataFrame(j)
-                for c in ["open", "high", "low", "close"]:
-                    df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
-                df["timestamp"] = pd.to_datetime(df["date"], errors="coerce")
-                df = df[["timestamp", "open", "high", "low", "close"]].set_index("timestamp").sort_index()
-                df["volume"] = 0.0
-                print(f"[FETCH] ✅ FMP OK — got {len(df)} candles for {s}")
-                return df.tail(limit)
-            else:
-                print(f"[FETCH] ⚠️ FMP returned no data for alias {s}")
+        except Exception:
+            continue
+        if r.status_code != 200:
+            continue
+        j = r.json()
+        if isinstance(j, list) and len(j) > 0:
+            df = pd.DataFrame(j)
+            for c in ["open", "high", "low", "close"]:
+                df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
+            df["timestamp"] = pd.to_datetime(df["date"], errors="coerce")
+            df = df[["timestamp", "open", "high", "low", "close"]].set_index("timestamp").sort_index()
+            df["volume"] = 0.0
+            return df.tail(limit)
+    raise RuntimeError(f"FMP returned no data for {symbol} and aliases tried: {aliases}")
 
-        raise RuntimeError(f"FMP returned no data for {symbol} and all aliases tried: {aliases}")
-
-    except Exception as e:
-        raise RuntimeError(f"FMP fetch fail for {symbol}: {e}")
-        
-def fetch_ohlc_freeforex(symbol: str, interval: str = "15m", limit: int = 200) -> pd.DataFrame:
+def fetch_ohlc_freeforex(symbol: str, interval: str="15m", limit: int=200) -> pd.DataFrame:
     """
-    FreeForexAPI fallback (gratis & realtime, tanpa API key)
-    Hanya mengembalikan harga terakhir XAUUSD/XAGUSD/forex pair.
+    FreeForexAPI fallback: returns the latest rate and synthesizes small-swing candles.
+    Useful when no paid API available (best-effort).
     """
     try:
         url = f"https://www.freeforexapi.com/api/live?pairs={symbol.upper()}"
@@ -288,33 +313,26 @@ def fetch_ohlc_freeforex(symbol: str, interval: str = "15m", limit: int = 200) -
         rate = j["rates"][symbol.upper()]
         price = float(rate["rate"])
         now = datetime.utcnow()
-        # buat dataframe dummy 200 candle dengan variasi harga kecil
         data = []
         for i in range(limit):
-            t = now - pd.Timedelta(minutes=i * 3)  # 3m interval simulasi
-            p = price * (1 + np.random.normal(0, 0.0005))  # ±0.05% noise
+            t = now - pd.Timedelta(minutes=i * 3)
+            p = price * (1 + np.random.normal(0, 0.0005))
             data.append({"timestamp": t, "open": p, "high": p * 1.0003, "low": p * 0.9997, "close": p, "volume": 0.0})
         df = pd.DataFrame(data).sort_values("timestamp").set_index("timestamp")
-        print(f"[FETCH] ✅ FreeForexAPI OK — simulated {len(df)} candles for {symbol}")
         return df
     except Exception as e:
         raise RuntimeError(f"FreeForexAPI fail for {symbol}: {e}")
-        
-def fetch_ohlc_goldapi(symbol: str, interval: str = "3m", limit: int = 200) -> pd.DataFrame:
+
+def fetch_ohlc_goldapi(symbol: str, interval: str="3m", limit: int=200) -> pd.DataFrame:
     """
-    GoldAPI.io real-time metals feed (free plan available)
+    GoldAPI fallback for metals when GOLDAPI_KEY available. Synthesizes candles around live price.
     """
     try:
-        import requests, numpy as np, pandas as pd
-        from datetime import datetime, timedelta
         sym = symbol.upper()
         if sym not in ["XAUUSD", "XAGUSD", "GOLDUSD", "SILVERUSD"]:
             raise RuntimeError("Unsupported symbol for GoldAPI")
-
-        GOLDAPI_KEY = os.getenv("GOLDAPI_KEY", "")
         if not GOLDAPI_KEY:
             raise RuntimeError("GOLDAPI_KEY not set")
-
         url = f"https://www.goldapi.io/api/{'XAU/USD' if 'XAU' in sym else 'XAG/USD'}"
         headers = {"x-access-token": GOLDAPI_KEY}
         r = requests.get(url, headers=headers, timeout=10)
@@ -322,11 +340,10 @@ def fetch_ohlc_goldapi(symbol: str, interval: str = "3m", limit: int = 200) -> p
         live_price = j.get("price")
         if not live_price:
             raise RuntimeError(f"Invalid GoldAPI response: {j}")
-
         now = datetime.utcnow()
         candles = []
         for i in range(limit):
-            t = now - timedelta(minutes=i * 3)
+            t = now - pd.Timedelta(minutes=i * 3)
             noise = np.random.normal(0, 0.0009)
             p = live_price * (1 + noise)
             candles.append({
@@ -338,22 +355,27 @@ def fetch_ohlc_goldapi(symbol: str, interval: str = "3m", limit: int = 200) -> p
                 "volume": np.random.randint(100, 1000)
             })
         df = pd.DataFrame(candles).sort_values("timestamp").set_index("timestamp")
-        print(f"[FETCH] ✅ GoldAPI OK — simulated {len(df)} candles for {symbol}")
         return df
     except Exception as e:
         raise RuntimeError(f"GoldAPI fetch failed for {symbol}: {e}")
 
-def fetch_ohlc_any(symbol: str, interval: str = "15m", limit: int = 500) -> pd.DataFrame:
+def fetch_ohlc_any(symbol: str, interval: str="15m", limit: int=500) -> pd.DataFrame:
     """
-    Universal data fetcher:
-    - Auto route between Binance, TwelveData, AlphaVantage, and Finnhub
-    - Auto convert metals (XAUUSD, XAGUSD, GOLD, SILVER → XAUSDT / XAGUSDT)
-    - Supports both crypto and forex pairs seamlessly
+    Universal fetcher with multiple fallbacks:
+    1) Auto-convert some metal tickers to Binance-compatible ones (XAUSDT/XAGUSDT)
+    2) Try Binance (fast & free) when symbol looks like crypto or XAUSDT endswith USDT
+    3) Try TwelveData for forex-like tickers
+    4) Try AlphaVantage for forex
+    5) Try Finnhub
+    6) Try FMP
+    7) Try FreeForexAPI
+    8) Try GoldAPI for metals
+    If all fail => raise RuntimeError
     """
+    if not symbol or not isinstance(symbol, str):
+        raise RuntimeError("invalid_symbol")
     original_symbol = symbol.upper().replace(" ", "").replace("/", "")
-    print(f"[FETCH] 🔎 Requesting OHLC for {original_symbol} ({interval}) with limit={limit}")
-
-    # 🟡 1️⃣ Auto-convert for Gold & Silver
+    # auto-convert metals to Binance-like where possible
     metal_aliases = {
         "XAUUSD": "XAUSDT",
         "XAU/USD": "XAUSDT",
@@ -364,83 +386,66 @@ def fetch_ohlc_any(symbol: str, interval: str = "15m", limit: int = 500) -> pd.D
         "SILVERUSD": "XAGUSDT"
     }
     symbol = metal_aliases.get(original_symbol, original_symbol)
-    if symbol != original_symbol:
-        print(f"[AUTO-CONVERT] 🟡 {original_symbol} → {symbol} (Binance-compatible)")
 
-    # 🧠 2️⃣ Detect if Forex (e.g., EURUSD, GBPJPY, USDJPY)
+    # heuristic: detect forex if both sides are alphabetic and length 6 or endswith common fiat codes
     forex_pairs = ["USD", "EUR", "GBP", "JPY", "CHF", "AUD", "NZD", "CAD"]
     is_forex = any(original_symbol.startswith(c) or original_symbol.endswith(c) for c in forex_pairs)
-    print(f"[FETCH] 🔎 Market detection → Forex={is_forex}")
 
-    # 🟢 3️⃣ Try Binance first (Crypto or Metals)
-    if not is_forex or symbol.endswith("USDT"):
+    # Try Binance for cryptos/metals with USDT
+    if (not is_forex) or symbol.endswith("USDT"):
         try:
-            print(f"[FETCH] 🟢 Trying Binance for {symbol}")
             df = fetch_ohlc_binance(symbol, interval, limit)
-            print(f"[FETCH] ✅ Binance OK — got {len(df)} candles for {symbol}")
             return df
-        except Exception as e:
-            print(f"[FETCH] ⚠️ Binance failed for {symbol}: {e}")
+        except Exception:
+            pass
 
-    # 🟡 4️⃣ Try TwelveData for Forex
+    # Try TwelveData (good for forex)
     try:
-        print(f"[FETCH] 🟡 Trying TwelveData for {original_symbol}")
         df = fetch_ohlc_twelvedata(original_symbol, interval, limit)
-        print(f"[FETCH] ✅ TwelveData OK — got {len(df)} candles for {original_symbol}")
         return df
-    except Exception as e:
-        print(f"[FETCH] ⚠️ TwelveData failed for {original_symbol}: {e}")
+    except Exception:
+        pass
 
-    # 🔵 5️⃣ Try AlphaVantage for Forex
+    # Try AlphaVantage (forex)
     try:
-        print(f"[FETCH] 🔵 Trying AlphaVantage for {original_symbol}")
         df = fetch_ohlc_alpha_forex(original_symbol, interval, limit)
-        print(f"[FETCH] ✅ AlphaVantage OK — got {len(df)} candles for {original_symbol}")
         return df
-    except Exception as e:
-        print(f"[FETCH] ❌ AlphaVantage failed for {original_symbol}: {e}")
+    except Exception:
+        pass
 
-    # 🟣 6️⃣ Try Finnhub as ultimate fallback
+    # Try Finnhub
     try:
-        print(f"[FETCH] 🟣 Trying Finnhub for {original_symbol}")
         df = fetch_ohlc_finnhub(original_symbol, interval, limit)
-        print(f"[FETCH] ✅ Finnhub OK — got {len(df)} candles for {original_symbol}")
         return df
-    except Exception as e:
-        print(f"[FETCH] ⚠️ Finnhub failed for {original_symbol}: {e}")
-        
-     # 🟤 7️⃣ Try FMP fallback (works for XAUUSD, XAGUSD, and forex)
+    except Exception:
+        pass
+
+    # Try FMP fallback
     try:
-        print(f"[FETCH] 🟤 Trying FMP for {original_symbol}")
         df = fetch_ohlc_fmp(original_symbol, interval, limit)
-        print(f"[FETCH] ✅ FMP OK — got {len(df)} candles for {original_symbol}")
         return df
-    except Exception as e:
-        print(f"[FETCH] ⚠️ FMP failed for {original_symbol}: {e}")
-        
-    # 🟤 8️⃣ Try FreeForexAPI fallback (gratis)
+    except Exception:
+        pass
+
+    # FreeForexAPI as last-resort for forex
     try:
-        print(f"[FETCH] 🟤 Trying FreeForexAPI for {original_symbol}")
         df = fetch_ohlc_freeforex(original_symbol, interval, limit)
-        print(f"[FETCH] ✅ FreeForexAPI OK — got simulated candles for {original_symbol}")
         return df
-    except Exception as e:
-        print(f"[FETCH] ⚠️ FreeForexAPI failed for {original_symbol}: {e}")
-        
-    # 🟣 8️⃣ Try GoldAPI fallback (real-time metals)
+    except Exception:
+        pass
+
+    # GoldAPI for metals if key available
     try:
         if original_symbol.upper() in ["XAUUSD", "XAGUSD", "GOLDUSD"]:
-            print(f"[FETCH] ⚙️ Trying GoldAPI fallback for {original_symbol}")
             df = fetch_ohlc_goldapi(original_symbol, interval, limit)
             return df
-    except Exception as e:
-        print(f"[FETCH] ⚠️ GoldAPI fallback failed for {original_symbol}: {e}")
+    except Exception:
+        pass
 
-    # 🔴 9️⃣ All data sources failed
     raise RuntimeError(f"All data sources failed for {original_symbol}")
-    
 
 # ---------------- INDICATORS ----------------
+# Thin wrappers around 'ta' library to centralize indicator calls.
 def ema(series: pd.Series, n:int):
     return ta.trend.EMAIndicator(series, window=n).ema_indicator()
 
@@ -448,9 +453,10 @@ def rsi(series: pd.Series, n:int=14):
     return ta.momentum.RSIIndicator(series, window=n).rsi()
 
 def atr(df: pd.DataFrame, n:int=14):
+    # returns ATR series for df
     return ta.volatility.AverageTrueRange(df['high'], df['low'], df['close'], window=n).average_true_range()
 
-# ---------------- SMC / ICT Utilities (original) ----------------
+# ---------------- SMC / ICT Utilities ----------------
 from datetime import time as dtime
 
 def parse_time(s):
@@ -458,6 +464,10 @@ def parse_time(s):
     return dtime(h, m)
 
 def in_killzone(check_dt: datetime) -> bool:
+    """
+    Check whether given datetime falls into configured ICT KILLZONE.
+    If killzone disabled -> always True (allowed)
+    """
     if not ICT_KILLZONE_ENABLE:
         return True
     start = parse_time(ICT_KILLZONE_START); end = parse_time(ICT_KILLZONE_END)
@@ -467,6 +477,11 @@ def in_killzone(check_dt: datetime) -> bool:
     return t >= start or t <= end
 
 def detect_structure_simple(df: pd.DataFrame, lookback=30):
+    """
+    Very simple structure detection:
+    - counts of higher highs vs lower lows in diff series to infer bias
+    - returns 'bull','bear' or 'range'
+    """
     if len(df) < lookback:
         return {'bias': 'neutral'}
     hh = (df['high'].diff() > 0).sum()
@@ -476,6 +491,9 @@ def detect_structure_simple(df: pd.DataFrame, lookback=30):
     return {'bias':'range'}
 
 def detect_liquidity_sweep(df: pd.DataFrame, lookback=50):
+    """
+    Detect potential liquidity sweep: last candle's high > 98th percentile OR low < 2nd percentile
+    """
     if len(df) < lookback:
         return {'sweep': False}
     recent = df[-lookback:]
@@ -487,6 +505,9 @@ def detect_liquidity_sweep(df: pd.DataFrame, lookback=50):
     return {'sweep': sweep_up or sweep_down, 'sweep_up': bool(sweep_up), 'sweep_down': bool(sweep_down)}
 
 def detect_order_blocks(df: pd.DataFrame, lookback=60):
+    """
+    Lightweight order block detection: look for candles where net move is large relative to recent average range.
+    """
     res = {'bull_ob': None, 'bear_ob': None}
     for i in range(len(df)-3, 3, -1):
         window = df.iloc[i-3:i+1]
@@ -497,6 +518,9 @@ def detect_order_blocks(df: pd.DataFrame, lookback=60):
     return res
 
 def detect_fvg(df: pd.DataFrame, lookback=40):
+    """
+    Fair value gap (FVG) detection - classic three-candle gap detection.
+    """
     fvg = []
     for i in range(2, min(len(df), lookback)):
         c1 = df.iloc[-i]; c2 = df.iloc[-i+1]
@@ -507,6 +531,9 @@ def detect_fvg(df: pd.DataFrame, lookback=40):
     return fvg
 
 def adaptive_bias_from_htf(htf_dict):
+    """
+    Combine HTF biases (1w,1d,1h default) into adaptive bias label with weights.
+    """
     weights = {'1w':3, '1d':2, '1h':1}
     score = 0
     for tf, d in htf_dict.items():
@@ -520,8 +547,14 @@ def adaptive_bias_from_htf(htf_dict):
     return 'neutral'
 
 # ---------------- PRO SMC + VOLUME FUNCTIONS (NEW) ----------------
+# The PRO (professional) SMC engine combines structure (BOS), FVG, OB detection
+# with volume-derived confidence and liquidity/orderflow add-ons.
 
 def detect_bos_pro(df: pd.DataFrame, lookback=50, atr_mul=1.0):
+    """
+    Detect Break Of Structure (BOS) using swing high/low + ATR margin.
+    Returns bias: LONG/SHORT/NEUTRAL and the bos_level price reference.
+    """
     if len(df) < lookback + 3:
         return {"bias": "NEUTRAL", "bos_level": None}
     if 'atr' not in df.columns:
@@ -542,6 +575,9 @@ def detect_bos_pro(df: pd.DataFrame, lookback=50, atr_mul=1.0):
         return {"bias": "NEUTRAL", "bos_level": None}
 
 def detect_fvg_pro(df: pd.DataFrame, atr_mul=1.5, min_gap_ratio=0.002):
+    """
+    PRO-style FVG detection with ATR scaling and body-wick checks for strong candles.
+    """
     results = []
     if len(df) < 6:
         return results
@@ -567,6 +603,10 @@ def detect_fvg_pro(df: pd.DataFrame, atr_mul=1.5, min_gap_ratio=0.002):
     return results
 
 def detect_order_blocks_pro(df: pd.DataFrame, lookback=40, atr_mul=1.5):
+    """
+    Order blocks detection tuned to look for strong bullish/bearish candles with big body relative to ATR.
+    Returns an array of detected OBs with type, level and strength.
+    """
     obs = []
     if len(df) < lookback:
         return obs
@@ -586,6 +626,13 @@ def detect_order_blocks_pro(df: pd.DataFrame, lookback=40, atr_mul=1.5):
     return obs
 
 def add_volume_features(df: pd.DataFrame):
+    """
+    Add derived volume features:
+    - vol_delta, vol_ma20, vol_ratio
+    - pv/nv (proxy buy/sell volume)
+    - vol_imbalance_score (0..1)
+    - absorption_flag (possible absorption if price moves but volume drops)
+    """
     df = df.copy()
     if 'volume' not in df.columns:
         df['volume'] = 0.0
@@ -605,8 +652,15 @@ def add_volume_features(df: pd.DataFrame):
     return df
 
 def compute_volume_confidence(df: pd.DataFrame, idx=-1):
+    """
+    Compute a [0..1] volume confidence score from vol_imbalance_score and vol_ratio.
+    - Penalize signals when absorption_flag is True (possible untrusted spike).
+    """
+    if df is None or df.empty:
+        return 0.5
     if 'vol_imbalance_score' not in df.columns:
         df = add_volume_features(df)
+    idx = idx if abs(idx) < len(df) else -1
     row = df.iloc[idx]
     vol_ratio = float(row.get('vol_ratio', 1.0))
     imb_score = float(row.get('vol_imbalance_score', 0.5))
@@ -617,16 +671,105 @@ def compute_volume_confidence(df: pd.DataFrame, idx=-1):
         base *= 0.5
     return float(np.clip(base, 0.0, 1.0))
 
+# ---------------- LIQUIDITY & ORDERFLOW (ADDED) ----------------
+import math
+from collections import Counter
+
+def map_liquidity_zones(df: pd.DataFrame, lookback: int = 200, bin_size_pct: float = 0.0015, min_cluster_count: int = 3):
+    """
+    Map liquidity pools by binning highs/lows into price buckets and count clusters.
+    Returns top zones sorted by 'strength' (count * avg_wick).
+    """
+    df = df.copy().tail(lookback)
+    if df.empty:
+        return []
+    highs = df['high'].astype(float).values
+    lows = df['low'].astype(float).values
+    closes = df['close'].astype(float).values
+    median_price = float(np.median(closes)) if len(closes) else float(closes[-1])
+    bin_size = max(1e-8, median_price * bin_size_pct)
+
+    def make_bins(arr):
+        return (np.round(arr / bin_size) * bin_size).tolist()
+
+    high_bins = make_bins(highs)
+    low_bins = make_bins(lows)
+
+    high_counts = Counter(high_bins)
+    low_counts = Counter(low_bins)
+
+    zones = []
+    for price_bin, cnt in high_counts.items():
+        if cnt >= min_cluster_count:
+            mask = (np.abs(highs - price_bin) <= bin_size)
+            avg_wick = float(np.mean((df['high'] - df['low'])[mask])) if mask.any() else float(np.mean(df['high']-df['low']))
+            zones.append({'type': 'sell_stops', 'price': float(price_bin), 'strength': float(cnt) * avg_wick})
+
+    for price_bin, cnt in low_counts.items():
+        if cnt >= min_cluster_count:
+            mask = (np.abs(lows - price_bin) <= bin_size)
+            avg_wick = float(np.mean((df['high'] - df['low'])[mask])) if mask.any() else float(np.mean(df['high']-df['low']))
+            zones.append({'type': 'buy_stops', 'price': float(price_bin), 'strength': float(cnt) * avg_wick})
+
+    zones = sorted(zones, key=lambda x: x['strength'], reverse=True)
+    return zones[:12]
+
+def compute_orderflow_heatmap(df: pd.DataFrame, lookback: int = 200, bins: int = 20):
+    """
+    Build a price-bin heatmap summarizing buy/sell volume proxy.
+    Returns dict {price_bin_center: {'buy':..., 'sell':..., 'imbalance': ...}}
+    """
+    df = df.copy().tail(lookback)
+    if df.empty:
+        return {}
+    high = float(df['high'].max())
+    low = float(df['low'].min())
+    if high <= low:
+        return {}
+    bin_edges = np.linspace(low, high, bins+1)
+    df['pv'] = ((df['close'] > df['open']).astype(float)) * df['volume']
+    df['nv'] = ((df['close'] < df['open']).astype(float)) * df['volume']
+    mid = (df['high'] + df['low']) / 2.0
+    inds = np.digitize(mid, bin_edges) - 1
+    heat = {}
+    for i in range(bins):
+        mask = inds == i
+        if not mask.any():
+            continue
+        buy = float(df['pv'][mask].sum())
+        sell = float(df['nv'][mask].sum())
+        center = float((bin_edges[i] + bin_edges[i+1]) / 2.0)
+        imb = (buy - sell) / (buy + sell + 1e-9)
+        heat[round(center, 8)] = {'buy': round(buy,8), 'sell': round(sell,8), 'imbalance': round(float(imb),3)}
+    return dict(sorted(heat.items(), key=lambda kv: abs(kv[1]['imbalance']), reverse=True))
+
+# ---------------- SIGNAL GENERATION (PRO) ----------------
 def generate_ict_signal_pro(entry_df: pd.DataFrame, pair: str = None, tf: str = '15m', ml_confidence: Optional[float] = None) -> Dict[str, Any]:
-    # Prepare df
+    """
+    Main PRO signal generator that integrates:
+    - SMC structural signals (BOS)
+    - Order blocks & FVG detection
+    - Volume-derived confidence
+    - Liquidity & orderflow add-ons
+    Returns a signal dict containing entry/tp/sl/confidence and detailed diagnostics.
+    """
+    if entry_df is None or entry_df.empty:
+        return {
+            "pair": pair, "timeframe": tf, "signal_type": "WAIT",
+            "entry": 0.0, "tp1": 0.0, "tp2": 0.0, "sl": 0.0,
+            "confidence": 0.0, "reasoning": "no_data", "details": {}
+        }
     df = entry_df.copy()
     df = add_volume_features(df)
     if 'atr' not in df.columns:
         df['atr'] = atr(df, 14)
-    # Detect structures
+
+    # Detect main SMC structures
     bos = detect_bos_pro(df, lookback=60)
     fvg = detect_fvg_pro(df, atr_mul=1.5)
     obs = detect_order_blocks_pro(df, lookback=60)
+
+    # Base SMC score: simplified additive scoring
     smc_score = 0.0
     bias = bos.get('bias', 'NEUTRAL')
     ob_strength = sum([o.get('strength', 0.0) for o in obs])
@@ -642,22 +785,58 @@ def generate_ict_signal_pro(entry_df: pd.DataFrame, pair: str = None, tf: str = 
     if fvg:
         smc_score += 0.15
     smc_conf = float(np.clip(smc_score, 0.0, 1.0))
+
+    # Volume confidence
     vol_conf = compute_volume_confidence(df, idx=-1)
     ml_conf = float(ml_confidence) if ml_confidence is not None else 0.0
+
+    # Weighted fusion
     final_conf = WEIGHT_SMC * smc_conf + WEIGHT_VOL * vol_conf + WEIGHT_ML * ml_conf
-    # dynamic adj by vol
+
+    # Dynamic adjustments
     if vol_conf > 0.75:
         final_conf = min(1.0, final_conf + 0.05)
     elif vol_conf < 0.3:
         final_conf = max(0.0, final_conf - 0.05)
     final_conf = float(np.clip(final_conf, 0.0, 1.0))
+
+    # Liquidity & Orderflow add-ons
+    try:
+        liq_zones = map_liquidity_zones(df, lookback=200)
+        of_heat = compute_orderflow_heatmap(df, lookback=200, bins=24)
+        # if orderflow supports bias then boost confidence
+        if bias == 'LONG':
+            if any(v['imbalance'] > 0.25 for v in of_heat.values()) if of_heat else False:
+                final_conf = min(1.0, final_conf + 0.05)
+        elif bias == 'SHORT':
+            if any(v['imbalance'] < -0.25 for v in of_heat.values()) if of_heat else False:
+                final_conf = min(1.0, final_conf + 0.05)
+    except Exception:
+        liq_zones = []
+        of_heat = {}
+
+    # Package details
+    details = {
+        "smc_conf": smc_conf,
+        "vol_conf": vol_conf,
+        "ml_conf": ml_conf,
+        "bos": bos,
+        "fvg": fvg,
+        "order_blocks": obs,
+        "liquidity_zones": liq_zones,
+        "orderflow_heatmap_top": dict(list(of_heat.items())[:8])
+    }
+
+    # Decide signal label
     signal_type = "WAIT"
     if final_conf >= STRONG_THRESHOLD and bias in ('LONG','SHORT'):
         signal_type = bias
     elif final_conf >= WEAK_THRESHOLD and bias in ('LONG','SHORT'):
         signal_type = bias + "_WEAK"
+
+    # Calculate entries/tps/sl anchored on last price and ATR
     last_close = float(df['close'].iat[-1])
-    last_atr = float(df['atr'].iat[-1]) if not np.isnan(df['atr'].iat[-1]) else (last_close*0.001)
+    last_atr = float(df['atr'].iat[-1]) if not np.isnan(df['atr'].iat[-1]) else (last_close * 0.001)
     if signal_type.startswith("LONG"):
         entry = last_close + 0.5 * last_atr
         sl = last_close - 1.5 * last_atr
@@ -670,15 +849,20 @@ def generate_ict_signal_pro(entry_df: pd.DataFrame, pair: str = None, tf: str = 
         tp2 = last_close - 3.6 * last_atr
     else:
         entry = tp1 = tp2 = sl = last_close
+
     return {
         "pair": pair, "timeframe": tf, "signal_type": signal_type,
         "entry": round(entry,8), "tp1": round(tp1,8), "tp2": round(tp2,8), "sl": round(sl,8),
         "confidence": round(final_conf,3), "reasoning": f"PRO SMC bias={bias}",
-        "details": {"smc_conf": smc_conf, "vol_conf": vol_conf, "ml_conf": ml_conf, "bos": bos, "fvg": fvg, "order_blocks": obs}
+        "details": details
     }
 
 # ---------------- HYBRID TECHNICAL ENGINE (original) ----------------
 def hybrid_analyze(df: pd.DataFrame, pair:Optional[str]=None, timeframe:Optional[str]=None) -> dict:
+    """
+    A fallback/more generic technical analyzer using EMA, RSI, ATR, Fibonacci support/resistance heuristics.
+    Returns entry/tp/sl/confidence and reasoning.
+    """
     df = df.copy().dropna().reset_index(drop=True)
     if df.shape[0] < 12:
         return {"error":"data_tidak_cukup", "message":"Perlu minimal 12 candle untuk analisis."}
@@ -697,10 +881,12 @@ def hybrid_analyze(df: pd.DataFrame, pair:Optional[str]=None, timeframe:Optional
     trend = "bullish" if ema20 > ema50 else "bearish"
     prev = df['close'].iloc[-2]; last_close = df['close'].iloc[-1]
     bos = None
+    # detect simple BOS from 20-candle breakout
     if prev <= df['high'].rolling(20).max().iloc[-2] and last_close > df['high'].rolling(20).max().iloc[-2]:
         bos = "BOS_UP"
     elif prev >= df['low'].rolling(20).min().iloc[-2] and last_close < df['low'].rolling(20).min().iloc[-2]:
         bos = "BOS_DOWN"
+
     if bos == "BOS_UP" or (trend == "bullish" and price > ema20):
         entry = price; sl = recent_low - atr_now*0.6
         rr = entry - sl if entry>sl else price*0.01
@@ -744,16 +930,18 @@ _cached_rf = None
 _cached_xgb = None
 
 def build_dataset_from_trade_log():
+    """
+    Build training dataset for RF from the trade_log.csv.
+    Labels: 1 if backtest_hit starts with 'TP', else 0.
+    For each row we compute features by fetching OHLC (via fetch_ohlc_any) and measuring technical features.
+    """
     if not os.path.exists(TRADE_LOG_FILE):
         return None, None
     df = pd.read_csv(TRADE_LOG_FILE)
     rows, labels = [], []
     for _, r in df.iterrows():
         hit = str(r.get("backtest_hit", "")).upper()
-        if hit.startswith("TP"):
-            label = 1
-        else:
-            label = 0
+        label = 1 if hit.startswith("TP") else 0
         try:
             entry = float(r.get("entry", 0))
             sl = float(r.get("sl", entry))
@@ -769,6 +957,10 @@ def build_dataset_from_trade_log():
     return X, y
 
 def compute_features_for_row(pair: str, timeframe: str, entry: float, tp: Optional[float], sl: float):
+    """
+    Compute features used for ML training/prediction for a single logged trade row.
+    Features designed to be simple & robust.
+    """
     try:
         kdf = fetch_ohlc_any(pair, timeframe, limit=200)
     except Exception:
@@ -788,8 +980,8 @@ def compute_features_for_row(pair: str, timeframe: str, entry: float, tp: Option
     vol_now = vol.iloc[-1] if len(vol)>0 else 0.0
     vol_spike = 1.0 if vol_now > vol_mean * 1.8 else 0.0
     recent_high = high.tail(80).max(); recent_low = low.tail(80).min()
-    dist_to_high = (recent_high - entry) / entry if entry else 0.0
-    dist_to_low = (entry - recent_low) / entry if entry else 0.0
+    dist_to_high = (recent_high - entry) / (entry if entry else 1)
+    dist_to_low = (entry - recent_low) / (entry if entry else 1)
     rr = abs((tp - entry) / (entry - sl)) if (tp is not None and (entry - sl) != 0) else 0.0
     return {
         "ema8_21_diff": float((ema8 - ema21) / (entry if entry != 0 else 1)),
@@ -802,6 +994,10 @@ def compute_features_for_row(pair: str, timeframe: str, entry: float, tp: Option
     }
 
 def train_and_save_rf():
+    """
+    Train RF using rows from trade log. Save to MODEL_RF_FILE using joblib.
+    Returns dict summary.
+    """
     X, y = build_dataset_from_trade_log()
     if X is None or len(y) < MIN_SAMPLES_TO_TRAIN:
         return {"status":"data_tidak_cukup", "samples": 0 if y is None else len(y)}
@@ -814,6 +1010,9 @@ def train_and_save_rf():
     return {"status":"trained", "samples": len(y)}
 
 def load_or_get_rf():
+    """
+    Load RF model from disk if not cached. Return dict {"clf":clf,"features":[...]} or None.
+    """
     global _cached_rf
     if _cached_rf is not None:
         return _cached_rf
@@ -826,6 +1025,10 @@ def load_or_get_rf():
     return None
 
 def train_and_save_xgb(df_log: Optional[pd.DataFrame] = None):
+    """
+    Train a small XGBoost model (light) directly from a DataFrame (df_log).
+    Saves model using model.save_model(MODEL_XGB_FILE)
+    """
     if df_log is None or len(df_log) < MIN_SAMPLES_TO_TRAIN:
         return None
     df = df_log.copy()
@@ -844,18 +1047,31 @@ def train_and_save_xgb(df_log: Optional[pd.DataFrame] = None):
         return {"error": str(e)}
 
 def predict_with_rf(payload: Dict[str, Any]):
+    """
+    Use loaded RF to predict probability that a logged trade would hit TP.
+    Expects payload to contain 'pair','timeframe','entry','tp1','sl'.
+    """
     mod = load_or_get_rf()
     if not mod:
         raise RuntimeError("model_rf_not_available")
     clf = mod["clf"]
+    saved_features = mod.get("features", None)
     feats = compute_features_for_row(payload.get("pair"), payload.get("timeframe","15m"), float(payload.get("entry")), payload.get("tp1"), float(payload.get("sl")))
     if feats is None:
         raise RuntimeError("gagal_menghitung_fitur")
     X = pd.DataFrame([feats])
+    if saved_features:
+        for f in saved_features:
+            if f not in X.columns:
+                X[f] = 0.0
+        X = X[saved_features]
     prob = float(clf.predict_proba(X)[:,1][0]) if hasattr(clf, "predict_proba") else float(clf.predict(X)[0])
     return {"prob": prob, "features": feats}
 
 def load_or_get_xgb():
+    """
+    Load cached XGBoost model (if saved) into memory.
+    """
     global _cached_xgb
     if _cached_xgb is not None:
         return _cached_xgb
@@ -870,6 +1086,10 @@ def load_or_get_xgb():
     return None
 
 def predict_confidence_xgb_from_model(signal_data: dict):
+    """
+    Predict probability via XGBoost model given a signal dict with entry/tp1/tp2/sl/confidence.
+    Returns probability float or None if model missing/error.
+    """
     model = load_or_get_xgb()
     if model is None:
         return None
@@ -884,8 +1104,14 @@ def predict_confidence_xgb_from_model(signal_data: dict):
     except Exception:
         return None
 
-# ---------------- SENTIMENT & FUSION (original) ----------------
+# ---------------- SENTIMENT & FUSION ----------------
 def get_crypto_sentiment():
+    """
+    Lightweight sentiment retrieval:
+    - Fear & Greed index via alternative.me
+    - BTC dominance via Coingecko global api
+    Best-effort, silently fails on error.
+    """
     out = {"fng": None, "btc_dom": None}
     try:
         r = requests.get("https://api.alternative.me/fng/", params={"limit": 1}, timeout=6)
@@ -904,6 +1130,10 @@ def get_crypto_sentiment():
     return out
 
 def fuse_confidence(tech_conf: float, market: str, crypto_sent: dict=None) -> float:
+    """
+    Fuse technical confidence with sentiment (for crypto) or neutral weighting (for forex).
+    Returns final confidence in [0..1].
+    """
     tech = float(tech_conf or 0.5)
     if market == "crypto":
         sent_score = 0.5
@@ -920,6 +1150,9 @@ def fuse_confidence(tech_conf: float, market: str, crypto_sent: dict=None) -> fl
     return round(max(0.0, min(1.0, final)), 3)
 
 def detect_market(pair: str) -> str:
+    """
+    Quick market detection: returns 'crypto' or 'forex' based on symbol heuristics.
+    """
     p = (pair or "").upper()
     if any(x in p for x in ["USDT","BUSD","BTC","ETH","SOL","BNB","ADA","DOGE"]):
         return "crypto"
@@ -927,8 +1160,81 @@ def detect_market(pair: str) -> str:
         return "forex"
     return "crypto"
 
+# ---------------- REINFORCE SIGNAL CONFIDENCE (NEW PATCH) ----------------
+def reinforce_signal_confidence(signal: dict, df_dict: Dict[str, pd.DataFrame]) -> dict:
+    """
+    Reinforce/adjust the signal confidence based on:
+    - HTF agreement (if df_dict contains HTF frames and they show bias)
+    - Volatility regime (ATR relative to price)
+    - Recent trade log model signals (if available)
+    This modifies signal['confidence'] and adds a 'reinforce' section to details.
+    """
+    try:
+        base_conf = float(signal.get("confidence", 0.0))
+        reinforce_notes = []
+        htf_bonus = 0.0
+
+        # HTF agreement: give small bonus if majority of HTFs share direction
+        if df_dict:
+            htf_biases = {}
+            for tf, df in df_dict.items():
+                try:
+                    s = detect_structure_simple(df, lookback=30)
+                    htf_biases[tf] = s.get('bias', 'neutral')
+                except Exception:
+                    htf_biases[tf] = 'neutral'
+            # count bull vs bear
+            bulls = sum(1 for v in htf_biases.values() if v == 'bull')
+            bears = sum(1 for v in htf_biases.values() if v == 'bear')
+            if bulls > bears and 'LONG' in signal.get('signal_type',''):
+                htf_bonus += 0.05
+                reinforce_notes.append("HTF_agree_long")
+            if bears > bulls and 'SHORT' in signal.get('signal_type',''):
+                htf_bonus += 0.05
+                reinforce_notes.append("HTF_agree_short")
+            signal.setdefault('details', {})['htf_biases'] = htf_biases
+
+        # Volatility adjustment: if ATR very low -> penalize overconfidence; if ATR high & volume supports -> boost
+        try:
+            # pick main timeframe df if available in df_dict
+            primary_df = None
+            if df_dict:
+                # prefer entry timeframe key
+                primary_df = next(iter(df_dict.values()))
+            if primary_df is not None and not primary_df.empty:
+                primary_df = primary_df.copy()
+                if 'atr' not in primary_df.columns:
+                    primary_df['atr'] = atr(primary_df, 14)
+                price = float(primary_df['close'].iat[-1])
+                atr_now = float(primary_df['atr'].iat[-1]) if not np.isnan(primary_df['atr'].iat[-1]) else 0.0
+                atr_rel = atr_now / price if price else 0.0
+                # low volatility regime -> reduce confidence slightly
+                if atr_rel < 0.0005:
+                    htf_bonus -= 0.04
+                    reinforce_notes.append("low_volatility_penalty")
+                elif atr_rel > 0.005:
+                    htf_bonus += 0.03
+                    reinforce_notes.append("high_volatility_bonus")
+        except Exception:
+            pass
+
+        # clamp adjustments and update
+        new_conf = float(np.clip(base_conf + htf_bonus, 0.0, 1.0))
+        signal['confidence'] = round(new_conf, 3)
+        signal.setdefault('details', {})['reinforce_notes'] = reinforce_notes
+        signal.setdefault('details', {})['htf_bonus'] = round(htf_bonus,3)
+    except Exception as e:
+        signal.setdefault('details', {})['reinforce_error'] = str(e)
+    return signal
+
 # ---------------- POSTPROCESS ----------------
 def _postprocess_with_learning(signal: Dict[str,Any]):
+    """
+    Combine model outputs and sentiment with the base signal confidence and optionally veto signals.
+    - Check RF and XGB models
+    - Fuse with sentiment for crypto
+    - Apply veto rule if ML extremely negative
+    """
     try:
         market = detect_market(signal.get("pair",""))
         crypto_sent = get_crypto_sentiment() if market=="crypto" else None
@@ -950,6 +1256,7 @@ def _postprocess_with_learning(signal: Dict[str,Any]):
                 model_prob = xgb_prob if model_prob is None else (model_prob + xgb_prob)/2.0
         except Exception as e:
             signal["model_xgb_error"] = str(e)
+
         orig = float(signal.get("confidence", 0.5))
         fused = fuse_confidence(orig, market, crypto_sent)
         if model_prob is not None:
@@ -958,6 +1265,7 @@ def _postprocess_with_learning(signal: Dict[str,Any]):
         signal["market_mode"] = market
         signal["sentiment"] = {"crypto": crypto_sent}
         if model_prob is not None and model_prob < 0.25:
+            # veto if model strongly negative
             signal["vetoed_by_model"] = True
             signal["signal_type"] = "WAIT"
         else:
@@ -968,6 +1276,10 @@ def _postprocess_with_learning(signal: Dict[str,Any]):
 
 # ---------------- BACKTEST COMM ----------------
 def post_to_backtester(payload: Dict[str,Any]) -> Dict[str,Any]:
+    """
+    Post payload to external backtester if BACKTEST_URL configured.
+    Returns the JSON response or error dict.
+    """
     if not BACKTEST_URL:
         return {"error":"BACKTEST_URL_not_configured"}
     try:
@@ -981,6 +1293,9 @@ def post_to_backtester(payload: Dict[str,Any]) -> Dict[str,Any]:
 
 # ---------------- TELEGRAM UTIL ----------------
 def send_telegram_message(text: str):
+    """
+    Send telegram message (HTML parse_mode). Threaded calls used for non-blocking behavior.
+    """
     if not TELEGRAM_AUTO_SEND or not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return {"ok": False, "reason": "telegram_not_configured"}
     try:
@@ -992,7 +1307,7 @@ def send_telegram_message(text: str):
         return {"ok": False, "reason": str(e)}
 
 # ---------------- ENDPOINTS ----------------
-app = FastAPI(title=APP_NAME, version="1.0")
+app = FastAPI(title=APP_NAME, version="2.0-detailed")
 
 @app.get("/health")
 def health():
@@ -1000,6 +1315,9 @@ def health():
 
 @app.get("/mode")
 def mode(pair: str = Query(...)):
+    """
+    Return detected market mode and recommended data sources.
+    """
     p = pair.upper()
     m = detect_market(p)
     sources = {"crypto": ["binance","coingecko","alternative.me"], "forex": ["twelvedata","alphavantage"]}
@@ -1007,6 +1325,9 @@ def mode(pair: str = Query(...)):
 
 @app.get("/context")
 def context(pair: str = Query(...), tf: str = Query("15m")):
+    """
+    Lightweight context endpoint returning last price and market type.
+    """
     p = pair.upper()
     m = detect_market(p)
     last_price = None
@@ -1017,8 +1338,35 @@ def context(pair: str = Query(...), tf: str = Query("15m")):
         last_price = None
     return respond({"pair": p, "mode": m, "last_price": last_price})
 
+@app.get("/liquidity_map")
+def liquidity_map(pair: str = Query(...), tf: str = Query("15m"), lookback: int = Query(400)):
+    """
+    Return liquidity zones and top orderflow heatmap entries.
+    """
+    try:
+        df = fetch_ohlc_any(pair, tf, limit=lookback)
+        zones = map_liquidity_zones(df, lookback=min(200, lookback))
+        heat = compute_orderflow_heatmap(df, lookback=min(200, lookback), bins=24)
+        return respond({
+            "pair": pair.upper(),
+            "timeframe": tf,
+            "liquidity_zones": zones,
+            "orderflow_heatmap_top": dict(list(heat.items())[:10])
+        })
+    except Exception as e:
+        return respond({"error": str(e)}, status_code=500)
+
 @app.get("/pro_signal")
 def pro_signal(pair: str = Query(...), tf_main: str = Query("1h"), tf_entry: str = Query("15m"), limit: int = Query(300), auto_log: bool = Query(True)):
+    """
+    Primary PRO signal endpoint:
+    - Fetch entry timeframe data and HTF frames
+    - Run generate_ict_signal_pro (PRO engine)
+    - If PRO returns WAIT, fallback to hybrid_analyze
+    - Position sizing (simple risk-percent)
+    - Append initial log, postprocess with learning, optional backtest + final log
+    - Optional telegram send
+    """
     try:
         df_dict = {}
         df_entry = fetch_ohlc_any(pair, tf_entry, limit=limit)
@@ -1030,17 +1378,23 @@ def pro_signal(pair: str = Query(...), tf_main: str = Query("1h"), tf_entry: str
             except Exception:
                 continue
 
-        # 1) Try PRO SMC (new)
+        # Generate PRO signal
         pro_res = generate_ict_signal_pro(df_entry, pair=pair, tf=tf_entry)
 
-        # if PRO says WAIT -> fallback ke hybrid analysis
+        # Fallback to hybrid analysis if PRO returns WAIT
         hybrid_res = hybrid_analyze(df_entry, pair=pair, timeframe=tf_entry)
         if pro_res.get("signal_type") == "WAIT":
             final = hybrid_res
         else:
             final = pro_res
 
-        # position sizing
+        # Optional reinforce by HTF & volatility
+        try:
+            final = reinforce_signal_confidence(final, df_dict)
+        except Exception:
+            pass
+
+        # Position sizing
         try:
             entry = float(final.get("entry", 0)); sl = float(final.get("sl", entry))
             risk_amount = ACCOUNT_BALANCE * RISK_PERCENT if ACCOUNT_BALANCE > 0 else 0
@@ -1050,17 +1404,17 @@ def pro_signal(pair: str = Query(...), tf_main: str = Query("1h"), tf_entry: str
         final["position_size"] = pos_size
         final["timestamp"] = datetime.utcnow().isoformat()
 
-        # log basic signal (first log before postprocessing/backtest to keep record)
+        # Log basic signal before postprocessing/backtest
         append_trade_log({
             "pair": final.get("pair"), "timeframe": final.get("timeframe"), "signal_type": final.get("signal_type"),
             "entry": final.get("entry"), "tp1": final.get("tp1"), "tp2": final.get("tp2"), "sl": final.get("sl"),
             "confidence": final.get("confidence"), "reasoning": final.get("reasoning"), "backtest_hit": None, "backtest_pnl": None
         })
 
-        # postprocess with learning/models
+        # Postprocess with learning/models
         final = _postprocess_with_learning(final)
 
-        # optional auto backtest + append backtest result to log
+        # Optional auto backtest + append backtest result to log
         if auto_log and BACKTEST_URL:
             bt = post_to_backtester({
                 "pair": final.get("pair"), "timeframe": final.get("timeframe"), "side": final.get("signal_type"),
@@ -1084,7 +1438,6 @@ def pro_signal(pair: str = Query(...), tf_main: str = Query("1h"), tf_entry: str
                             f"Type: {final.get('signal_type')} (conf {final.get('confidence')})\\n"
                             f"Entry: {final.get('entry')}  TP1: {final.get('tp1')}  SL: {final.get('sl')}\\n"
                             f"Reason: {final.get('reasoning')}")
-                    # Use daemon=True so thread won't block process exit
                     threading.Thread(target=send_telegram_message, args=(text,), daemon=True).start()
         except Exception:
             pass
@@ -1095,7 +1448,80 @@ def pro_signal(pair: str = Query(...), tf_main: str = Query("1h"), tf_entry: str
     except Exception as e:
         return respond({"error": f"internal_error: {e}"}, status_code=500)
 
+@app.get("/live_analyze")
+def live_analyze(pair: str = Query(...), entry_tf: str = Query("15m"), htf_limit: int = Query(200)):
+    """
+    New endpoint to produce a verbose live analysis:
+    - Returns HTF diagnostics, PRO signal, HYBRID result, models predictions,
+      liquidity map and orderflow snapshot in one call (good for dashboards).
+    """
+    try:
+        df_entry = fetch_ohlc_any(pair, entry_tf, limit=htf_limit)
+        df_htf_map = {}
+        for tf in ICT_HTF_LIST:
+            try:
+                df_htf_map[tf] = fetch_ohlc_any(pair, tf, limit=htf_limit)
+            except Exception:
+                df_htf_map[tf] = pd.DataFrame()
+        pro = generate_ict_signal_pro(df_entry, pair=pair, tf=entry_tf)
+        hybrid = hybrid_analyze(df_entry, pair=pair, timeframe=entry_tf)
+        # attempt ML predictions (RF/XGB) if models available
+        rf_pred = None; xgb_pred = None
+        try:
+            rf_mod = load_or_get_rf()
+            if rf_mod:
+                rf_pred = predict_with_rf({"pair": pair, "timeframe": entry_tf, "entry": pro['entry'], "tp1": pro['tp1'], "sl": pro['sl']})
+        except Exception as e:
+            rf_pred = {"error": str(e)}
+        try:
+            x = load_or_get_xgb()
+            if x:
+                xgb_p = predict_confidence_xgb_from_model(pro)
+                xgb_pred = xgb_p
+        except Exception as e:
+            xgb_pred = {"error": str(e)}
+        # liquidity & heatmap
+        zones = map_liquidity_zones(df_entry, lookback=200)
+        heat = compute_orderflow_heatmap(df_entry, lookback=200, bins=24)
+        # enrich pro with reinforcement
+        pro = reinforce_signal_confidence(pro, {**df_htf_map, entry_tf: df_entry})
+        # final pack
+        out = {
+            "pair": pair,
+            "entry_timeframe": entry_tf,
+            "pro_signal": pro,
+            "hybrid_signal": hybrid,
+            "rf_pred": rf_pred,
+            "xgb_pred": xgb_pred,
+            "liquidity_zones": zones,
+            "orderflow_heatmap_top": dict(list(heat.items())[:12]),
+            "htf_diagnostics": {tf: (df.shape[0] if df is not None else 0) for tf, df in df_htf_map.items()}
+        }
+        return respond(out)
+    except Exception as e:
+        return respond({"error": str(e)}, status_code=500)
+
+@app.get("/scalp_signal")
+def scalp_signal(pair: str = Query(...), tf: str = Query("5m"), limit: int = Query(200)):
+    """
+    Scalp endpoint (short timeframe) - returns PRO signal for quick execution.
+    """
+    try:
+        df = fetch_ohlc_any(pair, tf, limit=limit)
+        res = generate_ict_signal_pro(df, pair=pair, tf=tf)
+        return respond(res)
+    except Exception as e:
+        return respond({"error": str(e)}, status_code=500)
+
+# ---------------- CSV / Chart Analysis Endpoints ----------------
 def auto_format_csv(file_bytes: bytes) -> pd.DataFrame:
+    """
+    Robust CSV auto-format:
+    - attempt to infer separators
+    - rename common column headers to expected ones
+    - ensure timestamp + OHLC + volume
+    Returns cleaned DataFrame with columns: timestamp,open,high,low,close,volume
+    """
     import io, pandas as pd, numpy as np
     try:
         try:
@@ -1130,7 +1556,6 @@ def auto_format_csv(file_bytes: bytes) -> pd.DataFrame:
             if c not in df.columns:
                 raise ValueError(f"Kolom '{c}' tidak ditemukan")
 
-        # ganti fillna(method=...) deprecated dengan ffill/bfill
         for c in ["open", "high", "low", "close", "volume"]:
             df[c] = pd.to_numeric(df[c], errors="coerce")
             df[c] = df[c].ffill().bfill()
@@ -1147,7 +1572,7 @@ def auto_format_csv(file_bytes: bytes) -> pd.DataFrame:
         return df[["timestamp", "open", "high", "low", "close", "volume"]]
     except Exception as e:
         raise RuntimeError(f"auto_format_csv_error: {e}")
-        
+
 @app.post("/analyze_csv")
 def analyze_csv(
     file: UploadFile = File(...),
@@ -1156,56 +1581,50 @@ def analyze_csv(
     auto_backtest: Optional[str] = Form("true"),
     auto_log: Optional[str] = Form("true")
 ):
+    """
+    Upload CSV analysis endpoint - uses hybrid_analyze and auto-learning retrain hooks.
+    """
     auto_bt = auto_backtest.lower() != "false"
     auto_lg = auto_log.lower() != "false"
 
-    # baca file CSV
     try:
         contents = file.file.read()
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"invalid_csv_read: {e}")
 
-    if len(contents) > 7_000_000:  # ~7MB
+    if len(contents) > 7_000_000:
         raise HTTPException(status_code=400, detail="File terlalu besar (>7MB), kurangi data CSV.")
 
-    # gunakan auto_format_csv (jika error -> 400)
     try:
-        df = auto_format_csv(contents)  # df sudah berisi timestamp/open/high/low/close/volume
+        df = auto_format_csv(contents)
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-    # validasi lagi safety
     required = ["open", "high", "low", "close"]
     missing = [c for c in required if c not in df.columns]
     if missing:
         raise HTTPException(status_code=400, detail=f"CSV tidak valid, kolom hilang: {missing}")
 
-    # jaga ukuran file (safety)
     if len(df) > 50000:
         df = df.tail(5000)
         print(f"[CSV] ⚙️ File besar, hanya gunakan 5000 baris terakhir.")
 
-    # pastikan numeric & bersih
     for col in ["open","high","low","close","volume"]:
         df[col] = pd.to_numeric(df[col], errors="coerce").ffill().bfill()
     df = df.dropna().reset_index(drop=True)
     if df.shape[0] < 12:
         raise HTTPException(status_code=400, detail="CSV terlalu sedikit data (minimal 12 candle).")
 
-    # jalankan analisis
     try:
         res = hybrid_analyze(df, pair=pair or "CSV", timeframe=timeframe or "csv")
     except Exception as e:
-        # tangani error analisis agar tidak menimbulkan 500 tanpa pesan
         raise HTTPException(status_code=500, detail=f"analisis_gagal: {e}")
 
-    # postprocess learning safe
     try:
         res = _postprocess_with_learning(res)
     except Exception as e:
         res = {"error": "postprocess_failed", "detail": str(e)}
 
-    # optional backtest dan logging (bungkus try/except supaya tidak crash)
     bt_res = {}
     try:
         if auto_bt and BACKTEST_URL and res.get("signal_type") != "WAIT":
@@ -1229,7 +1648,7 @@ def analyze_csv(
         except Exception as e:
             print(f"[CSV LOGGING] error: {e}")
 
-    # auto-learning (sama logic, tapi bungkus aman)
+    # auto-learning: heuristic retrain of xgb when large new CSV provided
     try:
         import hashlib
         hash_val = hashlib.md5(contents).hexdigest()
@@ -1240,7 +1659,6 @@ def analyze_csv(
                 learned = json.load(f)
         if hash_val not in learned:
             if len(df) >= 1000:
-                print(f"[AUTO-LEARNING] 🔁 Retraining XGBoost dari CSV baru ({len(df)} baris)...")
                 df_learn = df.copy()
                 df_learn["signal_type"] = np.where(df_learn["close"].diff() > 0, "LONG", "SHORT")
                 df_learn["entry"] = df_learn["close"]
@@ -1266,7 +1684,6 @@ def analyze_csv(
     except Exception as e:
         print(f"[AUTO-LEARNING] ⚠️ Error retrain check: {e}")
 
-    # optional: kirim ringkasan ke Telegram (lakukan sebelum return)
     try:
         if TELEGRAM_AUTO_SEND and TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
             conf = float(res.get("confidence", 0))
@@ -1279,7 +1696,7 @@ def analyze_csv(
                     f"Entry: {res.get('entry')} | TP1: {res.get('tp1')} | SL: {res.get('sl')}\n"
                     f"Source: CSV upload"
                 )
-                threading.Thread(target=send_telegram_message, args=(text,)).start()
+                threading.Thread(target=send_telegram_message, args=(text,), daemon=True).start()
     except Exception as e:
         print(f"[TELEGRAM CSV] send failed: {e}")
 
@@ -1293,6 +1710,9 @@ def analyze_csv(
 
 @app.post("/analyze_chart")
 def analyze_chart(file: UploadFile = File(...), pair: Optional[str] = Form(None), timeframe: Optional[str] = Form(None)):
+    """
+    Basic chart OCR analysis (uses pytesseract). Very heuristic: extracts keywords from image and guesses bias.
+    """
     if not _HAS_TESSERACT:
         raise HTTPException(status_code=400, detail="tesseract_not_available")
     try:
@@ -1319,6 +1739,7 @@ def analyze_chart(file: UploadFile = File(...), pair: Optional[str] = Form(None)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"chart_analysis_error: {e}")
 
+# ---------------- LEARNING / LOGS / METRICS ----------------
 @app.get("/learning_status")
 def learning_status():
     info = {"rf_model_exists": os.path.exists(MODEL_RF_FILE), "xgb_model_exists": os.path.exists(MODEL_XGB_FILE)}
@@ -1385,31 +1806,45 @@ def get_logs(limit: int = Query(100)):
 # ---------------- STARTUP ----------------
 @app.on_event("startup")
 def startup_event():
+    """
+    On startup:
+    - Ensure trade log exists
+    - Attempt to load RF and XGB models into cache
+    """
     ensure_trade_log()
     global _cached_rf, _cached_xgb
+    # Load RandomForest model (RF)
     if os.path.exists(MODEL_RF_FILE):
         try:
             _cached_rf = joblib.load(MODEL_RF_FILE)
-            print("[startup] loaded rf model")
+            if isinstance(_cached_rf, dict) and "clf" in _cached_rf:
+                print("[startup] loaded rf model")
+            else:
+                # backward compatibility: older model may store clf only
+                _cached_rf = {"clf": _cached_rf, "features": None}
+                print("[startup] loaded rf model (no features metadata)")
         except Exception as e:
             print("[startup] rf load fail:", e)
-    if os.path.exists(MODEL_XGB_FILE):
-        try:
+            _cached_rf = None
+
+    # Load XGBoost model (XGB)
+    try:
+        if os.path.exists(MODEL_XGB_FILE):
             m = XGBClassifier()
             m.load_model(MODEL_XGB_FILE)
             _cached_xgb = m
             print("[startup] loaded xgb model")
-        except Exception as e:
-            print("[startup] xgb load fail:", e)
+    except Exception as e:
+        print("[startup] xgb load fail:", e)
 
 # ---------------- RUN (if executed directly) ----------------
 if __name__ == "__main__":
     import uvicorn
-    print(f"🚀 Starting {APP_NAME} on port {PORT} (Hybrid PRO Final)")
+    print(f"🚀 Starting {APP_NAME} on port {PORT} (Hybrid PRO Final v2 - detailed)")
     uvicorn.run(
-        "main_combined_learning_hybrid_pro_final:app",
+        "main_combined_learning_hybrid_pro_final_v2:app",
         host="0.0.0.0",
         port=PORT,
         reload=False,
-        log_level="info"   # ✅ tambahkan ini
+        log_level="info"
     )

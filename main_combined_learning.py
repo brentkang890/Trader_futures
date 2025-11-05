@@ -1159,30 +1159,39 @@ def pro_signal(pair: str = Query(...), tf_main: str = Query("1h"), tf_entry: str
                 df_dict[tf] = df_htf
             except:
                 continue
-        # 1) Try PRO SMC (new)
+# 1) Try PRO SMC (new)
         pro_res = generate_ict_signal_pro(df_entry, pair=pair, tf=tf_entry)
-        # if PRO says WAIT -> fallback to original multi-TF ICT
-        # if PRO says WAIT -> fallback to hybrid
-        # if PRO says WAIT -> fallback to hybrid
-        if pro_res.get("signal_type") == "WAIT":
-            try:
-                fallback = hybrid_analyze(df_entry, pair=pair, timeframe=tf_entry)
-            except Exception:
-                fallback = {"signal_type": "WAIT"}
-            if fallback.get("signal_type") != "WAIT":
-                final_raw = fallback
-                engine_used = "HYBRID"
-            else:
-                final_raw = pro_res
-                engine_used = "PRO_SMC"
-        else:
-            final_raw = pro_res
-            engine_used = "PRO_SMC"
 
-        # hybrid analysis complementary
-        hybrid_res = hybrid_analyze(df_entry, pair=pair, timeframe=tf_entry)
-        # prefer ICT/PRO unless it's WAIT then use hybrid
-        final = final_raw if final_raw.get("signal_type") != "WAIT" else hybrid_res
+# --- fallback handling (Hybrid Technical Engine) ---
+if pro_res.get("signal_type") == "WAIT":
+    try:
+        fallback = hybrid_analyze(df_entry, pair=pair, timeframe=tf_entry)
+    except Exception:
+        fallback = {"signal_type": "WAIT"}
+
+    if fallback.get("signal_type") != "WAIT":
+        final_raw = fallback
+        engine_used = "HYBRID"
+    else:
+        final_raw = pro_res
+        engine_used = "PRO_SMC"
+else:
+    final_raw = pro_res
+    engine_used = "PRO_SMC"
+
+# --- PATCH: add engine_mode info for Telegram and logs ---
+final_raw["engine_mode"] = engine_used
+
+# hybrid analysis complementary
+hybrid_res = hybrid_analyze(df_entry, pair=pair, timeframe=tf_entry)
+
+# prefer ICT/PRO unless it's WAIT then use hybrid
+if final_raw.get("signal_type") != "WAIT":
+    final = final_raw
+else:
+    final = hybrid_res
+
+final["engine_mode"] = final_raw.get("engine_mode", engine_used)
         # position sizing
         try:
             entry = float(final.get("entry",0)); sl = float(final.get("sl", entry))

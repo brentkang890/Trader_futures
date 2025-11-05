@@ -1,5 +1,6 @@
-# telegram_bot_full.py
+# telegram_bot_full_final.py
 # ProTraderAI - Full Telegram Bot (manual + auto-scan + status/logs/performance + csv/image + retrain)
+# Verbose Mode enabled (detailed console logging)
 # Requires environment variables: BOT_TOKEN, CHAT_ID, APP_URL
 # Requirements: python-telegram-bot==20.3, requests, apscheduler
 
@@ -47,6 +48,9 @@ else:
 
 AUTO_PAIRS = list(dict.fromkeys(AUTO_PAIRS_CRYPTO + AUTO_PAIRS_FOREX))
 
+# ---------------- VERBOSE MODE ----------------
+VERBOSE = True  # user requested verbose mode
+
 # ---------------- STATE ----------------
 scheduler = BackgroundScheduler()
 auto_job = None
@@ -55,6 +59,10 @@ auto_enabled = True  # default auto-scan ON
 stop_event = Event()
 
 # ---------------- HELPERS ----------------
+def vprint(*args, **kwargs):
+    if VERBOSE:
+        print(*args, **kwargs)
+
 def format_signal(result: dict) -> str:
     """Pretty-format a signal dict into Telegram message (HTML)."""
     if not isinstance(result, dict):
@@ -67,9 +75,22 @@ def format_signal(result: dict) -> str:
         tf = result.get("timeframe", "?")
         lines.append(f"📊 <b>{pair}</b> ({tf})")
         lines.append(f"💡 <b>{result.get('signal_type','?')}</b>")
+
+        # Engine mode (SMC/Hybrid/etc)
+        engine_mode = result.get("engine_mode")
+        if engine_mode:
+            if engine_mode.upper() == "SMC":
+                lines.append("🧩 Engine: SMC / ICT Smart Money")
+            elif engine_mode.upper() == "HYBRID":
+                lines.append("🧩 Engine: Hybrid Technical Fallback")
+            else:
+                lines.append(f"🧩 Engine: {engine_mode}")
+
+        # Harga & signal
         lines.append(f"🎯 Entry: <code>{result.get('entry')}</code>")
         lines.append(f"🎯 TP1: <code>{result.get('tp1')}</code> | TP2: <code>{result.get('tp2')}</code>")
         lines.append(f"🛑 SL: <code>{result.get('sl')}</code>")
+
         if result.get("confidence") is not None:
             lines.append(f"📊 Confidence: {result.get('confidence')}")
         if result.get("position_size"):
@@ -79,10 +100,11 @@ def format_signal(result: dict) -> str:
         if result.get("reasoning"):
             reasoning = str(result.get("reasoning"))[:800]
             lines.append(f"🧠 Reasoning: {reasoning}")
-        # backtest summary
+
+        # Backtest (optional)
         bt = result.get("backtest_raw") or result.get("backtest")
         if isinstance(bt, dict):
-            lines.append("")  # blank line
+            lines.append("")
             lines.append("📋 Backtest summary:")
             hit = bt.get("hit")
             pnl = bt.get("pnl_total") or bt.get("pnl")
@@ -133,29 +155,41 @@ def parse_pair_tf(text: str):
 def send_request_get(endpoint: str, params: dict = None, timeout: int = API_TIMEOUT):
     """Send GET request to backend APP_URL with error wrapper."""
     if not APP_URL:
+        vprint("[REQUEST] APP_URL not configured")
         return {"error": "APP_URL not configured"}
     url = f"{APP_URL.rstrip('/')}/{endpoint.lstrip('/')}"
+    vprint(f"[REQUEST GET] {url} params={params}")
     try:
         r = requests.get(url, params=params, timeout=timeout)
         try:
-            return r.json()
+            j = r.json()
+            vprint(f"[RESPONSE] {endpoint} -> {j if isinstance(j, dict) else str(j)[:250]}")
+            return j
         except Exception:
+            vprint(f"[RESPONSE] invalid json: {r.text[:250]}")
             return {"error": f"invalid_json_response: {r.text}"}
     except Exception as e:
+        vprint(f"[REQUEST ERROR] {e}")
         return {"error": str(e)}
 
 def send_request_post(endpoint: str, files: dict = None, data: dict = None, timeout: int = API_TIMEOUT):
     """Send POST request with files/data to backend APP_URL."""
     if not APP_URL:
+        vprint("[REQUEST] APP_URL not configured (post)")
         return {"error": "APP_URL not configured"}
     url = f"{APP_URL.rstrip('/')}/{endpoint.lstrip('/')}"
+    vprint(f"[REQUEST POST] {url} files={'yes' if files else 'no'} data_keys={list(data.keys()) if data else None}")
     try:
         r = requests.post(url, files=files, data=data, timeout=timeout)
         try:
-            return r.json()
+            j = r.json()
+            vprint(f"[RESPONSE POST] {endpoint} -> {j if isinstance(j, dict) else str(j)[:250]}")
+            return j
         except Exception:
+            vprint(f"[RESPONSE POST] invalid json: {r.text[:250]}")
             return {"error": f"invalid_json_response: {r.text}"}
     except Exception as e:
+        vprint(f"[REQUEST POST ERROR] {e}")
         return {"error": str(e)}
 
 # ---------------- AUTO-SCAN LOGIC ----------------
@@ -165,45 +199,51 @@ def auto_check_and_send(app):
     """
     bot = app.bot
     now = datetime.utcnow().isoformat()
-    print(f"[AUTO] Auto-scan start {now} - pairs {len(AUTO_PAIRS)} TF {AUTO_TIMEFRAMES}")
+    vprint(f"[AUTO] Auto-scan start {now} - pairs {len(AUTO_PAIRS)} TF {AUTO_TIMEFRAMES}")
     for pair in AUTO_PAIRS:
         for tf in AUTO_TIMEFRAMES:
             try:
                 params = {"pair": pair, "tf_entry": tf}
                 res = send_request_get("pro_signal", params=params)
                 if not isinstance(res, dict):
-                    print(f"[AUTO] non-dict response for {pair} {tf}: {res}")
+                    vprint(f"[AUTO] non-dict response for {pair} {tf}: {res}")
                     continue
                 if "error" in res:
-                    print(f"[AUTO] {pair} {tf} -> error: {res.get('error')}")
+                    vprint(f"[AUTO] {pair} {tf} -> error: {res.get('error')}")
                     continue
+
+                engine = res.get("engine_mode", "unknown")
+                vprint(f"[AUTO] {pair} {tf} -> engine={engine}, signal_type={res.get('signal_type')}, conf={res.get('confidence')}")
+
                 conf = float(res.get("confidence", 0) or 0)
                 if conf >= STRONG_SIGNAL_THRESHOLD and res.get("signal_type") and res.get("signal_type") != "WAIT":
                     msg = format_signal(res)
                     try:
                         if not CHAT_ID:
-                            print("[AUTO] CHAT_ID not configured; skipping send.")
+                            vprint("[AUTO] CHAT_ID not configured; skipping send.")
                         else:
                             bot.send_message(chat_id=int(CHAT_ID), text=msg, parse_mode="HTML")
-                            print(f"[AUTO] Sent strong signal {pair} {tf} (conf={conf})")
+                            vprint(f"[AUTO] Sent strong signal {pair} {tf} (conf={conf})")
                     except Exception as e:
-                        print(f"[AUTO ERROR] send_message failed for {pair} {tf}: {e}")
+                        vprint(f"[AUTO ERROR] send_message failed for {pair} {tf}: {e}")
                 else:
-                    print(f"[AUTO] {pair} {tf} no strong signal (conf={conf})")
+                    vprint(f"[AUTO] {pair} {tf} no strong signal (conf={conf})")
                 time.sleep(0.6)
             except Exception as e:
-                print(f"[AUTO EXC] {pair} {tf}: {e}")
+                vprint(f"[AUTO EXC] {pair} {tf}: {e}")
                 time.sleep(0.3)
-    print(f"[AUTO] Auto-scan finished at {datetime.utcnow().isoformat()}")
+    vprint(f"[AUTO] Auto-scan finished at {datetime.utcnow().isoformat()}")
 
 def start_auto_job(app):
     global auto_job
     with auto_job_lock:
         if auto_job is None:
+            # run immediately first time, then at interval
+            vprint("[AUTO] Scheduling job (interval hours=%s)" % AUTO_SCAN_HOURS)
             auto_job = scheduler.add_job(lambda: auto_check_and_send(app), 'interval', hours=AUTO_SCAN_HOURS, next_run_time=None)
-            print("[AUTO] Job scheduled.")
+            vprint("[AUTO] Job scheduled.")
         else:
-            print("[AUTO] Job already running.")
+            vprint("[AUTO] Job already running.")
 
 def stop_auto_job():
     global auto_job
@@ -214,12 +254,13 @@ def stop_auto_job():
             except Exception:
                 pass
             auto_job = None
-            print("[AUTO] Job removed.")
+            vprint("[AUTO] Job removed.")
         else:
-            print("[AUTO] No auto job to remove.")
+            vprint("[AUTO] No auto job to remove.")
 
 # ---------------- TELEGRAM HANDLERS ----------------
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    vprint("[CMD] /start from", update.effective_user.id if update.effective_user else "unknown")
     msg = (
         "🤖 <b>ProTraderAI - Assistant</b>\n\n"
         "Kirim perintah seperti:\n"
@@ -238,6 +279,7 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg, parse_mode="HTML")
 
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    vprint("[CMD] /status")
     try:
         res = send_request_get("learning_status", params=None)
         if "error" in res:
@@ -245,15 +287,17 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         msg = (
             "📊 <b>Status Model AI</b>\n\n"
-            f"📁 Model file: {'✅ Ada' if res.get('model_exists') else '❌ Tidak ada'}\n"
+            f"📁 RF model file: {'✅ Ada' if res.get('rf_model_exists') else '❌ Tidak ada'}\n"
+            f"📁 XGB model file: {'✅ Ada' if res.get('xgb_model_exists') else '❌ Tidak ada'}\n"
             f"📈 Jumlah data log: {res.get('trade_log_count', 0)}\n"
-            f"🧠 Algoritma: {res.get('algo', 'Unknown')}"
         )
         await update.message.reply_text(msg, parse_mode="HTML")
     except Exception as e:
+        vprint("[ERROR] status_cmd:", e)
         await update.message.reply_text(f"❌ Gagal mengambil status model.\nError: {e}")
 
 async def logs_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    vprint("[CMD] /logs")
     try:
         res = send_request_get("logs_summary", params=None)
         if "error" in res or res is None:
@@ -272,9 +316,11 @@ async def logs_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         await update.message.reply_text(msg, parse_mode="HTML")
     except Exception as e:
+        vprint("[ERROR] logs_cmd:", e)
         await update.message.reply_text(f"❌ Gagal mengambil log terakhir.\nError: {e}")
 
 async def performance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    vprint("[CMD] /performance")
     try:
         res = send_request_get("ai_performance", params=None)
         if "error" in res:
@@ -288,29 +334,35 @@ async def performance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         await update.message.reply_text(msg, parse_mode="HTML")
     except Exception as e:
+        vprint("[ERROR] performance_cmd:", e)
         await update.message.reply_text(f"❌ Gagal mengambil data performa.\nError: {e}")
 
 async def auto_on_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global auto_enabled
     auto_enabled = True
+    vprint("[CMD] /auto_on")
     try:
         app = context.application
         start_auto_job(app)
         await update.message.reply_text("✅ Auto-scan diaktifkan.")
     except Exception as e:
+        vprint("[ERROR] auto_on_cmd:", e)
         await update.message.reply_text(f"❌ Gagal mengaktifkan auto-scan: {e}")
 
 async def auto_off_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global auto_enabled
     auto_enabled = False
+    vprint("[CMD] /auto_off")
     try:
         stop_auto_job()
         await update.message.reply_text("⛔ Auto-scan dinonaktifkan.")
     except Exception as e:
+        vprint("[ERROR] auto_off_cmd:", e)
         await update.message.reply_text(f"❌ Gagal menonaktifkan auto-scan: {e}")
 
 async def retrain_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Perintah retrain model AI langsung dari Telegram."""
+    vprint("[CMD] /retrain")
     try:
         await update.message.reply_text("🧠 Melatih ulang model AI... harap tunggu (proses bisa memakan waktu) ⏳")
 
@@ -320,9 +372,11 @@ async def retrain_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         url = f"{APP_URL.rstrip('/')}/retrain_learning"
+        vprint(f"[RETRAIN] POST {url}")
         r = requests.post(url, timeout=300)
         try:
             res = r.json()
+            vprint("[RETRAIN] response:", res)
         except Exception:
             await update.message.reply_text(f"⚠️ Retrain selesai tapi response tidak JSON: {r.text}")
             return
@@ -343,10 +397,12 @@ async def retrain_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(msg, parse_mode="HTML")
 
     except Exception as e:
+        vprint("[ERROR] retrain_cmd:", e)
         await update.message.reply_text(f"❌ Retrain gagal.\nError: {e}")
 
 async def manual_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip() if update.message.text else ""
+    vprint("[MSG] manual_message received:", text[:200])
     if not text:
         return
     t_low = text.lower()
@@ -360,7 +416,9 @@ async def manual_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ Tidak bisa mendeteksi pair.")
             return
         await update.message.reply_text(f"⚡ Scalp {pair} ...")
+        vprint(f"[SCALP] request scalp_signal for {pair}")
         res = send_request_get("scalp_signal", params={"pair": pair, "tf": "3m"})
+        vprint("[SCALP] result:", res)
         await update.message.reply_text(format_signal(res), parse_mode="HTML")
         return
 
@@ -370,11 +428,16 @@ async def manual_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await update.message.reply_text(f"🔍 Menganalisis {pair} ({tf}) ...")
+    vprint(f"[ANALYSE] requesting pro_signal pair={pair} tf_entry={tf}")
     res = send_request_get("pro_signal", params={"pair": pair, "tf_entry": tf})
 
+    vprint(f"[ANALYSE] response for {pair} ({tf}): {res}")
     if "error" in res:
         await update.message.reply_text(f"❌ Error: {res.get('error')}")
         return
+
+    engine_mode = res.get("engine_mode", "unknown")
+    vprint(f"[ANALYSE] engine_mode={engine_mode}, signal_type={res.get('signal_type')}, confidence={res.get('confidence')}")
 
     conf = float(res.get("confidence", 0) or 0)
     if (not is_force) and conf < STRONG_SIGNAL_THRESHOLD:
@@ -388,6 +451,7 @@ async def manual_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_csv(update: Update, context: ContextTypes.DEFAULT_TYPE):
     doc = update.message.document
+    vprint("[MSG] CSV upload detected")
     if not doc:
         await update.message.reply_text("⚠️ Tidak ada file terdeteksi.")
         return
@@ -396,13 +460,17 @@ async def handle_csv(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         content = requests.get(file.file_path, timeout=30).content
         files = {"file": ("upload.csv", content)}
+        vprint("[CSV] posting to analyze_csv")
         res = send_request_post("analyze_csv", files=files, timeout=60)
+        vprint("[CSV] analyze_csv result:", res)
         await update.message.reply_text(format_signal(res), parse_mode="HTML")
     except Exception as e:
+        vprint("[ERROR] handle_csv:", e)
         await update.message.reply_text(f"⚠️ Gagal analisis CSV: {e}")
 
 async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
     photo = update.message.photo[-1] if update.message.photo else None
+    vprint("[MSG] Image upload detected")
     if not photo:
         await update.message.reply_text("⚠️ Tidak ada gambar.")
         return
@@ -411,13 +479,17 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         content = requests.get(file.file_path, timeout=60).content
         files = {"file": ("chart.jpg", content)}
+        vprint("[IMAGE] posting to analyze_chart")
         res = send_request_post("analyze_chart", files=files, timeout=60)
+        vprint("[IMAGE] analyze_chart result:", res)
         await update.message.reply_text(format_signal(res), parse_mode="HTML")
     except Exception as e:
+        vprint("[ERROR] handle_image:", e)
         await update.message.reply_text(f"⚠️ Gagal analisis gambar: {e}")
 
 # ---------------- SETUP & RUN ----------------
 def main():
+    vprint("[STARTUP] Starting telegram_bot_full_final.py (Verbose Mode)")
     if not BOT_TOKEN:
         print("❌ BOT_TOKEN belum di set pada environment.")
         return
@@ -441,7 +513,7 @@ def main():
     scheduler.start()
     start_auto_job(app)
 
-    print(f"[STARTUP] Bot running. Auto-scan every {AUTO_SCAN_HOURS} hour(s). Pairs: {len(AUTO_PAIRS)} TF: {AUTO_TIMEFRAMES}")
+    vprint(f"[STARTUP] Bot running. Auto-scan every {AUTO_SCAN_HOURS} hour(s). Pairs: {len(AUTO_PAIRS)} TF: {AUTO_TIMEFRAMES}")
     try:
         app.run_polling()
     finally:
@@ -451,7 +523,7 @@ def main():
             scheduler.shutdown(wait=False)
         except Exception:
             pass
-        print("[SHUTDOWN] Bot stopped, scheduler shutdown.")
+        vprint("[SHUTDOWN] Bot stopped, scheduler shutdown.")
 
 if __name__ == "__main__":
     main()
